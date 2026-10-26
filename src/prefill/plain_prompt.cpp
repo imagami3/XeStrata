@@ -48,11 +48,22 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <set>
 #include <tuple>
 #include <vector>
 
 namespace strata::core {
+
+namespace {
+// b70-local: a layer split's stages read the prompt side by side (prompt_split, STRATA_PROMPT_PIPELINE): what they
+// share is used by one at a time - the CPU expert pool, and the expert source where it assembles experts from the
+// files (its prefetch threads and staging)
+std::mutex g_prompt_pool_mu, g_prompt_src_mu;
+}
+
 
 namespace k = strata::kernels;
 
@@ -209,6 +220,7 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         }
         jobs.push_back(j);
     }
+    std::lock_guard<std::mutex> pool_lk(g_prompt_pool_mu);
     for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
         pool_->run_split_multi_native(f, jobs.data() + i,
                                       (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));
@@ -382,6 +394,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
     mark(1);
     const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
+    std::unique_lock<std::mutex> src_lk(g_prompt_src_mu, std::defer_lock);
+    if (transient) src_lk.lock();
     int64_t max_rows = 0;
     for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
     // a source that assembles its experts from the files (transient: GGUF read in place): each group's missed experts
@@ -607,6 +621,54 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
     };
     lap("borrow");
     bool ok = true;
+    // b70-local: STRATA_PROMPT_PIPELINE (on; =0 off) - the stages side by side, a thread each: stage s reads chunk k once stage
+    // s - 1 has finished it, and starts chunk k + 1 once stage s + 1 has copied chunk k out of its pinned rows (the
+    // stages one after another left two of three B70s idle through every chunk)
+    static const bool pipeline = [] { const char* v = std::getenv("STRATA_PROMPT_PIPELINE"); return v == nullptr || v[0] != '0'; }();
+    const int64_t n_chunks = (n + longest - 1) / longest;
+    if (pipeline && c.size() > 1 && n_chunks > 1) {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<int64_t> started(c.size(), 0), done(c.size(), 0);
+        bool failed = false;
+        std::string first_err;
+        std::vector<std::thread> th;
+        for (size_t si = 0; si < c.size(); ++si)
+            th.emplace_back([&, si] {
+                PlainModel* st = c[si];
+                const OnDevice on(st->dev_);
+                for (int64_t k = 0; k < n_chunks; ++k) {
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] {
+                            return failed || ((si == 0 || done[si - 1] >= k + 1) &&
+                                              (si + 1 == c.size() || started[si + 1] >= k));
+                        });
+                        if (failed) return;
+                    }
+                    if (si > 0)   // the rows chunk k of the stage before handed on, into this stage's own pinned memory
+                        std::memcpy(st->hand_host_, c[si - 1]->hand_host_,
+                                    (size_t) ((std::min(n, (k + 1) * longest) - k * longest) * st->hand_w_) * 4);
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        started[si] = k + 1;
+                    }
+                    cv.notify_all();
+                    std::string e;
+                    const bool r = st->prompt_chunks(tokens, n, pos, out, logits, e, k * longest, (k + 1) * longest,
+                                                     si > 0 ? st->hand_host_ : nullptr);
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        if (!r) { if (!failed) first_err = e; failed = true; }
+                        else done[si] = k + 1;
+                    }
+                    cv.notify_all();
+                    if (!r) return;
+                }
+            });
+        for (auto& t : th) t.join();
+        if (failed) { ok = false; err = first_err; }
+    } else
     for (int64_t c0 = 0; ok && c0 < n; c0 += longest) {
         const float* hand = nullptr;
         for (PlainModel* st : c) {

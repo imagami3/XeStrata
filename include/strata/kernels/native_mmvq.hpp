@@ -136,6 +136,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// would not take its one-row layout or the type has none (STRATA_MMVQ_BATCHED=0: always false).
 bool native_mmvq_batched(int ggml_type, const void* w, std::size_t w_stride, const void* x_q8_1, std::size_t x_stride,
                          float* y, std::size_t y_stride, int n_in, int n_out, int ncols, int batches, void* stream);
+/// b70-local: `count` (1-8) products of the same q8_1 activations, one type and n_in, matrix i of n_out[i] rows into
+/// y[i], in one launch, each row's arithmetic native_mmvq's; false (nothing launched) as native_mmvq_batched.
+bool native_mmvq_multi(int ggml_type, int count, const void* const* w, float* const* y, const int* n_out,
+                       const void* x_q8_1, int n_in, int ncols, void* stream);
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 

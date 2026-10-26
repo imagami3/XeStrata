@@ -396,7 +396,7 @@ void PlainModel::gproj(const W& w, const float* x, float* y, int T, bool quantiz
 // (0 start, 1 hc_read, 2 mixer, 3 hc_post + hc_read of the FFN, 4 router + shared expert, 5 routed experts + combine),
 // read after each window (glm5_decode_prof_read) and printed every 64 windows as each part's share of the ticks.
 namespace {
-struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
+struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}, kda[5] = {}; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
 std::unordered_map<const void*, DecProf>& dec_profs() { static std::unordered_map<const void*, DecProf> m; return m; }
 bool dec_prof_on() { static const bool on = std::getenv("STRATA_DECODE_PROFILE") != nullptr && k::gpu_stamp_available(); return on; }
 constexpr int kDecSlots = 12, kDecLayers = 96;
@@ -425,6 +425,10 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
         const int kk = l < (int64_t) is_kda.size() && is_kda[(size_t) l] ? 0 : 1;
         for (int i = 0; i < 5; ++i) d.sum[kk][i] += (double) (st[i + 1] - st[i]);
         d.sum[kk][5] += (double) (st[5] - st[0]);
+        if (kk == 0 && st[6] && st[10]) {   // the KDA mixer: 1 -> 6 projections, 6 -> 7 convolutions, 7 -> 8 norms and gates, 8 -> 9 scan, 9 -> 10 out + o
+            const unsigned long long p[6] = {st[1], st[6], st[7], st[8], st[9], st[10]};
+            for (int i = 0; i < 5; ++i) d.kda[i] += (double) (p[i + 1] - p[i]);
+        }
         if (kk == 1 && st[6] && st[10]) {   // the DSA mixer's parts: 1 -> 6 projections, 6 -> 7 indexer, 7 -> 8 k_b, 8 -> 9 attention, 9 -> 10 v_b + o
             const unsigned long long p[6] = {st[1], st[6], st[7], st[8], st[9], st[10]};
             for (int i = 0; i < 5; ++i) d.dsa[i] += (double) (p[i + 1] - p[i]);
@@ -439,6 +443,9 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
                              kk == 0 ? "KDA" : "DSA", d.n[kk], d.sum[kk][5] / d.n[kk], 100 * d.sum[kk][0] / d.sum[kk][5],
                              100 * d.sum[kk][1] / d.sum[kk][5], 100 * d.sum[kk][2] / d.sum[kk][5],
                              100 * d.sum[kk][3] / d.sum[kk][5], 100 * d.sum[kk][4] / d.sum[kk][5]);
+    if (d.windows % 64 == 0 && d.n[0] > 0)
+        std::fprintf(stderr, "strata decode profile %p KDA mixer a layer: projections %.0f, convolutions %.0f, norms+gates %.0f, scan %.0f, out+o %.0f ticks\n",
+                     model, d.kda[0] / d.n[0], d.kda[1] / d.n[0], d.kda[2] / d.n[0], d.kda[3] / d.n[0], d.kda[4] / d.n[0]);
     if (d.windows % 64 == 0 && d.n[1] > 0)
         std::fprintf(stderr, "strata decode profile %p DSA mixer a layer: projections %.0f, indexer %.0f, k_b %.0f, attention %.0f, v_b+o %.0f ticks\n",
                      model, d.dsa[0] / d.n[1], d.dsa[1] / d.n[1], d.dsa[2] / d.n[1], d.dsa[3] / d.n[1], d.dsa[4] / d.n[1]);
@@ -468,9 +475,32 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         const int64_t hist = C * (s.ssm_d_conv - 1);
         const std::pair<const W*, float*> from_row[] = {{&b.q, g_q_},   {&b.k, g_k_},   {&b.v, g_v_},
                                                         {&b.f_a, g_fa_}, {&b.g_a, g_ga_}, {&b.beta, g_beta_}};
-        for (const auto& [w, y] : from_row) gproj(*w, hn_, y, T, true, cs);
+        static bool said = false;
+        if (!said && std::getenv("STRATA_DECODE_PROFILE")) {
+            said = true;
+            for (const auto& [w, y] : from_row) std::fprintf(stderr, "strata kda proj: type %d n_in %lld n_out %lld\n", w->type, (long long) w->n_in, (long long) w->n_out);
+            std::fprintf(stderr, "strata kda proj: o type %d n_in %lld n_out %lld; f_b %d, g_b %d\n", b.o.type, (long long) b.o.n_in, (long long) b.o.n_out, b.f_b.type, b.g_b.type);
+        }
+        {   // b70-local: the six from the block row in as few launches as their types allow (native_mmvq_multi)
+            bool done[6] = {};
+            for (int i = 0; i < 6; ++i) {
+                if (done[i]) continue;
+                const void* ws[6]; float* ys[6]; int no[6]; int idx[6]; int c = 0;
+                for (int j = i; j < 6; ++j)
+                    if (!done[j] && from_row[j].first->type == from_row[i].first->type && from_row[j].first->n_in == from_row[i].first->n_in) {
+                        ws[c] = from_row[j].first->data; ys[c] = from_row[j].second; no[c] = (int) from_row[j].first->n_out; idx[c++] = j;
+                    }
+                if (c > 1 && k::native_mmvq_multi(from_row[i].first->type, c, ws, ys, no, g_xq_, (int) from_row[i].first->n_in, T, cs)) {
+                    for (int q = 0; q < c; ++q) done[idx[q]] = true;
+                } else {
+                    gproj(*from_row[i].first, hn_, from_row[i].second, T, true, cs);
+                    done[i] = true;
+                }
+            }
+        }
         gproj(b.f_b, g_fa_, g_f_, T, false, cs);   // the low-rank gates' second halves (their inputs quantized in turn)
         gproj(b.g_b, g_ga_, g_g2_, T, false, cs);
+        glm5_decode_stamp(this, l, 6, cs);
         // the states after rows 0 .. n_snaps - 1, for spec_step: the convolutions then go row by row, their history
         // copied after each of those rows
         const int n_snaps = std::min(T - 1, n_snap_);
@@ -488,16 +518,20 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
                     k::copy_from_mapped(conv_snap_[(size_t) b.idx][(size_t) t], conv, (int64_t) (conv_bytes_ / 4), cs);
             }
         }
+        glm5_decode_stamp(this, l, 7, cs);
         float* snaps[k::kGlm5MaxSnaps] = {};
         for (int t = 0; t < n_snaps; ++t) snaps[t] = gdn_snap_[(size_t) b.idx][(size_t) t];
         k::glm5_l2_heads(g_qc_, H, kL2Eps, T, cs);
         k::glm5_l2_heads(g_kc_, H, kL2Eps, T, cs);
         k::glm5_kda_gate(g_f_, b.dt, b.a, (float) s.kda_gate_lower_bound, g_gate_, H, S, T, cs);
         k::native_gdn_beta_gate(g_beta_, H * T, cs);
+        glm5_decode_stamp(this, l, 8, cs);
         k::glm5_kda_scan(state, g_qc_, g_kc_, g_vc_, g_gate_, g_beta_, g_o_, H, T, cs, snaps,   // the recurrence
                          std::max(n_snaps, 0));
+        glm5_decode_stamp(this, l, 9, cs);
         k::glm5_kda_out(g_o_, g_g2_, b.o_norm, eps, g_oy_, H, T, cs);
         gproj(b.o, g_oy_, mix_, T, false, cs);
+        glm5_decode_stamp(this, l, 10, cs);
     } else {
         dsa_layer_ = l;
         record_dsa(b, T, cs);

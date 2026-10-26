@@ -133,7 +133,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         const int64_t L = n_moe_;
         std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
         const int64_t c_last = std::min(n, c_end);
-        if (!first())   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
+        if (!first() && hand_in != hand_host_)   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
             std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * kHC * N) * 4);
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;

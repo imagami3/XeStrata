@@ -769,6 +769,68 @@ bool mmvq_batched(const void* w, std::size_t w_stride, const void* x, std::size_
     return true;
 }
 
+// b70-local: up to 8 products of the same activations (one type, one n_in, any n_out) in one launch, launch_row's
+// arithmetic row by row (GLM's KDA q / k / v / f_a / g_a / beta: six launches a block, ~60% of its mixer in decode)
+struct MultiMats { const void* w[8]; float* y[8]; int start[9]; int count; };
+
+template<typename F, int NCOLS, int RPG>
+sycl::event launch_row_multi(sycl::queue& q, MultiMats m, const void* x_q8_1, int n_in) {
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int rows_all = m.start[m.count];
+    const std::size_t groups = (std::size_t(rows_all) + RPG - 1) / RPG;
+    return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
+        if (row >= rows_all) return;
+        int mi = 0;
+        while (row >= m.start[mi + 1]) ++mi;
+        const int n_out = m.start[mi + 1] - m.start[mi];
+        row -= m.start[mi];
+        const void* wsrc = m.w[mi];
+        float* ydst = m.y[mi];
+        const auto* w = static_cast<const typename F::Block*>(wsrc);
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        const int kqs = F::kqs(lane);
+        float tmp[NCOLS] = {};
+        for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
+            typename F::W wv;
+            if constexpr (requires { F::load_row; })
+                wv = F::load_row(static_cast<const uint8_t*>(wsrc), row, kbx, blocks_per_row, kqs);
+            else
+                wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+            for (int j = 0; j < NCOLS; ++j)
+                tmp[j] += F::apply(wv, x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY, kqs);
+        }
+        for (int j = 0; j < NCOLS; ++j) {
+            const float s = warp_sum(sg, tmp[j]);
+            if (lane == 0) ydst[std::size_t(j) * n_out + row] = s;
+        }
+    });
+}
+
+template<typename F>
+bool mmvq_multi(const MultiMats& m, const void* x, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols, F::DIV);
+    auto& q = validate_stream(stream);
+    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
+    if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;
+    switch (ncols) {
+        case 1: launch_row_multi<F, 1, 8>(q, m, x, n_in); break;
+        case 2: launch_row_multi<F, 2, 8>(q, m, x, n_in); break;
+        case 3: launch_row_multi<F, 3, 8>(q, m, x, n_in); break;
+        case 4: launch_row_multi<F, 4, 8>(q, m, x, n_in); break;
+        case 5: launch_row_multi<F, 5, 8>(q, m, x, n_in); break;
+        case 6: launch_row_multi<F, 6, 8>(q, m, x, n_in); break;
+        case 7: launch_row_multi<F, 7, 8>(q, m, x, n_in); break;
+        case 8: launch_row_multi<F, 8, 8>(q, m, x, n_in); break;
+        default: return false;
+    }
+    return true;
+}
+
 template<typename F>
 void mmvq_f32(const void* weights, const float* x, void* scratch_q8_1, float* y, int n_in, int n_out, int ncols,
               void* stream) {
@@ -1049,6 +1111,32 @@ bool native_mmvq_batched(int ggml_type, const void* w, std::size_t w_stride, con
         return native_q8_0_rows_ok(n_in) &&
                mmvq_batched<Q80RowTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
     case 23: return mmvq_batched<IQ4XSTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    default: return false;
+    }
+}
+
+bool native_mmvq_multi(int ggml_type, int count, const void* const* w, float* const* y, const int* n_out,
+                       const void* x_q8_1, int n_in, int ncols, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_MULTI"); return v == nullptr || v[0] != '0'; }();
+    if (!on || count < 1 || count > 8) return false;
+    MultiMats m{};
+    m.count = count;
+    m.start[0] = 0;
+    for (int i = 0; i < count; ++i) {
+        if (n_out[i] <= 0) return false;
+        m.w[i] = w[i];
+        m.y[i] = y[i];
+        m.start[i + 1] = m.start[i] + n_out[i];
+    }
+    switch (ggml_type) {
+    case 2: return mmvq_multi<Q40Traits>(m, x_q8_1, n_in, ncols, stream);
+    case 6: return mmvq_multi<Q50Traits>(m, x_q8_1, n_in, ncols, stream);
+    case 8: return mmvq_multi<Q80Traits>(m, x_q8_1, n_in, ncols, stream);
+    case 20: return mmvq_multi<IQ4NLTraits>(m, x_q8_1, n_in, ncols, stream);
+    case 14: return mmvq_multi<Q6KTraits>(m, x_q8_1, n_in, ncols, stream);
+    case kNativeQ6KRows: return native_q6_k_rows_ok(n_in) && mmvq_multi<Q6KRowTraits>(m, x_q8_1, n_in, ncols, stream);
+    case kNativeQ8Rows: return native_q8_0_rows_ok(n_in) && mmvq_multi<Q80RowTraits>(m, x_q8_1, n_in, ncols, stream);
+    case 23: return mmvq_multi<IQ4XSTraits>(m, x_q8_1, n_in, ncols, stream);
     default: return false;
     }
 }
