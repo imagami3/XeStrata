@@ -43,6 +43,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -706,6 +707,68 @@ bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, fl
     return true;
 }
 
+// b70-local: launch_row for `batches` products of the same shape in one launch (GLM's per-head wk_b / wv_b: 32 heads
+// were 32 launches of a few microseconds' work each, ~70% of a DSA block's attention time in decode on the B70).
+// Batch b reads weights + b * w_stride bytes and x + b * x_stride bytes and writes y + b * y_stride floats; each row's
+// arithmetic is launch_row's.
+template<typename F, int NCOLS, int RPG>
+sycl::event launch_row_batched(sycl::queue& q, const void* weights, std::size_t w_stride, const void* x_q8_1,
+                               std::size_t x_stride_b, float* y, std::size_t y_stride, int n_in, int n_out, int batches) {
+    static_assert(WARP % F::T == 0, "a block's lanes must divide the sub-group");
+    const std::size_t per = (std::size_t(n_out) + RPG - 1) / RPG;
+    return q.parallel_for(sycl::nd_range<1>(per * batches * RPG * WARP, std::size_t(RPG) * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const std::size_t g = it.get_group(0), b = g / per;
+        const int row = (int) (g % per) * RPG + (int) sg.get_group_linear_id();
+        if (row >= n_out) return;
+        const void* wsrc = static_cast<const uint8_t*>(weights) + b * w_stride;
+        const auto* x = reinterpret_cast<const Q81Block*>(static_cast<const uint8_t*>(x_q8_1) + b * x_stride_b);
+        float* ydst = y + b * y_stride;
+        const auto* w = static_cast<const typename F::Block*>(wsrc);
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        const int kqs = F::kqs(lane);
+        float tmp[NCOLS] = {};
+        for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
+            typename F::W wv;
+            if constexpr (requires { F::load_row; })
+                wv = F::load_row(static_cast<const uint8_t*>(wsrc), row, kbx, blocks_per_row, kqs);
+            else
+                wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+            for (int j = 0; j < NCOLS; ++j)
+                tmp[j] += F::apply(wv, x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY, kqs);
+        }
+        for (int j = 0; j < NCOLS; ++j) {
+            const float s = warp_sum(sg, tmp[j]);
+            if (lane == 0) ydst[std::size_t(j) * n_out + row] = s;
+        }
+    });
+}
+
+template<typename F>
+bool mmvq_batched(const void* w, std::size_t w_stride, const void* x, std::size_t x_stride, float* y, std::size_t y_stride,
+                  int n_in, int n_out, int ncols, int batches, void* stream) {
+    validate_shape(n_in, ncols, F::DIV);
+    if (n_out <= 0 || batches <= 0) return false;
+    auto& q = validate_stream(stream);
+    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
+    if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;   // launch_n would not take launch_row
+    switch (ncols) {
+        case 1: launch_row_batched<F, 1, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 2: launch_row_batched<F, 2, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 3: launch_row_batched<F, 3, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 4: launch_row_batched<F, 4, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 5: launch_row_batched<F, 5, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 6: launch_row_batched<F, 6, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 7: launch_row_batched<F, 7, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        case 8: launch_row_batched<F, 8, 8>(q, w, w_stride, x, x_stride, y, y_stride, n_in, n_out, batches); break;
+        default: return false;
+    }
+    return true;
+}
+
 template<typename F>
 void mmvq_f32(const void* weights, const float* x, void* scratch_q8_1, float* y, int n_in, int n_out, int ncols,
               void* stream) {
@@ -966,6 +1029,27 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         return native_q8_0_rows_ok(n_in) && mmvq_pair<Q80RowTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
     case 23: return mmvq_pair<IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
     default: return false;   // the K-quants' and i-quants' own kernels: two launches
+    }
+}
+
+bool native_mmvq_batched(int ggml_type, const void* w, std::size_t w_stride, const void* x_q8_1, std::size_t x_stride,
+                         float* y, std::size_t y_stride, int n_in, int n_out, int ncols, int batches, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_BATCHED"); return v == nullptr || v[0] != '0'; }();
+    if (!on) return false;
+    switch (ggml_type) {
+    case 2: return mmvq_batched<Q40Traits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case 6: return mmvq_batched<Q50Traits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case 8: return mmvq_batched<Q80Traits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case 20: return mmvq_batched<IQ4NLTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case 14: return mmvq_batched<Q6KTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case kNativeQ6KRows:
+        return native_q6_k_rows_ok(n_in) &&
+               mmvq_batched<Q6KRowTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case kNativeQ8Rows:
+        return native_q8_0_rows_ok(n_in) &&
+               mmvq_batched<Q80RowTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    case 23: return mmvq_batched<IQ4XSTraits>(w, w_stride, x_q8_1, x_stride, y, y_stride, n_in, n_out, ncols, batches, stream);
+    default: return false;
     }
 }
 

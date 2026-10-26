@@ -416,6 +416,7 @@ private:
     };
     bool glm_ = false;
     std::vector<GBlock> gblocks_;
+    int64_t dsa_layer_ = -1;   // b70-local: the block record_dsa records (STRATA_DECODE_PROFILE)
     GBlock gmtp_;                             ///< GLM's MTP layer (has_mtp_): a DSA block of one stream
     bool load_glm5(std::string& err);
     /// `mtp`: the MTP layer's block, without the mHC mixes
@@ -429,7 +430,7 @@ private:
     /// A MoE block's FFN over T rows from hn_ (its q8_1 in g_xq_): the routed experts of MoE layer `ml` and the shared
     /// expert into moe_out_
     bool record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
-                    strata::gpu::Stream cs, std::string& err);
+                    strata::gpu::Stream cs, std::string& err, int64_t l = -1);
     /// record_mtp for GLM-5.3-Flash: eh_proj, the DSA block, the MoE, the shared head's norm
     bool record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err);
     /// x [T][n_in] through w into y [T][n_out] (q8_1 of x into g_xq_ first unless `quantized`)

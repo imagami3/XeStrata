@@ -57,6 +57,7 @@
 #include <utility>
 
 namespace strata::core {
+void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, int64_t first_l, int64_t last_l);
 namespace {
 
 namespace k = strata::kernels;
@@ -1779,6 +1780,11 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         return false;
     }
     pcie_probe_after(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), T);
+    if (glm_) {   // b70-local: STRATA_DECODE_PROFILE
+        std::vector<char> kda(gblocks_.size(), 0);
+        for (size_t i = 0; i < kda.size(); ++i) kda[i] = gblocks_[i].kda ? 1 : 0;
+        glm5_decode_prof_read(this, kda, lb_, le_);
+    }
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
         return false;

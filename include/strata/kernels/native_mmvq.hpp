@@ -131,6 +131,11 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                  int n_in, int n_out, int ncols, void* stream);
 /// native_mmvq of two matrices of one type and shape over the same activations in one launch (upstream b08cf3e1's
 /// pair), every output the two calls' bits.  Returns false, launching nothing, where that layout does not apply.
+/// b70-local: `batches` products of one shape in one launch (batch b: weights + b * w_stride bytes, x + b * x_stride
+/// bytes, y + b * y_stride floats), each row's arithmetic native_mmvq's; false (nothing launched) where native_mmvq
+/// would not take its one-row layout or the type has none (STRATA_MMVQ_BATCHED=0: always false).
+bool native_mmvq_batched(int ggml_type, const void* w, std::size_t w_stride, const void* x_q8_1, std::size_t x_stride,
+                         float* y, std::size_t y_stride, int n_in, int n_out, int ncols, int batches, void* stream);
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 

@@ -582,7 +582,7 @@ void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, i
                    int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool) {
     constexpr int L = 512, WG = 256, NSG = WG / WARP, PER = L / WARP;
     if (n_tokens <= 0) return;
-    if (n_tokens > 1 && n_heads > 0 && cap > 0 && tail_kpool >= 0 && tail_kpool != 1 &&
+    if (n_heads > 0 && cap > 0 && tail_kpool >= 0 && tail_kpool != 1 &&   // one token too: 1.52 -> see below
         glm5_mla_attn_xmx(q, latent, ids, cap, steps, n_heads, scale, n_tokens, out, stream, tail_kpool))
         return;
     if (n_tokens > 1 && n_heads > 0 && cap > 0 && tail_kpool >= 0 && tail_kpool != 1 &&

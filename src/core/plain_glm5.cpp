@@ -22,6 +22,7 @@
 //
 // The prompt runs in chunks (src/prefill/plain_prompt_glm5.cpp); the MTP layer does not draft yet.
 #include "strata/core/plain_model.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/runtime.hpp"
@@ -391,6 +392,58 @@ void PlainModel::gproj(const W& w, const float* x, float* y, int T, bool quantiz
     k::native_mmvq(w.type, w.data, g_xq_, y, w.n_in, w.n_out, T, cs);
 }
 
+// b70-local: STRATA_DECODE_PROFILE=1 - device-clock stamps inside the decode graphs at the parts of each block
+// (0 start, 1 hc_read, 2 mixer, 3 hc_post + hc_read of the FFN, 4 router + shared expert, 5 routed experts + combine),
+// read after each window (glm5_decode_prof_read) and printed every 64 windows as each part's share of the ticks.
+namespace {
+struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
+std::unordered_map<const void*, DecProf>& dec_profs() { static std::unordered_map<const void*, DecProf> m; return m; }
+bool dec_prof_on() { static const bool on = std::getenv("STRATA_DECODE_PROFILE") != nullptr && k::gpu_stamp_available(); return on; }
+constexpr int kDecSlots = 12, kDecLayers = 96;
+}
+
+void glm5_decode_stamp(const void* model, int64_t l, int i, strata::gpu::Stream cs) {
+    if (!dec_prof_on()) return;
+    DecProf& d = dec_profs()[model];
+    if (d.dev == nullptr) {
+        if (!strata::gpu::alloc_device((void**) &d.dev, (size_t) kDecLayers * kDecSlots * 8)) return;
+        strata::gpu::memset(d.dev, 0, (size_t) kDecLayers * kDecSlots * 8);
+        d.h.assign((size_t) kDecLayers * kDecSlots, 0);
+    }
+    if (l < kDecLayers) k::gpu_stamp(d.dev, (int) (l * kDecSlots + i), cs);
+}
+
+void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, int64_t first_l, int64_t last_l) {
+    if (!dec_prof_on()) return;
+    auto it = dec_profs().find(model);
+    if (it == dec_profs().end() || it->second.dev == nullptr) return;
+    DecProf& d = it->second;
+    if (!strata::gpu::copy(d.h.data(), d.dev, d.h.size() * 8)) return;
+    for (int64_t l = first_l; l < last_l && l < kDecLayers; ++l) {
+        const unsigned long long* st = &d.h[(size_t) l * kDecSlots];
+        if (st[0] == 0 || st[5] < st[0]) continue;
+        const int kk = l < (int64_t) is_kda.size() && is_kda[(size_t) l] ? 0 : 1;
+        for (int i = 0; i < 5; ++i) d.sum[kk][i] += (double) (st[i + 1] - st[i]);
+        d.sum[kk][5] += (double) (st[5] - st[0]);
+        if (kk == 1 && st[6] && st[10]) {   // the DSA mixer's parts: 1 -> 6 projections, 6 -> 7 indexer, 7 -> 8 k_b, 8 -> 9 attention, 9 -> 10 v_b + o
+            const unsigned long long p[6] = {st[1], st[6], st[7], st[8], st[9], st[10]};
+            for (int i = 0; i < 5; ++i) d.dsa[i] += (double) (p[i + 1] - p[i]);
+        }
+        ++d.n[kk];
+    }
+    if (++d.windows % 64 == 0)
+        for (int kk = 0; kk < 2; ++kk)
+            if (d.n[kk] > 0)
+                std::fprintf(stderr, "strata decode profile %p %s layers (%lld): ticks a layer %.0f = hc_read %.0f%%, mixer %.0f%%, "
+                                     "post+ffn read %.0f%%, router+shared %.0f%%, experts+combine %.0f%%\n", model,
+                             kk == 0 ? "KDA" : "DSA", d.n[kk], d.sum[kk][5] / d.n[kk], 100 * d.sum[kk][0] / d.sum[kk][5],
+                             100 * d.sum[kk][1] / d.sum[kk][5], 100 * d.sum[kk][2] / d.sum[kk][5],
+                             100 * d.sum[kk][3] / d.sum[kk][5], 100 * d.sum[kk][4] / d.sum[kk][5]);
+    if (d.windows % 64 == 0 && d.n[1] > 0)
+        std::fprintf(stderr, "strata decode profile %p DSA mixer a layer: projections %.0f, indexer %.0f, k_b %.0f, attention %.0f, v_b+o %.0f ticks\n",
+                     model, d.dsa[0] / d.n[1], d.dsa[1] / d.n[1], d.dsa[2] / d.n[1], d.dsa[3] / d.n[1], d.dsa[4] / d.n[1]);
+}
+
 bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
                                strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
@@ -406,7 +459,9 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
     };
 
     // ---- the mixer
+    glm5_decode_stamp(this, l, 0, cs);
     hc_read(b.hc_attn_fn, b.hc_attn_scale, b.hc_attn_base, b.attn_norm);
+    glm5_decode_stamp(this, l, 1, cs);
     if (b.kda) {
         float* state = gdn_state_[(size_t) b.idx];
         float* conv = gdn_conv_[(size_t) b.idx];
@@ -444,12 +499,15 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         k::glm5_kda_out(g_o_, g_g2_, b.o_norm, eps, g_oy_, H, T, cs);
         gproj(b.o, g_oy_, mix_, T, false, cs);
     } else {
+        dsa_layer_ = l;
         record_dsa(b, T, cs);
     }
+    glm5_decode_stamp(this, l, 2, cs);
     k::glm5_hc_post(mix_, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs);
 
     // ---- the FFN
     hc_read(b.hc_ffn_fn, b.hc_ffn_scale, b.hc_ffn_base, b.ffn_norm);
+    glm5_decode_stamp(this, l, 3, cs);
     auto swiglu = [&](float* out) {   // gate / up from hn_'s q8_1, the clamp, down
         const int FW = b.ffn_gate.n_out;
         if (b.ffn_gate.type != b.ffn_up.type ||
@@ -465,10 +523,11 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
     if (l < s.n_dense_lead) {
         swiglu(mix_);
     } else {
-        if (!record_moe(b, s.moe_index(l), T, ring, segs, cs, err)) return false;
+        if (!record_moe(b, s.moe_index(l), T, ring, segs, cs, err, l)) return false;
         ffn_out = moe_out_;
     }
     k::glm5_hc_post(ffn_out, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs);
+    glm5_decode_stamp(this, l, 5, cs);
     return true;
 }
 
@@ -489,6 +548,7 @@ void PlainModel::record_dsa(const GBlock& b, int T, strata::gpu::Stream cs) {
         k::native_qsa_rms_norm_weighted_q8_1(g_qa_, b.q_a_norm, g_qr_, g_xq_, (int) QLR, T, eps, cs);
         gproj(b.q_b, g_qr_, g_qb_, T, true, cs);
         gproj(b.idx_q_b, g_qr_, g_iq_, T, true, cs);
+        glm5_decode_stamp(this, dsa_layer_, 6, cs);
         // the indexer: the window's keys and pools, the pools' scores, the selection
         k::glm5_idx_append(g_ik_, g_ig_, b.idx_k_norm, b.idx_k_norm_b, s.norm_eps > 0 ? (float) s.norm_eps : 1e-6f, g_steps_, T,
                            g_idx_cache_[(size_t) d], cs);
@@ -498,31 +558,41 @@ void PlainModel::record_dsa(const GBlock& b, int T, strata::gpu::Stream cs) {
         qs.idx_block = s.idx_kpool;
         qs.idx_top_k = s.idx_top_k;
         k::qsa_block_topk(g_scores_, g_steps_, T, g_max_blocks_, g_cap_, qs, g_ids_, cs);
+        glm5_decode_stamp(this, dsa_layer_, 7, cs);
         // the MLA: the latent into the cells, q through each head's wk_b, the attention, each head's wv_b
         k::glm5_latent_store(g_kv_, g_steps_, T, KVR, g_latent_[(size_t) d], cs);
         const size_t kb = k::native_mmvq_weight_bytes(file_type(b.k_b.type), (int) QK, (int) KVR);
         const size_t vb = k::native_mmvq_weight_bytes(file_type(b.v_b.type), (int) KVR, (int) VD);
         k::glm5_transpose_abd(g_qb_, g_qbT_, T, H, QK, cs);
         k::native_quantize_q8_1_rows(g_qbT_, g_xq_, (int) QK, H * T, cs);
+        const size_t xqk = k::native_q8_1_rows_bytes((int) QK, T), xkv = k::native_q8_1_rows_bytes((int) KVR, T);
+        const bool lin = k::native_q8_1_rows_bytes((int) QK, 2 * T) == 2 * xqk && k::native_q8_1_rows_bytes((int) KVR, 2 * T) == 2 * xkv;
+        if (!lin || !k::native_mmvq_batched(b.k_b.type, b.k_b.data, kb, g_xq_, xqk, g_absT_, (size_t) (T * KVR),
+                                           (int) QK, (int) KVR, T, (int) H, cs))
         for (int64_t h = 0; h < H; ++h)
             k::native_mmvq(b.k_b.type, (const uint8_t*) b.k_b.data + h * kb,
                            g_xq_ + k::native_q8_1_rows_bytes((int) QK, h * T), g_absT_ + h * T * KVR, (int) QK,
                            (int) KVR, T, cs);
         k::glm5_transpose_abd(g_absT_, g_abs_, H, T, KVR, cs);
+        glm5_decode_stamp(this, dsa_layer_, 8, cs);
         k::glm5_mla_attn(g_abs_, g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, (int) H, 1.0f / std::sqrt((float) QK),
                          T, g_lat_, cs, s.idx_kpool_select_tail ? (int) s.idx_kpool : 0);
+        glm5_decode_stamp(this, dsa_layer_, 9, cs);
         k::glm5_transpose_abd(g_lat_, g_latT_, T, H, KVR, cs);
         k::native_quantize_q8_1_rows(g_latT_, g_xq_, (int) KVR, H * T, cs);
+        if (!lin || !k::native_mmvq_batched(b.v_b.type, b.v_b.data, vb, g_xq_, xkv, g_voT_, (size_t) (T * VD),
+                                           (int) KVR, (int) VD, T, (int) H, cs))
         for (int64_t h = 0; h < H; ++h)
             k::native_mmvq(b.v_b.type, (const uint8_t*) b.v_b.data + h * vb,
                            g_xq_ + k::native_q8_1_rows_bytes((int) KVR, h * T), g_voT_ + h * T * VD, (int) KVR,
                            (int) VD, T, cs);
         k::glm5_transpose_abd(g_voT_, g_vo_, H, T, VD, cs);
         gproj(b.o, g_vo_, mix_, T, false, cs);
+        glm5_decode_stamp(this, dsa_layer_, 10, cs);
 }
 
 bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
-                            strata::gpu::Stream cs, std::string& err) {
+                            strata::gpu::Stream cs, std::string& err, int64_t l) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, E = s.n_expert, K = s.n_expert_used;
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
@@ -541,6 +611,7 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
         k::glm5_swiglu_clamp(g_ffg_, g_ffu_, g_ffg_, (int64_t) T * FW, b.clamp, cs);
         gproj(b.ffn_down, g_ffg_, shared_, T, false, cs);
     }
+    if (l >= 0) glm5_decode_stamp(this, l, 4, cs);
     if (win_.segmented()) {   // a graph ends where the host must answer the ring
         strata::gpu::Graph* g = nullptr;
         if (!strata::gpu::end_capture(cs, &g)) {

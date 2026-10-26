@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <string>
@@ -571,7 +572,7 @@ int test_swiglu_clamp() {
 int bench_mla() {
     using namespace strata::kernels;
     const int L = 512, H = std::getenv("PARITY_MLA_H") ? std::atoi(std::getenv("PARITY_MLA_H")) : 32;
-    const int T = 3024, W = 2048, P = 4096;
+    const int T = std::getenv("PARITY_MLA_T") ? std::atoi(std::getenv("PARITY_MLA_T")) : 3024, W = 2048, P = 4096;
     strata::parity::Device dev;
     std::vector<int32_t> steps((size_t) T * kStepCount, 0), ids((size_t) T * W);
     std::mt19937 g(1);
@@ -589,16 +590,52 @@ int bench_mla() {
     uint16_t* dlat = dev.alloc<uint16_t>((size_t) P * L);
     glm5_latent_store(dkv, dso, P, L, dlat, nullptr);
     for (int r = 0; r < 3; ++r) {
+        const int reps = T < 64 ? 200 : 1;
         const auto t0 = std::chrono::steady_clock::now();
-        glm5_mla_attn(dqa, dlat, dids, W, dst, H, 0.06f, T, dout, nullptr);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("  mla_attn T=%d width=%d H=%d: %.1f ms\n", T, W, H, ms);
+        for (int i = 0; i < reps; ++i) glm5_mla_attn(dqa, dlat, dids, W, dst, H, 0.06f, T, dout, nullptr);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("  mla_attn T=%d width=%d H=%d: %.3f ms\n", T, W, H, ms);
     }
     return 0;
 }
 
+// b70-local: native_mmvq_batched against the per-batch native_mmvq loop, bit for bit (Q8_0 weights; T 1-4)
+int test_mmvq_batched() {
+    using namespace strata::kernels;
+    const int H = 32, NI = 512, NO = 128;
+    strata::parity::Device dev;
+    std::mt19937 g(7);
+    std::vector<block_q8_0> wb((size_t) H * NO * (NI / 32));
+    for (auto& b : wb) { b.d = f16_from_f32(std::uniform_real_distribution<float>(0.001f, 0.02f)(g)); for (auto& q : b.qs) q = (int8_t) (g() % 255 - 127); }
+    const size_t wbytes = native_mmvq_weight_bytes(8, NI, NO);
+    std::vector<uint8_t> wraw(wb.size() * sizeof(block_q8_0));
+    std::memcpy(wraw.data(), wb.data(), wraw.size());
+    uint8_t* dw = dev.upload(wraw);
+    int bad = 0;
+    for (int T = 1; T <= 4; ++T) {
+        std::vector<float> x = randn((size_t) H * T * NI, 0.3f);
+        float* dx = dev.upload(x);
+        uint8_t* dq = dev.alloc<uint8_t>(native_q8_1_rows_bytes(NI, H * T));
+        native_quantize_q8_1_rows(dx, dq, NI, H * T, strata::parity::stream());
+        float *y1 = dev.alloc<float>((size_t) H * T * NO), *y2 = dev.alloc<float>((size_t) H * T * NO);
+        for (int h = 0; h < H; ++h)
+            native_mmvq(8, dw + h * wbytes, dq + native_q8_1_rows_bytes(NI, h * T), y1 + (size_t) h * T * NO, NI, NO, T, strata::parity::stream());
+        const bool ok = native_mmvq_batched(8, dw, wbytes, dq, native_q8_1_rows_bytes(NI, T), y2, (size_t) T * NO, NI, NO, T, H, strata::parity::stream());
+        strata::core::Runtime::get().compute().wait();
+        std::vector<float> a((size_t) H * T * NO), b2(a.size());
+        strata::parity::copy_out(a.data(), y1, a.size());
+        strata::parity::copy_out(b2.data(), y2, b2.size());
+        long long diff = 0;
+        for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b2[i], 4) != 0;
+        std::printf("  mmvq_batched T=%d %s: %lld of %zu differ %s\n", T, ok ? "batched" : "NOT batched", diff, a.size(), diff ? "*** FAIL ***" : "ok");
+        bad += diff ? 1 : 0;
+    }
+    return bad;
+}
+
 int main(int argc, char** argv) {
     if (std::getenv("PARITY_MLA_BENCH")) return bench_mla();
+    if (std::getenv("PARITY_MMVQ_BATCHED")) return test_mmvq_batched();
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) != "--selftest") {
             std::fprintf(stderr, "usage: glm5_parity [--selftest]\n");
