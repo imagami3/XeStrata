@@ -146,7 +146,11 @@ bool PlainModel::prompt_return(std::string& err) {
     for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
     borrow_first_ = -1;
     // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
+    static const bool ret_prof = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;   // b70-local
+    const auto tr0 = std::chrono::steady_clock::now();
+    long long n_fast = 0, n_fill = 0, n_transient = 0;
     for (const auto& [l, e] : borrowed_res_) {
+        if (ret_prof) { if (src_->transient(l, e)) ++n_transient; }
         auto& f = free_[(size_t) l];
         if (f.empty()) break;
         const uint8_t* hb = src_->transient(l, e) ? nullptr : src_->blob(l, e);
@@ -158,10 +162,17 @@ bool PlainModel::prompt_return(std::string& err) {
             }
             f.pop_back();
             res_[(size_t) (l * spec_.n_expert + e)] = slot;
+            ++n_fast;
         } else if (!fill_slot(l, e, err)) {
             return false;
+        } else {
+            ++n_fill;
         }
     }
+    if (ret_prof)
+        std::fprintf(stderr, "strata plain: prompt_return dev %d: %zu displaced, %lld from pinned RAM, %lld through "
+                             "fill_slot (%lld transient), %.1f ms\n", dev_, borrowed_res_.size(), n_fast, n_fill,
+                     n_transient, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0).count());
     borrowed_res_.clear();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     return true;
@@ -585,6 +596,16 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
         }
         longest = std::max(longest, c[i]->pb_.T);
     }
+    static const bool split_prof = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;   // b70-local
+    auto ts0 = std::chrono::steady_clock::now();
+    auto lap = [&](const char* what) {
+        if (!split_prof) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "strata plain: split prompt %s %.1f ms\n", what,
+                     std::chrono::duration<double, std::milli>(now - ts0).count());
+        ts0 = now;
+    };
+    lap("borrow");
     bool ok = true;
     for (int64_t c0 = 0; ok && c0 < n; c0 += longest) {
         const float* hand = nullptr;
@@ -594,11 +615,13 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
             hand = st->hand_host_;
         }
     }
+    lap("chunks");
     std::string err2;
     for (PlainModel* st : c) {
         const OnDevice on(st->dev_);
         if (!st->prompt_return(err2) && ok) { err = err2; ok = false; }
     }
+    lap("return");
     if (!ok) return false;
     for (PlainModel* st : c) {   // each tier to the experts its layers routed most (prompt_one)
         const OnDevice on(st->dev_);
@@ -606,6 +629,7 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
         for (const auto& f : st->free_) n_free += (int64_t) f.size();
         if (!st->disp_.usage.empty() && !st->adapt(err, std::max<int64_t>(2048, n_free), st->opt_.adapt_swaps)) return false;
     }
+    lap("adapt");
     return true;
 }
 

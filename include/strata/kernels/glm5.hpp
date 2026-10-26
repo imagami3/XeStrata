@@ -118,6 +118,10 @@ void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, 
 /// out[t][h] = sum_j p_j latent[c_j], over the steps[t][kStepWidth] cells ids[t][0 ..) (qsa_block_topk's output, cap
 /// apart) and, with `tail_kpool` (the pool size; 0 for none), the token's unfinished pool's cells up to it.  A token
 /// with no cell gets zeros.  q, out [T][H][L] (q already through wk_b); latent [cells][L] FP16.  L = 512.
+/// b70-local: glm5_mla_attn for a prompt (16 heads a work-group) on the matrix engines; false where they or the local
+/// memory are missing, or the heads are not a multiple of 16 (STRATA_MLA_XMX=0: false), and the caller keeps its kernel.
+bool glm5_mla_attn_xmx(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
+                       int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool);
 void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
                    int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool = 0);
 

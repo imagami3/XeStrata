@@ -1234,6 +1234,15 @@ void PlainModel::finish_experts() {
         // with 8 GiB left is not known: dropping the files' cache before and during the copy changed nothing.
         if (!level_zero_)
             headroom += std::min<uint64_t>(strata::platform::total_physical_memory() / 5, 16ull << 30);
+        // STRATA_PLAIN_HEADROOM_GIB=N: the RAM left beside the copy, in place of the rule above.  3 B70s made it
+        // 8 + 3 x 16 = 56 GiB, more than a 64 GB PC has free, so GLM-5.3-Flash got no RAM tier at all (every miss
+        // read from the files, prefill ~55 tok/s); there the Level Zero driver held 9.5 GiB of RAM with 96 GB of
+        // VRAM in use (2026-10-27)
+        if (const char* h = std::getenv("STRATA_PLAIN_HEADROOM_GIB"); h != nullptr && *h != '\0') {
+            headroom = (uint64_t) (std::strtod(h, nullptr) * 1073741824.0);
+            std::fprintf(stderr, "strata plain: RAM headroom %.1f GiB (STRATA_PLAIN_HEADROOM_GIB)\n",
+                         (double) headroom / 1073741824.0);
+        }
         // the order the RAM takes them in: the profile's, else each layer's experts in turn
         std::vector<std::pair<int32_t, int32_t>> order = prior_;
         if (order.empty())

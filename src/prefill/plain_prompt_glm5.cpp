@@ -112,6 +112,18 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         stage_ms[stage] += std::chrono::duration<double, std::milli>(now - t_mark).count();
         t_mark = now;
     };
+    // STRATA_DSA_PROFILE=1: the DSA block's parts, each synced (b70-local)
+    static const bool dsa_prof = std::getenv("STRATA_DSA_PROFILE") != nullptr;
+    static double dsa_ms[16] = {};
+    static long dsa_calls = 0;
+    auto t_dsa = std::chrono::steady_clock::now();
+    auto dmark = [&](int part) {
+        if (!dsa_prof) return;
+        strata::gpu::stream_sync(cs);
+        const auto now = std::chrono::steady_clock::now();
+        dsa_ms[part] += std::chrono::duration<double, std::milli>(now - t_dsa).count();
+        t_dsa = now;
+    };
     PromptRouted rst;
     if (!pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);
@@ -195,24 +207,31 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     mark(8);
                 } else {
                     const int64_t d = b.idx;
+                    dmark(15);
                     dense(b.q_a, P.hn, P.g_qa, T);
                     dense(b.kv_a, P.hn, P.g_absT, T);   // the raw latent, normed into g_kv below
                     dense(b.idx_k, P.hn, P.g_ik, T);
                     dense(b.idx_gate, P.hn, P.g_ig, T);
                     k::f32_gemm_rows(P.hn, N, b.idx_proj, P.g_iw, IH, N, IH, T, cs);
                     k::scale_inplace(P.g_iw, T * IH, 1.0f / std::sqrt((float) (ID * IH)), cs);
+                    dmark(0);
                     k::native_qsa_rms_norm_weighted(P.g_absT, b.kv_a_norm, P.g_kv, (int) KVR, (int) T, eps, cs);
                     k::native_qsa_rms_norm_weighted(P.g_qa, b.q_a_norm, P.g_qr, (int) QLR, (int) T, eps, cs);
                     dense(b.q_b, P.g_qr, P.g_qb, T);
                     dense(b.idx_q_b, P.g_qr, P.g_iq, T);
+                    dmark(1);
                     k::glm5_idx_append(P.g_ik, P.g_ig, b.idx_k_norm, b.idx_k_norm_b,
                                        s.norm_eps > 0 ? (float) s.norm_eps : 1e-6f, P.g_steps, T,
                                        g_idx_cache_[(size_t) d], cs);
+                    dmark(2);
                     k::glm5_idx_pool(g_idx_cache_[(size_t) d], b.idx_ape, (int) s.idx_kpool, P.g_steps, T,
                                      g_pooled_[(size_t) d], cs);
+                    dmark(3);
                     k::glm5_idx_scores(g_pooled_[(size_t) d], P.g_iq, P.g_iw, (int) IH, P.g_steps, T, g_max_blocks_,
                                        P.g_scores, cs);
+                    dmark(4);
                     k::qsa_block_topk(P.g_scores, P.g_steps, T, g_max_blocks_, g_cap_, sel, P.g_ids, cs);
+                    dmark(5);
                     k::glm5_latent_store(P.g_kv, P.g_steps, T, KVR, g_latent_[(size_t) d], cs);
                     // each head's q through its wk_b into the latent, the attention, each head's wv_b
                     const size_t kb = k::native_mmvq_weight_bytes(file_type(b.k_b.type), (int) QK, (int) KVR);
@@ -222,15 +241,20 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                         prod(b.k_b.type, (const uint8_t*) b.k_b.data + h * kb, QK, KVR, P.g_qbT + h * T * QK, QK,
                              P.g_absT + h * T * KVR, T, KVR);
                     k::glm5_transpose_abd(P.g_absT, P.g_abs, H, T, KVR, cs);
+                    dmark(6);
                     k::glm5_mla_attn(P.g_abs, g_latent_[(size_t) d], P.g_ids, g_cap_, P.g_steps, (int) H,
                                      1.0f / std::sqrt((float) QK), T, P.g_lat, cs,
                                      s.idx_kpool_select_tail ? (int) s.idx_kpool : 0);
+                    dmark(7);
                     k::glm5_transpose_abd(P.g_lat, P.g_latT, T, H, KVR, cs);
                     for (int64_t h = 0; h < H; ++h)
                         prod(b.v_b.type, (const uint8_t*) b.v_b.data + h * vb, KVR, VD, P.g_latT + h * T * KVR, KVR,
                              P.g_voT + h * T * VD, T, VD);
                     k::glm5_transpose_abd(P.g_voT, P.g_vo, H, T, VD, cs);
                     dense(b.o, P.g_vo, P.mix, T);
+                    dmark(8);
+                    if (dsa_prof && ++dsa_calls % 4 == 0)
+                        std::fprintf(stderr, "strata dsa: T=%lld total ms: proj %.0f q_b %.0f idx_append %.0f idx_pool %.0f idx_scores %.0f topk %.0f k_b %.0f mla_attn %.0f v_b+o %.0f\n", (long long) T, dsa_ms[0], dsa_ms[1], dsa_ms[2], dsa_ms[3], dsa_ms[4], dsa_ms[5], dsa_ms[6], dsa_ms[7], dsa_ms[8]);
                     mark(1);
                 }
                 k::glm5_hc_post(P.mix, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs);

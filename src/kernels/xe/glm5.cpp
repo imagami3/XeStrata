@@ -14,6 +14,7 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -480,10 +481,113 @@ void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, 
     sync_if_needed(stream, event, "glm5_latent_store");
 }
 
+// b70-local (2026-10-27): the MLA's heads share one latent row per cell, but the kernel below gives every
+// (token, head) its own work-group, so each cell's 1 KiB row was read 2 x n_heads times per token (scores, then
+// values) by scalar loops: 3,024 prompt tokens took ~1 s a DSA block on the B70 (~10 s of a 49 s prompt).  This one
+// takes G = 16 heads of a token per work-group and streams the cells through local memory in tiles with an online
+// softmax, so a row is read once per 16 heads.  STRATA_MLA_HG=0 goes back to the per-head kernel.
+static bool mla_hg_attn(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
+                        int H, float scale, int64_t n_tokens, float* out, void* stream, int KP) {
+    constexpr int L = 512, WG = 256, G = 16, TJ = 16, PERD = L / (WG / G);   // 32 dims a thread in the output
+    static const bool on = [] { const char* v = std::getenv("STRATA_MLA_HG"); return v != nullptr && v[0] == '1'; }();   // slower (opt-in)
+    if (!on || H % G != 0) return false;
+    const auto event = queue_for(stream).submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) G * L), hd);
+        sycl::local_accessor<uint16_t, 1> tile(sycl::range<1>((size_t) TJ * L), hd);
+        sycl::local_accessor<float, 1> pr(sycl::range<1>((size_t) G * TJ), hd);
+        sycl::local_accessor<float, 1> st(sycl::range<1>((size_t) 3 * G), hd);   // m, l, the rescale
+        hd.parallel_for(sycl::nd_range<1>((size_t) (n_tokens * (H / G)) * WG, WG),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int64_t grp = (int64_t) it.get_group(0), t = grp / (H / G);
+            const int h0 = (int) (grp % (H / G)) * G;
+            const int lid = (int) it.get_local_id(0);
+            const int64_t chosen = sycl::min<int64_t>(steps[t * kStepCount + kStepWidth], cap);
+            const int32_t pos = steps[t * kStepCount + kStepPos];
+            const int64_t tail0 = KP > 0 && pos >= 0 ? (int64_t) ((pos + 1) / KP) * KP : 0;
+            const int64_t width = chosen + (KP > 0 && pos >= 0 ? (int64_t) pos + 1 - tail0 : 0);
+            // this thread's output: head og, dims od + 16 k (neighbouring lanes on neighbouring halves: a lane's
+            // own 32-dim run put 16 lanes 64 bytes apart, all on one bank of the local memory, 2.4x slower)
+            const int og = lid / (WG / G), od = lid % (WG / G);
+            float* oh = out + ((int64_t) t * H + h0 + og) * L + od;
+            if (width <= 0) {
+                for (int k = 0; k < PERD; ++k) oh[k * (WG / G)] = 0.0f;
+                return;
+            }
+            for (int i = lid; i < G * L; i += WG) qs[i] = q[((int64_t) t * H + h0) * L + i];
+            if (lid < G) { st[lid] = -INFINITY; st[G + lid] = 0.0f; }
+            const int32_t* sel = ids + t * cap;
+            float acc[PERD];
+            for (int k = 0; k < PERD; ++k) acc[k] = 0.0f;
+            const int sg_ = lid / TJ, sj = lid % TJ;   // this thread's score: head sg_, cell sj of the tile
+            for (int64_t j0 = 0; j0 < width; j0 += TJ) {
+                {   // the tile's rows: a thread 32 halves of one row
+                    const int r = lid / (WG / TJ), c = (lid % (WG / TJ)) * (L / (WG / TJ));
+                    const int64_t j = j0 + r;
+                    if (j < width) {
+                        const int64_t cl = j < chosen ? (int64_t) sel[j] : tail0 + (j - chosen);
+                        const uint16_t* src = latent + cl * L + c;
+                        for (int k = 0; k < L / (WG / TJ); ++k) tile[r * L + c + k] = src[k];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                {
+                    float d = -INFINITY;
+                    if (j0 + sj < width) {
+                        d = 0.0f;
+                        const float* qq = &qs[sg_ * L];
+                        const uint16_t* rr = &tile[sj * L];
+                        for (int i = 0; i < L; ++i) {
+                            const int k = (i + sj * 2) & (L - 1);   // spread the rows over the banks
+                            d += qq[k] * f32_from_f16(rr[k]);
+                        }
+                        d *= scale;
+                    }
+                    pr[sg_ * TJ + sj] = d;
+                }
+                sycl::group_barrier(it.get_group());
+                if (lid < G) {   // the online softmax, a thread a head
+                    float mx = st[lid];
+                    for (int j = 0; j < TJ; ++j) mx = sycl::fmax(mx, pr[lid * TJ + j]);
+                    const float corr = sycl::exp(st[lid] - mx);
+                    float sum = 0.0f;
+                    for (int j = 0; j < TJ; ++j) {
+                        const float e = pr[lid * TJ + j] == -INFINITY ? 0.0f : sycl::exp(pr[lid * TJ + j] - mx);
+                        pr[lid * TJ + j] = e;
+                        sum += e;
+                    }
+                    st[lid] = mx;
+                    st[G + lid] = st[G + lid] * corr + sum;
+                    st[2 * G + lid] = corr;
+                }
+                sycl::group_barrier(it.get_group());
+                const float corr = st[2 * G + og];
+                for (int k = 0; k < PERD; ++k) acc[k] *= corr;
+                for (int j = 0; j < TJ; ++j) {
+                    const float p = pr[og * TJ + j];
+                    if (p == 0.0f) continue;
+                    const uint16_t* rr = &tile[j * L + od];
+                    for (int k = 0; k < PERD; ++k) acc[k] += p * f32_from_f16(rr[k * (WG / G)]);
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            const float inv = 1.0f / st[G + og];
+            for (int k = 0; k < PERD; ++k) oh[k * (WG / G)] = acc[k] * inv;
+        });
+    });
+    sync_if_needed(stream, event, "glm5_mla_attn (heads grouped)");
+    return true;
+}
+
 void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
                    int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool) {
     constexpr int L = 512, WG = 256, NSG = WG / WARP, PER = L / WARP;
     if (n_tokens <= 0) return;
+    if (n_tokens > 1 && n_heads > 0 && cap > 0 && tail_kpool >= 0 && tail_kpool != 1 &&
+        glm5_mla_attn_xmx(q, latent, ids, cap, steps, n_heads, scale, n_tokens, out, stream, tail_kpool))
+        return;
+    if (n_tokens > 1 && n_heads > 0 && cap > 0 && tail_kpool >= 0 && tail_kpool != 1 &&
+        mla_hg_attn(q, latent, ids, cap, steps, n_heads, scale, n_tokens, out, stream, tail_kpool))
+        return;
     if (n_heads <= 0 || cap <= 0 || n_tokens * n_heads > 0x7fffffff || tail_kpool < 0 || tail_kpool == 1)
         throw core::DeviceError("glm5_mla_attn: " + std::to_string(n_heads) + " heads, cap " + std::to_string(cap) +
                                 ", tail pool " + std::to_string(tail_kpool));

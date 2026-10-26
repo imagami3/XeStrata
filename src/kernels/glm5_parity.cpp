@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <chrono>
 #include <cstdio>
 #include <numeric>
 #include <random>
@@ -352,7 +354,7 @@ int test_kda() {
 int test_dsa() {
     using namespace strata::kernels;
     const int D = 128, KP = 4, IH = 32, P = 53, TOPK = 24;   // 53 cells: 13 pools and one unfinished
-    const int L = 512, H = 4;
+    const int L = 512, H = std::getenv("PARITY_MLA_H") ? std::atoi(std::getenv("PARITY_MLA_H")) : 4;
     const float ln_eps = 1e-6f;
     std::vector<float> kraw = randn((size_t) P * D), graw = randn((size_t) P * D), lw = randn(D, 0.3f), lb = randn(D, 0.1f),
                        ape = randn((size_t) KP * D, 0.5f);
@@ -565,7 +567,38 @@ int test_swiglu_clamp() {
 
 }  // namespace
 
+// b70-local: PARITY_MLA_BENCH=1 times glm5_mla_attn at a prompt's size (T tokens, `width` cells each, H heads)
+int bench_mla() {
+    using namespace strata::kernels;
+    const int L = 512, H = std::getenv("PARITY_MLA_H") ? std::atoi(std::getenv("PARITY_MLA_H")) : 32;
+    const int T = 3024, W = 2048, P = 4096;
+    strata::parity::Device dev;
+    std::vector<int32_t> steps((size_t) T * kStepCount, 0), ids((size_t) T * W);
+    std::mt19937 g(1);
+    for (int t = 0; t < T; ++t) {
+        steps[(size_t) t * kStepCount + kStepPos] = t;
+        steps[(size_t) t * kStepCount + kStepWidth] = W;
+        for (int j = 0; j < W; ++j) ids[(size_t) t * W + j] = (int32_t) (g() % P);
+    }
+    std::vector<float> kv = randn((size_t) P * L, 0.5f), qa = randn((size_t) T * H * L, 0.1f);
+    float *dkv = dev.upload(kv), *dqa = dev.upload(qa), *dout = dev.alloc<float>((size_t) T * H * L);
+    int32_t *dst = dev.upload(steps), *dids = dev.upload(ids);
+    std::vector<int32_t> so((size_t) P * kStepCount, 0);
+    for (int t = 0; t < P; ++t) so[(size_t) t * kStepCount + kStepPos] = t;
+    int32_t* dso = dev.upload(so);
+    uint16_t* dlat = dev.alloc<uint16_t>((size_t) P * L);
+    glm5_latent_store(dkv, dso, P, L, dlat, nullptr);
+    for (int r = 0; r < 3; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        glm5_mla_attn(dqa, dlat, dids, W, dst, H, 0.06f, T, dout, nullptr);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  mla_attn T=%d width=%d H=%d: %.1f ms\n", T, W, H, ms);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (std::getenv("PARITY_MLA_BENCH")) return bench_mla();
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) != "--selftest") {
             std::fprintf(stderr, "usage: glm5_parity [--selftest]\n");
