@@ -371,7 +371,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
                 --want;
             } else {
                 const int64_t jobs = (c + k::cpu::MAXT - 1) / k::cpu::MAXT;
-                if (!split_rows || split_.c <= 0.0 || (double) jobs * 1.5 * split_.c >= split_.p) continue;
+                static const double factor = [] { const char* v = std::getenv("STRATA_PROMPT_CPU_SPLIT_FACTOR"); return v ? std::atof(v) : 3.0; }();   // 1.5 / 3 / 6 alike on the B70s (3: less CPU)
+                if (!split_rows || split_.c <= 0.0 || (double) jobs * factor * split_.c >= split_.p) continue;
             }
             on_cpu[(size_t) e] = 1;
             cpu_experts.push_back(e);
