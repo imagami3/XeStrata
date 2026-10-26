@@ -1255,6 +1255,27 @@ void PlainModel::finish_experts() {
         const Pin pin = pin_env != nullptr && std::strcmp(pin_env, "0") == 0   ? Pin::off
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
                                                                                : Pin::automatic;
+        // b70-local: a layer split's lend regions (each stage's slots from lend_from_ on: the prompt borrows them and
+        // gives their experts back after it) into the copy too, where it has room: with `others` the single region is
+        // off, so every prompt read those experts back from the files (GLM-5.3-Flash, 3 B70s, 2K chunks: 11 s a prompt)
+        if (chain().size() > 1) {
+            std::vector<std::vector<std::pair<int32_t, int32_t>>> regions;
+            for (PlainModel* st : chain()) {
+                if (st->lend_from_ < 0) continue;
+                std::vector<std::pair<int32_t, int32_t>> r;
+                for (int64_t l : st->moe_local_)
+                    for (int64_t e = 0; e < E; ++e)
+                        if (const int32_t sl = st->res_[(size_t) (l * E + e)]; sl >= st->lend_from_) r.emplace_back((int32_t) l, (int32_t) e);
+                if (!r.empty()) regions.push_back(std::move(r));
+            }
+            static const bool on = [] { const char* v = std::getenv("STRATA_PLAIN_STAGE_LEND"); return v == nullptr || v[0] != '0'; }();
+            if (on && !regions.empty()) {
+                size_t nk = 0;
+                for (const auto& r : regions) nk += r.size();
+                std::fprintf(stderr, "strata plain: the stages' lend regions: %zu experts offered to the RAM copy\n", nk);
+                file->stage_lend_regions(std::move(regions));
+            }
+        }
         std::string why;
         if (!file->pin_complement(n_slots_, held, slots, why, pin, others, lend_from_, headroom,
                                   FileExpertSource::kResidentWhatFits, &order)) {
