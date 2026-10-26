@@ -379,7 +379,9 @@ private:
     /// `mark(stage)` is the profile's (1 the grouping, 2 the experts).
     struct PromptRouted {
         int64_t cpu_n = 0, cpu_rows = 0, miss_n = 0;   ///< the CPU's experts and rows, the experts not in VRAM
+        double cpu_prep_ms = 0, cpu_lock_ms = 0, cpu_run_ms = 0, gpu_loop_ms = 0, blob_ms = 0, copy_ms = 0; int64_t n_up = 0, n_up_transient = 0, n_groups = 0; double sync_ms = 0, fetch_ms = 0, ev_ms = 0, gcopy_ms = 0, gmmq_ms = 0; bool bounce = false, transient = false;   ///< b70-local: where the experts' time goes
     };
+    PromptRouted* prof_rst_ = nullptr;   ///< b70-local: the chunk's counters prompt_cpu_experts adds its times to
     bool prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes, const std::function<void(int)>& mark,
                        PromptRouted& st, std::string& err);
     bool prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,

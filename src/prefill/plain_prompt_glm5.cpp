@@ -125,6 +125,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         t_dsa = now;
     };
     PromptRouted rst;
+    prof_rst_ = profile ? &rst : nullptr;
     if (!pg.identity) {
         prefill::mmq::iota(P.identity, P.T * K, cs);
         pg.identity = true;
@@ -366,16 +367,17 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         err = std::string("plain prompt: ") + strata::gpu::last_error();
         return false;
     }
-    if (c_end < n) return true;   // a layer split's chunk: the stage's part of the prompt goes on with the next
-    windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     if (profile)
         std::fprintf(stderr, "strata plain: GLM prompt of %lld tokens: KDA %.1f ms (projections %.1f, convolutions and "
                              "gates %.1f, recurrence %.1f, output %.1f), DSA %.1f, grouping %.1f, experts %.1f, shared and "
                              "dense FFN %.1f, staging %.1f, head %.1f, the rest %.1f; experts not in VRAM %lld, on the CPU %lld "
-                             "(%lld rows)\n",
+                             "(%lld rows); last chunk's experts (dev %d): GPU loop %.0f ms (uploads %lld, %lld transient; blob %.0f ms, copy %.0f ms; %lld groups, sync %.0f, fetch %.0f, event %.0f ms; bounce %d transient %d; synced: copies %.0f ms, products %.0f ms), CPU prep %.0f, lock wait %.0f, CPU run %.0f\n",
                      (long long) n, stage_ms[5] + stage_ms[6] + stage_ms[7] + stage_ms[8], stage_ms[5], stage_ms[6],
                      stage_ms[7], stage_ms[8], stage_ms[1], stage_ms[2], stage_ms[3], stage_ms[4], stage_ms[9], stage_ms[10], stage_ms[11],
-                     (long long) rst.miss_n, (long long) rst.cpu_n, (long long) rst.cpu_rows);
+                     (long long) rst.miss_n, (long long) rst.cpu_n, (long long) rst.cpu_rows, dev_, rst.gpu_loop_ms, (long long) rst.n_up, (long long) rst.n_up_transient, rst.blob_ms, rst.copy_ms, (long long) rst.n_groups, rst.sync_ms, rst.fetch_ms, rst.ev_ms, (int) rst.bounce, (int) rst.transient, rst.gcopy_ms, rst.gmmq_ms, rst.cpu_prep_ms,
+                     rst.cpu_lock_ms, rst.cpu_run_ms);
+    if (c_end < n) return true;   // a layer split's chunk: the stage's part of the prompt goes on with the next
+    windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     mtp_h_set_ = has_mtp_ && pos + n < opt_.max_cells;   // the trunk's last row is in mtp_h_ for spec_start
     if (!last()) return true;
     *out = ((volatile int32_t*) h_out_)[0];

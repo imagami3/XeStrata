@@ -191,6 +191,7 @@ bool PlainModel::prompt_return(std::string& err) {
 
 bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
                                     const std::vector<int32_t>& start, std::string& err) {
+    const auto tc0_ = std::chrono::steady_clock::now();
     // On the host while the GPU computes its share: each routed row's token quantized once to the layer's native
     // activation, one multi-token job an expert, the outputs back to the GPU into their routing entries' rows of parts.
     namespace kc = k::cpu;
@@ -206,6 +207,12 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         j.blob = src_->blob(ml, e);
         if (j.blob == nullptr) { err = "plain prompt: an expert could not be read for the CPU"; return false; }
         for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r) {
+            if (j.nt == kc::MAXT) {   // b70-local: an expert of more rows than a job takes: another job of the same weights
+                jobs.push_back(j);
+                const uint8_t* b = j.blob;
+                j = kc::ExpertJobMulti{};
+                j.blob = b;
+            }
             const int32_t tok = P.h_src[r];
             uint8_t* act = P.h_nact + (size_t) tok * kc::kNativeActBytes;
             if (!quantized[(size_t) tok]) {
@@ -220,10 +227,18 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         }
         jobs.push_back(j);
     }
+    const auto tl0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> pool_lk(g_prompt_pool_mu);
+    const auto tl1 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
         pool_->run_split_multi_native(f, jobs.data() + i,
                                       (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));
+    if (prof_rst_ != nullptr) {
+        const auto tl2 = std::chrono::steady_clock::now();
+        prof_rst_->cpu_prep_ms += std::chrono::duration<double, std::milli>(tl0 - tc0_).count();
+        prof_rst_->cpu_lock_ms += std::chrono::duration<double, std::milli>(tl1 - tl0).count();
+        prof_rst_->cpu_run_ms += std::chrono::duration<double, std::milli>(tl2 - tl1).count();
+    }
     if (!strata::gpu::copy_async(P.cpu, P.h_cpu, (size_t) (q * N) * 4, cs_) ||
         !strata::gpu::copy_async(P.cpu_row, P.h_cpu_row, (size_t) q * 4, cs_)) {
         err = std::string("plain prompt: the CPU's rows: ") + strata::gpu::last_error();
@@ -343,12 +358,24 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
         std::sort(missed.begin(), missed.end());
         int64_t rows = 0;
+        // b70-local: an expert of more rows than a CPU job takes (MAXT) went to the GPU whatever its link: on the
+        // B70s behind the chipset (1.6 and 3.1 GB/s from the host, 5.7 and 2.9 ms an expert against 0.26 on the CPU)
+        // a 3,000-token prompt spent 10.8 and 6.7 s copying them.  Such an expert takes the CPU too, as jobs of MAXT
+        // rows (its weights read once a job), where those jobs' measured time is below the expert's copy
+        // (STRATA_PROMPT_CPU_SPLIT_ROWS=0: as before)
+        static const bool split_rows = [] { const char* v = std::getenv("STRATA_PROMPT_CPU_SPLIT_ROWS"); return v == nullptr || v[0] != '0'; }();
         for (const auto& [c, e] : missed) {
-            if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
+            if (rows + c > P.cpu_cap) break;
+            if (c <= k::cpu::MAXT) {
+                if (want <= 0) continue;
+                --want;
+            } else {
+                const int64_t jobs = (c + k::cpu::MAXT - 1) / k::cpu::MAXT;
+                if (!split_rows || split_.c <= 0.0 || (double) jobs * 1.5 * split_.c >= split_.p) continue;
+            }
             on_cpu[(size_t) e] = 1;
             cpu_experts.push_back(e);
             rows += c;
-            --want;
         }
     }
     // rows in expert order, the GPU's experts first (their bounds one run), the CPU's after them
@@ -393,6 +420,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
     else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
     mark(1);
+    const auto tg0_ = std::chrono::steady_clock::now();
     const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
     std::unique_lock<std::mutex> src_lk(g_prompt_src_mu, std::defer_lock);
     if (transient) src_lk.lock();
@@ -422,12 +450,21 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     // a transient source's blobs through pinned host memory (h_stage's halves, as the device staging's) with the copies
     // beside the products, instead of each copied from pageable memory before the next is read
     const bool bounce = transient && P.h_stage != nullptr && pg.overlap();
+    if (prof_rst_ == &st) { st.bounce = st.bounce || bounce; st.transient = st.transient || transient; }
     for (size_t g0 = 0, gi = 0; use_mmq && g0 < experts.size(); ++gi) {
+        auto tq0 = std::chrono::steady_clock::now();
         if (transient && !bounce && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
             err = std::string("plain prompt: ") + strata::gpu::last_error();
             return false;
         }
+        auto tq1 = std::chrono::steady_clock::now();
         if (fetch.valid()) fetch.wait();   // this group's missed experts are assembled
+        auto tq2 = std::chrono::steady_clock::now();
+        if (prof_rst_ == &st) {
+            st.sync_ms += std::chrono::duration<double, std::milli>(tq1 - tq0).count();
+            st.fetch_ms += std::chrono::duration<double, std::milli>(tq2 - tq1).count();
+            ++st.n_groups;
+        }
         fetch_group(gi + 1);
         size_t g1 = g0;
         int staged = 0;
@@ -435,10 +472,12 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         // the half of the staging this group takes; its copies wait for the products two groups back
         const bool ovl = (!transient || bounce) && pg.overlap();
         const int h = (int) (gi % 2);
+        const auto te0 = std::chrono::steady_clock::now();
         if (bounce && pg.ready_live[h] && !strata::gpu::event_sync(pg.ready[h])) {   // the half's last copies are done
             err = std::string("plain prompt: ") + strata::gpu::last_error();
             return false;
         }
+        if (prof_rst_ == &st) st.ev_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
         strata::gpu::Stream ccs = ovl ? pg.xs : cs;
         if (ovl && pg.used_live[h] && !strata::gpu::stream_wait_event(ccs, pg.used[h])) {
             err = std::string("plain prompt: ") + strata::gpu::last_error();
@@ -454,18 +493,35 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
                 if (staged == PromptBufs::kGroup) break;
                 const size_t at = (size_t) ((ovl ? h * PromptBufs::kGroup : 0) + staged++) * lay.max_blob;
                 uint8_t* dst = P.stage + at;
+                const auto tb0 = std::chrono::steady_clock::now();
                 const uint8_t* hb = src_->blob(ml, e);
                 if (bounce && hb != nullptr) {
                     std::memcpy(P.h_stage + at, hb, f.bytes);
                     hb = P.h_stage + at;
                 }
+                const auto tb1 = std::chrono::steady_clock::now();
                 const bool copied = hb != nullptr && (transient && !bounce ? strata::gpu::copy(dst, hb, f.bytes)
                                                                            : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
+                if (prof_rst_ == &st) {
+                    st.blob_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
+                    st.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb1).count();
+                    ++st.n_up;
+                    st.n_up_transient += src_->transient(ml, e) ? 1 : 0;
+                }
                 if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
                 blob = dst;
             }
             P.h_wtab[g1] = blob;
             mr = std::max<int64_t>(mr, count[(size_t) e]);
+        }
+        static const bool gsync = std::getenv("STRATA_EXPERT_SYNC_PROFILE") != nullptr;   // b70-local: each group's copies and products timed apart
+        auto tgs = std::chrono::steady_clock::now();
+        if (gsync && prof_rst_ == &st) {
+            strata::gpu::stream_sync(cs);
+            tgs = std::chrono::steady_clock::now();
+            strata::gpu::stream_sync(ccs);
+            st.gcopy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tgs).count();
+            tgs = std::chrono::steady_clock::now();
         }
         if (ovl && (!strata::gpu::event_record(pg.ready[h], ccs) || !strata::gpu::stream_wait_event(cs, pg.ready[h]))) {
             err = std::string("plain prompt: ") + strata::gpu::last_error();
@@ -500,6 +556,10 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
         dn.dst = P.parts; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;   // routing order
         pg.mmq.run(dn, cs);
+        if (gsync && prof_rst_ == &st) {
+            strata::gpu::stream_sync(cs);
+            st.gmmq_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tgs).count();
+        }
         if (ovl) {
             if (!strata::gpu::event_record(pg.used[h], cs)) {
                 err = std::string("plain prompt: ") + strata::gpu::last_error();
@@ -512,6 +572,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     // the CPU's rows go into parts after the GPU's products are queued (it computes beside them): here on
     // the int8 path, which writes parts itself; after the FP16 path's gather, which writes every routing
     // entry's row of parts (the CPU's from rows of dm no product wrote)
+    if (prof_rst_ == &st) st.gpu_loop_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg0_).count();
     if (use_mmq && !cpu_experts.empty() && !prompt_cpu_experts(ml, cpu_experts, count, start, err))
         return false;
     st.cpu_n += (int64_t) cpu_experts.size();
