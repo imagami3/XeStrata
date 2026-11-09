@@ -25,6 +25,15 @@ namespace strata::kernels {
 void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const float* base, float rms_eps, float hc_eps,
                  int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream);
 
+/// b70-local: hc_read in one launch (quantize, the mixes' Q8_0 rows product, glm5_hc_pre, the weighted RMS norm and
+/// its q8_1): fn_rows kNativeQ8Rows [24][4 n_embd]; hn [T][N] with its q8_1 blocks in xq, post [T][4], comb [T][16].
+void glm5_hc_read_fused(const float* hs, const void* fn_rows, const float* scale, const float* base, float rms_eps,
+                        float hc_eps, int iters, const float* gamma, float norm_eps, float* hn, void* xq, float* post,
+                        float* comb, int64_t n_embd, int64_t n_tokens, void* stream);
+
+/// b70-local: softmax probability of row 0's top token -> *out (a float, may be mapped host memory)
+void glm5_top_prob(const float* logits, int n, float* out, void* stream);
+
 /// The streams before the first block: every stream the token's embedding, hs[t][s] = x[t] (llama.cpp's hc_init).
 void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream);
 

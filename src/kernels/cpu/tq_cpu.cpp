@@ -92,9 +92,9 @@ const int16_t* tq_state_table() {
     return g_table;
 }
 
-bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146; }
+bool tq_supported(int t) noexcept { return t == 143 || t == 144 || t == 145 || t == 146; }
 
-int tq_kbits(int t) noexcept { return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : 0; }
+int tq_kbits(int t) noexcept { return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : t == 143 ? kPtq1Kb : 0; }
 
 bool tq_isa_ok(TqIsa isa) {
 #if defined(STRATA_TQ_X86)
@@ -143,8 +143,44 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
     }
 }
 
+const int8_t* ptq1_digit_table() {
+    static int8_t tab[256 * 8];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        static const int p3[5] = {1, 3, 9, 27, 81};
+        for (int q = 0; q < 256; ++q)
+            for (int n = 0; n < 8; ++n) tab[8 * q + n] = n < 5 ? (int8_t) (((((q * p3[n]) & 255) * 3) >> 8) - 1) : 0;
+    });
+    return tab;
+}
+
+void ptq1_rows_scalar(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                      int r1) {
+    const int nb = n / 128;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        float acc[kTqMaxTokens][4] = {};
+        alignas(64) int16_t tw[128];
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * 28;
+            ptq1_block_trits(blk, tw);
+            const float dx = tq_half_to_float(tq_ld16(blk + 26));
+            for (int t = 0; t < nt; ++t) {
+                const int16_t* q = a[t]->q + 128 * i;
+                for (int k = 0; k < 4; ++k) {
+                    int32_t s = 0;
+                    for (int j = 0; j < 32; ++j) s += tw[32 * k + j] * q[32 * k + j];
+                    acc[t][k] = std::fma((float) s, dx * a[t]->d[4 * i + k], acc[t][k]);
+                }
+            }
+        }
+        for (int t = 0; t < nt; ++t) out[t][r] = (acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3]);
+    }
+}
+
 void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
+    if (kb == kPtq1Kb) { ptq1_rows_scalar(w, row_bytes, n, a, nt, out, r0, r1); return; }
     if (kb == 8) rows_scalar_t<8>(w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 6) rows_scalar_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
     else rows_scalar_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
@@ -174,8 +210,14 @@ void rows_on(TqIsa isa, int kb, const uint8_t* w, size_t row_bytes, int n, const
              float* const* out, int r0, int r1) {
     switch (isa) {
 #if defined(STRATA_TQ_X86)
-        case TqIsa::avx512: tq_detail::tq_rows_avx512(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
-        case TqIsa::avx2: tq_detail::tq_rows_avx2(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
+        case TqIsa::avx512:   // PTQ1_0: the AVX2 kernel on an AVX-512 CPU too
+            if (kb == kPtq1Kb) tq_detail::ptq1_rows_avx2(w, row_bytes, n, a, nt, out, r0, r1);
+            else tq_detail::tq_rows_avx512(kb, w, row_bytes, n, a, nt, out, r0, r1);
+            break;
+        case TqIsa::avx2:
+            if (kb == kPtq1Kb) tq_detail::ptq1_rows_avx2(w, row_bytes, n, a, nt, out, r0, r1);
+            else tq_detail::tq_rows_avx2(kb, w, row_bytes, n, a, nt, out, r0, r1);
+            break;
 #endif
         default: tq_detail::tq_rows_scalar(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
     }

@@ -67,6 +67,10 @@ void kq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// Q8_0 (8) rows against Q8_0 activations, several tokens at once: gate/up with SwiGLU, and plain rows.
 void q80_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                      float* const* ff, int r0, int r1);
+/// b70-local: NVFP4 rows against nt Q8_0 activations, the weights decoded once for all tokens; each token's value is
+/// ggml-cpu's AVX-2 vec_dot_nvfp4_q8_0 bit for bit (rows r0..r1 of out[t]).  AVX-2 CPUs only (cpu_avx2_ok).
+void nvfp4_rows_mt(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                   int r0, int r1);
 void q80_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                   int r0, int r1);
 /// The four in a given variant (only the kIq256Vnni bit matters here; tests and benches).

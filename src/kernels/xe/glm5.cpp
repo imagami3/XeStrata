@@ -6,9 +6,11 @@
 // Transcribed from llama.cpp f9a95ae (src/models/glm5-next.cpp; ggml/src/ggml-cpu/ops.cpp's dsv4_hc_comb,
 // gated_delta_net and swiglu_clamp); MIT License, Copyright (c) 2023-2026 The ggml authors, see
 // third_party/main/ggml/LICENSE.  The KDA step keeps the layout and the sub-group shape of native_gdn.cpp.
+#include <cstdlib>
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "q8_1_finite.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_glm5
 #include "strata/kernels/device_arch_tag.hpp"
@@ -40,7 +42,9 @@ void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const f
     if (n_tokens <= 0) return;
     if (n_embd <= 0 || iters < 1) throw core::DeviceError("glm5_hc_pre: n_embd " + std::to_string(n_embd) + ", iters " +
                                                           std::to_string(iters));
-    constexpr int WG = 256;
+    // b70-local: 1024 work-items a token, not 256 (a token's 4N values read 64 apart was most of the time at T = 3:
+    // three work-groups on the whole card)
+    constexpr int WG = 1024;
     const int64_t N = n_embd;
     const auto event = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> pre_l(sycl::range<1>(HC), h);
@@ -52,54 +56,47 @@ void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const f
             float ss = 0.0f;
             for (int64_t i = lid; i < HC * N; i += WG) ss += xt[i] * xt[i];
             ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
-            if (lid == 0) {
+            // b70-local: the 4 x 4 Sinkhorn on 16 lanes of the first sub-group, lane L holding c[L] (dst = L % 4,
+            // src = L / 4); each sum gathers its four values in the serial loop's order, so every value is bitwise the
+            // one-lane loop's (21.6 us -> a few, B70, T = 3)
+            const sycl::sub_group sg = it.get_sub_group();
+            if (sg.get_group_linear_id() == 0) {
+                const int L = (int) sg.get_local_linear_id();
                 const float inv = 1.0f / sycl::sqrt(ss / (float) (HC * N) + rms_eps);
-                float m[MIX];
-                for (int i = 0; i < MIX; ++i) m[i] = mixes[t * MIX + i] * inv;
-                for (int s = 0; s < HC; ++s) {
-                    pre_l[s] = sigmoid(m[s] * scale[0] + base[s]) + hc_eps;
-                    post[t * HC + s] = 2.0f * sigmoid(m[HC + s] * scale[1] + base[HC + s]);
+                if (L < HC) {
+                    pre_l[L] = sigmoid(mixes[t * MIX + L] * inv * scale[0] + base[L]) + hc_eps;
+                    post[t * HC + L] = 2.0f * sigmoid(mixes[t * MIX + HC + L] * inv * scale[1] + base[HC + L]);
                 }
-                // ggml_dsv4_hc_comb: softmax over dst for each src, + eps, then the Sinkhorn rounds
-                float c[HC * HC];
-                for (int src = 0; src < HC; ++src) {
+                const int Lc = L < HC * HC ? L : 0, dst = Lc % HC, src = Lc / HC;
+                float cv = (mixes[t * MIX + 2 * HC + Lc] * inv) * scale[2] + base[2 * HC + Lc];
+                auto at = [&](float v, int idx) { return sycl::select_from_group(sg, v, idx); };
+                {   // softmax over dst for this src
                     float mx = -INFINITY;
-                    for (int dst = 0; dst < HC; ++dst) {
-                        const int idx = dst + HC * src;
-                        c[idx] = m[2 * HC + idx] * scale[2] + base[2 * HC + idx];
-                        mx = sycl::fmax(mx, c[idx]);
-                    }
+                    for (int d = 0; d < HC; ++d) mx = sycl::fmax(mx, at(cv, d + HC * src));
+                    const float e = sycl::exp(cv - mx);
                     float sum = 0.0f;
-                    for (int dst = 0; dst < HC; ++dst) {
-                        const int idx = dst + HC * src;
-                        c[idx] = sycl::exp(c[idx] - mx);
-                        sum += c[idx];
-                    }
+                    for (int d = 0; d < HC; ++d) sum += at(e, d + HC * src);
                     const float inv_sum = 1.0f / sum;
-                    for (int dst = 0; dst < HC; ++dst) c[dst + HC * src] = c[dst + HC * src] * inv_sum + hc_eps;
+                    cv = e * inv_sum + hc_eps;
                 }
                 auto norm_cols = [&]() {
-                    for (int dst = 0; dst < HC; ++dst) {
-                        float sum = hc_eps;
-                        for (int src = 0; src < HC; ++src) sum += c[dst + HC * src];
-                        const float inv_sum = 1.0f / sum;
-                        for (int src = 0; src < HC; ++src) c[dst + HC * src] *= inv_sum;
-                    }
+                    float sum = hc_eps;
+                    for (int s2 = 0; s2 < HC; ++s2) sum += at(cv, dst + HC * s2);
+                    const float inv_sum = 1.0f / sum;
+                    cv *= inv_sum;
                 };
                 auto norm_rows = [&]() {
-                    for (int src = 0; src < HC; ++src) {
-                        float sum = hc_eps;
-                        for (int dst = 0; dst < HC; ++dst) sum += c[dst + HC * src];
-                        const float inv_sum = 1.0f / sum;
-                        for (int dst = 0; dst < HC; ++dst) c[dst + HC * src] *= inv_sum;
-                    }
+                    float sum = hc_eps;
+                    for (int d = 0; d < HC; ++d) sum += at(cv, d + HC * src);
+                    const float inv_sum = 1.0f / sum;
+                    cv *= inv_sum;
                 };
                 norm_cols();
                 for (int i = 1; i < iters; ++i) {
                     norm_rows();
                     norm_cols();
                 }
-                for (int i = 0; i < HC * HC; ++i) comb[t * HC * HC + i] = c[i];
+                if (L < HC * HC) comb[t * HC * HC + L] = cv;
             }
             sycl::group_barrier(it.get_group());
             const float p0 = pre_l[0], p1 = pre_l[1], p2 = pre_l[2], p3 = pre_l[3];
@@ -108,6 +105,145 @@ void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const f
         });
     });
     sync_if_needed(stream, event, "glm5_hc_pre");
+}
+
+
+// b70-local: the mHC read of a block in one launch a token (hc_read's four: the streams' q8_1, the 24 mixes' Q8_0
+// products, glm5_hc_pre, the weighted RMS norm with its q8_1): 35 us -> one kernel at T = 3 (B70).  The mixes are
+// FP32 products of the streams with the Q8_0 rows (not of the streams' q8_1), so the values differ from the four
+// launches' by those roundings; the Sinkhorn, y and the norm are theirs.  fn: kNativeQ8Rows (a row's qs, then its d),
+// [24][4N].  hn [T][N] and its q8_1 blocks (xq), post [T][4], comb [T][16].
+void glm5_hc_read_fused(const float* hs, const void* fn_rows, const float* scale, const float* base, float rms_eps,
+                        float hc_eps, int iters, const float* gamma, float norm_eps, float* hn, void* xq, float* post,
+                        float* comb, int64_t n_embd, int64_t n_tokens, void* stream) {
+    if (n_tokens <= 0) return;
+    constexpr int WG = 1024, NW = WG / WARP, NV = MIX + 1;   // the 24 mixes and the sum of squares
+    const int64_t N = n_embd, HN = HC * N;
+    if (HN % WG != 0 || N % WG != 0 || HN / WG > 32) throw core::DeviceError("glm5_hc_read_fused: n_embd");
+    const int bpr = (int) (HN / 32);
+    const uint8_t* W = static_cast<const uint8_t*>(fn_rows);
+    struct Q81b { sycl::half2 ds; int8_t qs[32]; };
+    Q81b* blocks = static_cast<Q81b*>(xq);
+    const auto event = queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) NW * NV), h);
+        sycl::local_accessor<float, 1> mixl(sycl::range<1>(NV), h);
+        sycl::local_accessor<float, 1> pre_l(sycl::range<1>(HC), h);
+        sycl::local_accessor<float, 1> sq(sycl::range<1>(NW), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int64_t t = (int64_t) it.get_group(0);
+            const int lid = (int) it.get_local_id(0);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int w = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const float* xt = hs + t * HN;
+            float acc[NV];
+            #pragma unroll
+            for (int v = 0; v < NV; ++v) acc[v] = 0.0f;
+            for (int64_t i = lid; i < HN; i += WG) {
+                const float x = xt[i];
+                acc[MIX] += x * x;
+                const int kb = (int) (i / 32);
+                #pragma unroll
+                for (int r = 0; r < MIX; ++r) {
+                    const uint8_t* row = W + (size_t) r * (size_t) bpr * 34;
+                    const float d = (float) *reinterpret_cast<const sycl::half*>(row + (size_t) bpr * 32 + (size_t) kb * 2);
+                    acc[r] += x * (d * (float) (int8_t) row[i]);
+                }
+            }
+            #pragma unroll
+            for (int v = 0; v < NV; ++v) {
+                const float sv = sycl::reduce_over_group(sg, acc[v], sycl::plus<float>());
+                if (lane == 0) red[w * NV + v] = sv;
+            }
+            sycl::group_barrier(it.get_group());
+            if (w == 0) {
+                for (int v = 0; v < NV; ++v) {
+                    const float sv = sycl::reduce_over_group(sg, lane < NW ? red[lane * NV + v] : 0.0f, sycl::plus<float>());
+                    if (lane == 0) mixl[v] = sv;
+                }
+                sycl::group_barrier(sg);
+                // glm5_hc_pre's pre / post / comb from the mixes (the Sinkhorn on 16 lanes, as there)
+                const int L = lane;
+                const float inv = 1.0f / sycl::sqrt(mixl[MIX] / (float) HN + rms_eps);
+                if (L < HC) {
+                    pre_l[L] = sigmoid(mixl[L] * inv * scale[0] + base[L]) + hc_eps;
+                    post[t * HC + L] = 2.0f * sigmoid(mixl[HC + L] * inv * scale[1] + base[HC + L]);
+                }
+                const int Lc = L < HC * HC ? L : 0, dst = Lc % HC, src = Lc / HC;
+                float cv = (mixl[2 * HC + Lc] * inv) * scale[2] + base[2 * HC + Lc];
+                auto at = [&](float v, int idx) { return sycl::select_from_group(sg, v, idx); };
+                {
+                    float mx = -INFINITY;
+                    for (int d = 0; d < HC; ++d) mx = sycl::fmax(mx, at(cv, d + HC * src));
+                    const float e = sycl::exp(cv - mx);
+                    float sum = 0.0f;
+                    for (int d = 0; d < HC; ++d) sum += at(e, d + HC * src);
+                    cv = e * (1.0f / sum) + hc_eps;
+                }
+                auto norm_cols = [&]() {
+                    float sum = hc_eps;
+                    for (int s2 = 0; s2 < HC; ++s2) sum += at(cv, dst + HC * s2);
+                    cv *= 1.0f / sum;
+                };
+                auto norm_rows = [&]() {
+                    float sum = hc_eps;
+                    for (int d = 0; d < HC; ++d) sum += at(cv, d + HC * src);
+                    cv *= 1.0f / sum;
+                };
+                norm_cols();
+                for (int i = 1; i < iters; ++i) {
+                    norm_rows();
+                    norm_cols();
+                }
+                if (L < HC * HC) comb[t * HC * HC + L] = cv;
+            }
+            sycl::group_barrier(it.get_group());
+            const float p0 = pre_l[0], p1 = pre_l[1], p2 = pre_l[2], p3 = pre_l[3];
+            constexpr int PER = 8;   // N / WG at most (N = 4096: 4)
+            float y[PER];
+            float ys = 0.0f;
+            const int per = (int) (N / WG);
+            for (int k = 0; k < per; ++k) {
+                const int64_t n = lid + (int64_t) k * WG;
+                y[k] = ((xt[n] * p0 + xt[N + n] * p1) + xt[2 * N + n] * p2) + xt[3 * N + n] * p3;
+                ys += y[k] * y[k];
+            }
+            ys = sycl::reduce_over_group(sg, ys, sycl::plus<float>());
+            if (lane == 0) sq[w] = ys;
+            sycl::group_barrier(it.get_group());
+            const float tot = sycl::reduce_over_group(sg, lane < NW ? sq[lane] : 0.0f, sycl::plus<float>());
+            const float sc = sycl::rsqrt(tot / (float) N + norm_eps);
+            for (int k = 0; k < per; ++k) {
+                const int64_t n = lid + (int64_t) k * WG;
+                const float v = sc * y[k] * gamma[n];
+                hn[t * N + n] = v;
+                const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
+                const float sum = sycl::reduce_over_group(sg, v, sycl::plus<float>());
+                const float d = xe::q8_1_finite(amax / 127.0f);
+                const int64_t bi = (t * N + n) / 32;
+                blocks[bi].qs[(t * N + n) % 32] = xe::q8_1_quant(v, d, amax);
+                if (lane == 0) blocks[bi].ds = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            }
+        });
+    });
+    sync_if_needed(stream, event, "glm5_hc_read_fused");
+}
+
+
+// b70-local: the softmax probability of row 0's most likely token (the greedy draft's), written as a float to
+// out (a mapped host word): the adaptive draft length's confidence.  One work-group over the n logits.
+void glm5_top_prob(const float* logits, int n, float* out, void* stream) {
+    constexpr int WG = 1024;
+    const auto event = queue_for(stream).parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const int lid = (int) it.get_local_id(0);
+        float mx = -INFINITY;
+        for (int i = lid; i < n; i += WG) mx = sycl::fmax(mx, logits[i]);
+        mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+        float sum = 0.0f;
+        for (int i = lid; i < n; i += WG) sum += sycl::exp(logits[i] - mx);
+        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        if (lid == 0) *out = 1.0f / sum;
+    });
+    sync_if_needed(stream, event, "glm5_top_prob");
 }
 
 void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream) {
@@ -167,23 +303,40 @@ void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, vo
 void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, int n_expert, int k, bool norm,
                          float scale, int32_t* ids, float* weights, void* stream) {
     if (n_tokens <= 0) return;
-    if (n_expert <= 0 || k <= 0 || k > WARP || k > n_expert)
+    if (n_expert <= 0 || k <= 0 || k > WARP || k > n_expert || n_expert > 16 * WARP)
         throw core::DeviceError("glm5_router_sigmoid: " + std::to_string(k) + " of " + std::to_string(n_expert) +
                                 " experts (at most 32 picks)");
+    // b70-local: STRATA_MOE_KEEP=k1 (< k) keeps only the first k1 picks with the weights they have among all k
+    // (normalised over the k picks, as trained; Chen and Yao's k2 = trained k): the others get weight 0 (quality runs;
+    // they are still computed). Unset or >= k: unchanged.
+    static const int keep_env = [] { const char* v = std::getenv("STRATA_MOE_KEEP"); return v ? std::atoi(v) : 0; }();
+    const int keep = keep_env > 0 && keep_env < k ? keep_env : k;
     const auto event = queue_for(stream).parallel_for(
         sycl::nd_range<1>((size_t) n_tokens * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_group(0), lane = (int) sg.get_local_linear_id();
             const float* l = logits + (size_t) t * n_expert;
-            // pass i: the best below pass i - 1's pick in the order (larger biased score, then lower index)
+            // b70-local: each lane's biased scores computed once (n_expert / WARP of them, up to kRouterPer), then k
+            // passes over them in registers: pass i takes the best below pass i - 1's pick in the order (larger biased
+            // score, then lower index), the same picks as before (26.7 -> a few us at 288 experts, B70)
+            constexpr int kRouterPer = 16;
+            float v[kRouterPer];
+            #pragma unroll
+            for (int j = 0; j < kRouterPer; ++j) {
+                const int e = lane + j * WARP;
+                v[j] = e < n_expert ? sigmoid(l[e]) + bias[e] : -INFINITY;
+            }
             float pv = INFINITY, mine = 0.0f;
             int pi = -1;
             for (int i = 0; i < k; ++i) {
                 float bv = -INFINITY;
                 int bi = n_expert;
-                for (int e = lane; e < n_expert; e += WARP) {
-                    const float v = sigmoid(l[e]) + bias[e];
-                    if ((v < pv || (v == pv && e > pi)) && (v > bv || (v == bv && e < bi))) { bv = v; bi = e; }
+                #pragma unroll
+                for (int j = 0; j < kRouterPer; ++j) {
+                    const int e = lane + j * WARP;
+                    if (e >= n_expert) break;
+                    const float x = v[j];
+                    if ((x < pv || (x == pv && e > pi)) && (x > bv || (x == bv && e < bi))) { bv = x; bi = e; }
                 }
                 for (int off = WARP / 2; off > 0; off >>= 1) {
                     const float ov = sycl::permute_group_by_xor(sg, bv, off);
@@ -202,7 +355,7 @@ void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, i
                 const float sum = sycl::reduce_over_group(sg, lane < k ? mine : 0.0f, sycl::plus<float>());
                 div = sycl::fmax(sum, 6.103515625e-05f);   // 2**-14, as llama.cpp
             }
-            if (lane < k) weights[(size_t) t * k + lane] = mine / div * scale;
+            if (lane < k) weights[(size_t) t * k + lane] = lane < keep ? mine / div * scale : 0.0f;
         });
     sync_if_needed(stream, event, "glm5_router_sigmoid");
 }
@@ -285,11 +438,11 @@ void glm5_kda_step(float* state, const float* q, const float* k, const float* v,
     // one sub-group a (head, column): its four state rows a lane in registers, as native_gdn_step
     const auto event = queue_for(stream).parallel_for(
         sycl::nd_range<2>({(size_t) H, (size_t) S * WARP}, {1, (size_t) COLS * WARP}),
-        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        [=, cols = COLS](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int head = (int) it.get_group(0);
             const int lane = (int) sg.get_local_linear_id();
-            const int col = (int) it.get_group(1) * COLS + (int) sg.get_group_linear_id();
+            const int col = (int) it.get_group(1) * cols + (int) sg.get_group_linear_id();
             float s[4], kr[4], qr[4], dr[4];
             float kv = 0.0f;
             for (int r = 0; r < 4; ++r) {
@@ -317,7 +470,11 @@ void glm5_kda_step(float* state, const float* q, const float* k, const float* v,
 void glm5_kda_scan(float* state, const float* q, const float* k, const float* v, const float* g, const float* beta,
                    float* out, int64_t n_heads, int64_t n_tokens, void* stream, float* const* snaps, int n_snaps) {
     constexpr int S = 128;
-    constexpr int COLS = 4;   // columns (sub-groups) a work-group
+    // columns (sub-groups) a work-group.  b70-local: 16, not 4 - a lane's state rows lie H S floats apart, so a
+    // sub-group's load touches 32 lines and uses 4 bytes of each; 16 neighbouring columns a work-group use them whole
+    // (each column's arithmetic unchanged)
+    static const int COLS = [] { const char* e = std::getenv("STRATA_KDA_SCAN_COLS"); return e ? std::atoi(e) : 16; }();
+    if (COLS < 1 || S % COLS != 0 || COLS * WARP > 1024) throw core::DeviceError("glm5_kda_scan: STRATA_KDA_SCAN_COLS");
     if (n_heads <= 0 || n_heads > 65535) throw core::DeviceError("glm5_kda_scan: " + std::to_string(n_heads) + " heads");
     if (n_snaps < 0 || n_snaps > kGlm5MaxSnaps) throw core::DeviceError("glm5_kda_scan: too many snapshots");
     if (n_tokens <= 0) return;
@@ -327,14 +484,76 @@ void glm5_kda_scan(float* state, const float* q, const float* k, const float* v,
     const int H = (int) n_heads;
     const int64_t T = n_tokens, TS = (int64_t) H * S;
     const float scale = 1.0f / sycl::sqrt((float) S);
+    // b70-local: STRATA_KDA_SCAN_LDS (default on) - the work-group's 16 columns of the state through local memory: the
+    // loads and stores (state, snapshots) go 16 columns side by side (64 contiguous bytes a key row) instead of a lane
+    // a key row H S floats apart (32 lines a load).  Each column's arithmetic is the one below's, bit for bit.
+    static const bool lds = [] { const char* e = std::getenv("STRATA_KDA_SCAN_LDS"); return e == nullptr || e[0] != '0'; }();
+    if (lds) {
+        constexpr int C16 = 16, PAD = C16 + 1, WG = C16 * WARP;
+        const auto ev = queue_for(stream).submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> tile(sycl::range<1>((size_t) S * PAD), h);
+            h.parallel_for(sycl::nd_range<2>({(size_t) H, (size_t) (S / C16) * WG}, {1, (size_t) WG}),
+                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int head = (int) it.get_group(0);
+                const int lane = (int) sg.get_local_linear_id();
+                const int w = (int) sg.get_group_linear_id();
+                const int c0 = (int) it.get_group(1) * C16, col = c0 + w;
+                const int tid = (int) it.get_local_id(1);
+                auto gidx = [&](int i, int c) { return ((size_t) i * H + head) * S + c0 + c; };
+                // the tile's key rows: 16 columns a row, contiguous in memory
+                for (int e = tid; e < S * C16; e += WG) tile[(e / C16) * PAD + e % C16] = state[gidx(e / C16, e % C16)];
+                sycl::group_barrier(it.get_group());
+                float s[4];
+                for (int r = 0; r < 4; ++r) s[r] = tile[(r * WARP + lane) * PAD + w];
+                const int64_t hs = (int64_t) head * S;
+                for (int64_t t = 0; t < T; ++t) {
+                    const float* gt = g + t * TS + hs;
+                    const float* kt = k + t * TS + hs;
+                    const float* qt = q + t * TS + hs;
+                    float kr[4], qr[4];
+                    float kv = 0.0f;
+                    for (int r = 0; r < 4; ++r) {
+                        const int i = r * WARP + lane;
+                        s[r] = sycl::exp(gt[i]) * s[r];
+                        kr[r] = kt[i];
+                        qr[r] = qt[i];
+                        kv += s[r] * kr[r];
+                    }
+                    kv = sycl::reduce_over_group(sg, kv, sycl::plus<float>());
+                    const float delta = (v[t * TS + hs + col] - kv) * beta[t * H + head];
+                    float o = 0.0f;
+                    for (int r = 0; r < 4; ++r) {
+                        s[r] += kr[r] * delta;
+                        o += s[r] * qr[r];
+                    }
+                    o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
+                    if (lane == 0) out[t * TS + hs + col] = o * scale;
+                    if (t < NS) {   // the state after this row through the tile, written 16 columns side by side
+                        sycl::group_barrier(it.get_group());
+                        for (int r = 0; r < 4; ++r) tile[(r * WARP + lane) * PAD + w] = s[r];
+                        sycl::group_barrier(it.get_group());
+                        float* sp = sn.p[t];
+                        for (int e = tid; e < S * C16; e += WG) sp[gidx(e / C16, e % C16)] = tile[(e / C16) * PAD + e % C16];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                for (int r = 0; r < 4; ++r) tile[(r * WARP + lane) * PAD + w] = s[r];
+                sycl::group_barrier(it.get_group());
+                for (int e = tid; e < S * C16; e += WG) state[gidx(e / C16, e % C16)] = tile[(e / C16) * PAD + e % C16];
+            });
+        });
+        sync_if_needed(stream, ev, "glm5_kda_scan");
+        return;
+    }
     // one sub-group a (head, column): its four state rows a lane in registers, as native_gdn_step
     const auto event = queue_for(stream).parallel_for(
         sycl::nd_range<2>({(size_t) H, (size_t) S * WARP}, {1, (size_t) COLS * WARP}),
-        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        [=, cols = COLS](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int head = (int) it.get_group(0);
             const int lane = (int) sg.get_local_linear_id();
-            const int col = (int) it.get_group(1) * COLS + (int) sg.get_group_linear_id();
+            const int col = (int) it.get_group(1) * cols + (int) sg.get_group_linear_id();
             float s[4];
             for (int r = 0; r < 4; ++r) s[r] = state[((size_t) (r * WARP + lane) * H + head) * S + col];
             const int64_t hs = (int64_t) head * S;

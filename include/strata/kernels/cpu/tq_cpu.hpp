@@ -39,7 +39,12 @@ bool tq_supported(int ggml_type) noexcept;
 int tq_kbits(int ggml_type) noexcept;
 /// Values per block of the trellis types, and bytes per block (2 + 4 * bits: 34, 26, 30).
 constexpr int kTqBlock = 128;
-inline size_t tq_block_bytes(int ggml_type) noexcept { return (size_t) (2 + 4 * tq_kbits(ggml_type)); }
+/// b70-local: Prism's PTQ1_0 (ggml 143, plain ternary: 26 B of base-3 digits + fp16 d at the end) rides the same row API;
+/// its "bits" value is the sentinel kPtq1Kb and its block is 28 bytes.
+inline constexpr int kPtq1Kb = 1;
+inline size_t tq_block_bytes(int ggml_type) noexcept {
+    return ggml_type == 143 ? (size_t) 28 : (size_t) (2 + 4 * tq_kbits(ggml_type));
+}
 /// The best ISA this CPU runs (capped by STRATA_TQ_ISA).
 TqIsa tq_isa();
 /// Whether this CPU can run `isa` at all (scalar: always).
@@ -74,6 +79,20 @@ struct TqAct {
     alignas(64) float d[kTqMaxN / 32];
 };
 void unpack_act(const void* q8_0, int n, TqAct& a);
+/// PTQ1_0 rows (kb == kPtq1Kb in the row kernels): digits of a 128-weight block decoded through a 256 x 5 table, then
+/// the trellis arithmetic (four float accumulators, one per Q8_0 sub-block position), unscaled.
+void ptq1_rows_scalar(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                      int r1);
+void ptq1_rows_avx2(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                    int r1);
+const int8_t* ptq1_digit_table();   // [256][8]: digits 0..4 of a byte (-1, 0, 1), 3 bytes of padding
+/// one block's 128 weights as int16 trits (Prism's value order)
+inline void ptq1_block_trits(const uint8_t* b, int16_t* t) {
+    const int8_t* D = ptq1_digit_table();
+    for (int m = 0; m < 16; ++m) for (int n5 = 0; n5 < 5; ++n5) t[16 * n5 + m] = D[8 * b[m] + n5];
+    for (int m = 0; m < 8; ++m) for (int n5 = 0; n5 < 5; ++n5) t[80 + 8 * n5 + m] = D[8 * b[16 + m] + n5];
+    for (int h = 0; h < 2; ++h) for (int n4 = 0; n4 < 4; ++n4) t[120 + 2 * n4 + h] = D[8 * b[24 + h] + n4];
+}
 // the per-ISA row kernels (dot products only; `out[t][r]` for rows [r0, r1))
 void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1);

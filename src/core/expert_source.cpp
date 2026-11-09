@@ -1113,7 +1113,9 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_file_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
         const auto& fm = lay.fmt[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
+        uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, fm.d_row * (uint64_t) fm.n_embd};
+        if (lay.from_ptq1(l))   // the file's PTQ1_0 slices (role_bytes_), not the blob's Q2_0 ones
+            for (uint64_t& p : per) p = p / 36 * 28;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * l + r);
             const std::string path = lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i]
@@ -1175,6 +1177,35 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
         }
     }
 #endif
+    if (!role_ptr_.empty() && strata::kernels::cpu::expert_layout().from_ptq1(layer)) {
+        // b70-local STRATA_PTQ1_AS_Q2: each role's PTQ1_0 slice read whole, re-packed into the blob's Q2_0 slice
+        thread_local std::vector<uint8_t> raw;
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) (3 * layer + r);
+            const uint64_t per = role_bytes_[i];
+            const uint8_t* src = role_ptr_[i] + (size_t) ((uint64_t) expert * per);
+            const uint8_t* from = src;
+#if !defined(_WIN32)
+            raw.resize((size_t) per);
+            const Map& m = maps_[(size_t) role_file_[i]];
+            const int fd = (size_t) role_file_[i] < io_fds_.size() ? io_fds_[(size_t) role_file_[i]] : m.fd;
+            if (fd >= 0) {
+                uint64_t done = 0;
+                while (done < per) {
+                    const ssize_t n = ::pread(fd, raw.data() + done, (size_t) (per - done),
+                                              (off_t) ((uint64_t) (src - m.base) + done));
+                    if (n <= 0) break;
+                    done += (uint64_t) n;
+                }
+                if (done == per) from = raw.data();
+            }
+#endif
+            strata::kernels::cpu::ptq1_to_q2(from, dst + at, per / 28);
+            at += per / 28 * 36;
+        }
+        return true;
+    }
     if (!role_ptr_.empty()) {
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
@@ -1202,6 +1233,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
             std::memcpy(dst + at, src, (size_t) per);
             at += per;
         }
+        strata::kernels::cpu::expert_layout().write_tail(layer, expert, dst);
         return true;
     }
     const uint8_t* b = mapped_blob(layer, expert);
@@ -1362,7 +1394,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     zc_keys_.clear();
     std::vector<char> zc_ok;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (zc && !role_ptr_.empty() && direct_.empty() && lay.native && lay.fmt[(size_t) layer].tail_off == 0) {
+    if (zc && !role_ptr_.empty() && direct_.empty() && lay.native && !lay.from_ptq1(layer)) {   // NVFP4's tail: see the zero-copy job
         zc_ok.assign((size_t) n, 0);
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -1651,6 +1683,92 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
     if (new_window && gate_on_ && tl_decode) { gate_capacity(); gate_tick(); }
 }
 
+const strata::kernels::cpu::NativeFmt* FileExpertSource::cpu_fmt(int64_t layer, int64_t expert) const {
+    if (cold_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    return cold_[index] ? &cold_fmt_[(size_t) layer] : nullptr;
+}
+
+const strata::kernels::cpu::NativeFmt* FileExpertSource::cold_layer_fmt(int64_t layer) const {
+    if (cold_fmt_.empty() || layer < 0 || layer >= (int64_t) cold_fmt_.size() || cold_fmt_[(size_t) layer].gu_type < 0)
+        return nullptr;
+    return &cold_fmt_[(size_t) layer];
+}
+
+int64_t FileExpertSource::convert_cold(int type) {
+    // b70-local (2026-11-02): the RAM copy holds the experts the GPUs miss, which the CPU computes; on a Zen 3 the
+    // i-quant gate/up rows (IQ3_S, GLM-5.3 UD-IQ4_XS) run ALU-bound at ~26 GB/s, a K-quant at ~42 (coldbench: an
+    // expert 0.41 -> 0.34 ms as Q3_K, 0.26 as Q2_K).  In place: gate rows from 0, up rows at the layer's up_off, down
+    // untouched, so offsets and the blob size stay; the activation format (Q8_K) is the same.
+    namespace kc = strata::kernels::cpu;
+    const auto& lay = kc::expert_layout();
+    if (!complement_ready_ || exchange_storage_.active()) return 0;
+    std::vector<char> lent((size_t) n_layers_ * (size_t) n_expert_, 0);   // VRAM experts the copy keeps too: as they are
+    for (const auto& r : stage_lend_regions_)
+        for (const auto& [l, e] : r) lent[(size_t) l * (size_t) n_expert_ + (size_t) e] = 1;
+    cold_.assign((size_t) n_layers_ * (size_t) n_expert_, 0);
+    cold_fmt_.assign((size_t) n_layers_, kc::NativeFmt{});
+    std::vector<char> layer_ok((size_t) n_layers_, 0);
+    for (int64_t l = 0; l < n_layers_ && l < (int64_t) lay.fmt.size(); ++l) {
+        const kc::NativeFmt& f = lay.fmt[(size_t) l];
+        if (f.gu_type == type || kc::native_mixed_gu(f) || f.had_block != 0 || f.gu_type < 0) continue;
+        kc::NativeFmt g;
+        std::string err;
+        if (!kc::native_fmt(type, f.d_type, f.n_embd, f.n_ff, g, err)) continue;
+        // fits in place; the activation format may differ (an NVFP4 layer's Q8_0 against a K-quant's Q8_K: the CPU
+        // quantizes the tokens both ways, cold_layer_fmt), but then never for the prompt's GPU rows (read from the files)
+        if (g.gu_row * (size_t) f.n_ff > f.up_off) continue;
+        g.up_off = f.up_off;
+        g.down_off = f.down_off;
+        g.bytes = f.bytes;
+        g.tail_off = f.tail_off;
+        cold_fmt_[(size_t) l] = g;
+        layer_ok[(size_t) l] = 1;
+    }
+    std::vector<size_t> todo;
+    for (int64_t l = 0; l < n_layers_; ++l)
+        if (layer_ok[(size_t) l])
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
+                if (!lent[index] && resident_blob(index) != nullptr) todo.push_back(index);
+            }
+    std::atomic<size_t> next{0};
+    std::atomic<int64_t> done{0};
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> th;
+    for (unsigned t = 0; t < nt; ++t)
+        th.emplace_back([&] {
+            std::vector<float> w;
+            std::vector<uint8_t> q;
+            for (size_t i; (i = next.fetch_add(1)) < todo.size();) {
+                const size_t index = todo[i];
+                const int64_t l = (int64_t) (index / (size_t) n_expert_);
+                const kc::NativeFmt& f = lay.fmt[(size_t) l];
+                const kc::NativeFmt& g = cold_fmt_[(size_t) l];
+                uint8_t* b = const_cast<uint8_t*>(resident_blob(index));
+                const int64_t N = f.n_embd, F = f.n_ff;
+                w.resize((size_t) (F * N));
+                q.resize(g.gu_row * (size_t) F);
+                bool ok = true;
+                for (int part = 0; part < 2 && ok; ++part) {   // gate, then up
+                    uint8_t* src = b + (part == 0 ? 0 : f.up_off);
+                    for (int64_t r = 0; r < F && ok; ++r)
+                        ok = kc::native_row_to_float(f.gu_type, src + (size_t) r * f.gu_row, w.data() + (size_t) (r * N), N);
+                    if (ok && f.tail_off != 0 && f.gu_type == 40) {   // NVFP4: the role's weight_scale_2 into the values
+                        float sc = 1.f;
+                        std::memcpy(&sc, b + f.tail_off + 4 * part, 4);
+                        for (float& v : w) v *= sc;
+                    }
+                    if (ok) ok = kc::native_quantize_rows(type, w.data(), q.data(), F, N, nullptr) == q.size();
+                    if (ok) std::memcpy(src, q.data(), q.size());
+                }
+                if (ok) { cold_[index] = 1; done.fetch_add(1); }
+            }
+        });
+    for (auto& t : th) t.join();
+    return done.load();
+}
+
 bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     if (!staged() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -1699,6 +1817,7 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         const uint8_t* held =
             resident_blob(index);
         if (held == nullptr && !override_.empty()) held = override_[index];
+        if (held != nullptr && !cold_.empty() && cold_[index]) held = nullptr;   // b70-local: the file's rows for a GPU
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t) bytes);
             return true;
@@ -2196,6 +2315,13 @@ bool FileExpertSource::pin_complement(
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
     complement_lent_slots_ += stage_lent;   // and the split stages' regions: the pairs the copy kept of them
     complement_ready_ = true;
+    if (const char* ct = std::getenv("STRATA_COLD_GU_TYPE"); ct != nullptr && std::atoi(ct) > 0) {
+        const auto tc0 = std::chrono::steady_clock::now();
+        const int64_t nc = convert_cold(std::atoi(ct));
+        std::fprintf(stderr, "FileExpertSource: cold experts: %lld RAM-copy blobs' gate/up requantized to ggml type %d "
+                             "for the CPU in %.0f s (STRATA_COLD_GU_TYPE)\n", (long long) nc, std::atoi(ct),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count());
+    }
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
@@ -2493,6 +2619,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
         layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (!cold_.empty() && cold_[index]) return false;   // b70-local: a cold blob never goes to a GPU
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host != nullptr;
     if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
     // a partial pin (CS-T): only the registered prefix
@@ -2501,7 +2628,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
-    if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
+    if (!pinned(layer, expert) || complement_device_ == nullptr || cpu_fmt(layer, expert) != nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;
     if (!complement_chunks_.empty()) {
@@ -2962,7 +3089,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else {
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         // pinned() first: blob() is a file read with the GGUF in place (upstream cacffa9)
-                        const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
+                        const uint8_t* src = d.src->pinned(d.layers, e) && !d.src->low(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;   // a cold blob: CPU only
                         if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
@@ -3043,8 +3170,66 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
     } else if (native) {
+        // b70-local: STRATA_DUMP_X_ALL=<dir> [STRATA_DUMP_X_CAP=<rows, 512>]: for every MoE layer, the first CAP inputs each
+        // expert sees, as records {int32 expert, fp16 input[W]} in <dir>/L<layer>.bin, for calibrating low-bit experts
+        static const char* dump_all = std::getenv("STRATA_DUMP_X_ALL");
+        if (dump_all != nullptr) {
+            static const int64_t cap = [] { const char* v = std::getenv("STRATA_DUMP_X_CAP"); return v ? std::atoll(v) : 512; }();
+            static std::mutex mu;
+            static std::vector<FILE*> fps;
+            static std::vector<std::vector<int32_t>> seen;
+            static thread_local std::vector<uint16_t> half;
+            half.resize((size_t) W);
+            std::lock_guard<std::mutex> lk(mu);
+            const size_t ly = (size_t) d.layers;
+            if (fps.size() <= ly) { fps.resize(ly + 1, nullptr); seen.resize(ly + 1); }
+            if (fps[ly] == nullptr) fps[ly] = std::fopen((std::string(dump_all) + "/L" + std::to_string(d.layers) + ".bin").c_str(), "ab");
+            if (fps[ly] != nullptr) {
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    bool have = false;
+                    for (int64_t j = 0; j < k; ++j) {
+                        const int32_t e = ids[t * k + j];
+                        if (e < 0) continue;
+                        if (seen[ly].size() <= (size_t) e) seen[ly].resize((size_t) e + 1, 0);
+                        if (seen[ly][(size_t) e] >= cap) continue;
+                        ++seen[ly][(size_t) e];
+                        if (!have) {
+                            have = true;
+                            for (int64_t i = 0; i < W; ++i) {
+                                uint32_t b;
+                                std::memcpy(&b, &x_f[(size_t) t * W + i], 4);
+                                const int ex = (int) ((b >> 23) & 0xff) - 112;
+                                half[(size_t) i] = (uint16_t) (((b >> 16) & 0x8000u) | (ex <= 0 ? 0u : ex >= 31 ? 0x7c00u : ((uint32_t) ex << 10) | ((b >> 13) & 0x3ffu)));
+                            }
+                        }
+                        std::fwrite(&e, sizeof(int32_t), 1, fps[ly]);
+                        std::fwrite(half.data(), sizeof(uint16_t), (size_t) W, fps[ly]);
+                    }
+                }
+                std::fflush(fps[ly]);
+            }
+        }
+        // b70-local: STRATA_DUMP_X_LAYER=<MoE layer> STRATA_DUMP_X_FILE=<path>: each token's routed experts (k int32)
+        // and its expert input (W floats) appended, for calibrating requantized experts offline (a window with CPU work)
+        static const int64_t dump_layer = [] { const char* v = std::getenv("STRATA_DUMP_X_LAYER"); return v ? std::atoll(v) : -1; }();
+        if (dump_layer == d.layers) {
+            static std::mutex dump_mu;
+            static FILE* dump_fp = [] { const char* f = std::getenv("STRATA_DUMP_X_FILE"); return f ? std::fopen(f, "ab") : nullptr; }();
+            if (dump_fp != nullptr) {
+                std::lock_guard<std::mutex> lk(dump_mu);
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    std::fwrite(ids + t * k, sizeof(int32_t), (size_t) k, dump_fp);
+                    std::fwrite(x_f + (size_t) t * W, sizeof(float), (size_t) W, dump_fp);
+                }
+                std::fflush(dump_fp);
+            }
+        }
         for (int64_t t = 0; t < n_tok; ++t)
             native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi[(size_t) t].bytes);
+        if (const NativeFmt* cf = d.src->cold_layer_fmt(d.layers); cf != nullptr && cf->gu_act != lay.fmt[(size_t) d.layers].gu_act) {
+            if (d.nact_cold.size() < (size_t) MAXT) d.nact_cold.resize((size_t) MAXT);
+            for (int64_t t = 0; t < n_tok; ++t) native_quant_act(*cf, x_f + (size_t) t * W, d.nact_cold[(size_t) t].bytes);
+        }
     } else {
         for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     }
@@ -3102,19 +3287,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
-                nj.fmt = nullptr;
+                nj.fmt = zc ? nullptr : d.src->cpu_fmt(d.layers, e);   // b70-local: a cold blob's own layout
                 if (zc) {   // the gate rows are the blob; up and down at their distance in the mapping
                     strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
                     f = lay.fmt[(size_t) d.layers];
                     f.up_off = (size_t) ((uintptr_t) zp[1] - (uintptr_t) zp[0]);     // modular: the tensors' order
                     f.down_off = (size_t) ((uintptr_t) zp[2] - (uintptr_t) zp[0]);   // in the file does not matter
+                    if (f.tail_off != 0)   // NVFP4: the per-expert scales are not in the file; the layout's host copy
+                        f.tail_off = (size_t) ((uintptr_t) (lay.tail[(size_t) d.layers].data() + 4 * (size_t) e) -
+                                               (uintptr_t) zp[0]);
                     nj.fmt = &f;
                     ++d.cold_zc;
                 }
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
             jb.act[jb.nt] = native ? nullptr : &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi[(size_t) t].bytes : nullptr;
+            // b70-local: a cold blob whose activation format is not the layer's reads the tokens quantized for it
+            const bool cold_act = native && jb.fmt != nullptr && jb.fmt->gu_act != lay.fmt[(size_t) d.layers].gu_act &&
+                                  !d.nact_cold.empty();
+            jb.nact[jb.nt] = native ? (cold_act ? d.nact_cold[(size_t) t].bytes : d.nact_multi[(size_t) t].bytes) : nullptr;
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
@@ -3435,16 +3626,49 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
             }
             // gate and up may differ in type (native_mixed_gu), as long as they read the same activation
             NativeFmt& f = L.fmt[(size_t) l];
-            if (!native_fmt((int) t[0]->type, (int) t[2]->type, n_embd, n_ff, f, err, (int) t[1]->type)) {
+            // b70-local, STRATA_PTQ1_AS_Q2=1: a layer whose three tensors are PTQ1_0 is held and computed as Q2_0
+            // (re-packed as it is read: the Q2_0 container's bytes; faster on the XMX kernels, 1.29x the bytes)
+            static const bool as_q2 = [] { const char* v = std::getenv("STRATA_PTQ1_AS_Q2"); return v != nullptr && v[0] == '1'; }();
+            const bool conv = as_q2 && t[0]->type == 143 && t[1]->type == 143 && t[2]->type == 143 &&
+                              n_embd % 128 == 0 && n_ff % 128 == 0;
+            if (conv) {
+                if (L.ptq1_q2.empty()) L.ptq1_q2.assign((size_t) n_layers, 0);
+                L.ptq1_q2[(size_t) l] = 1;
+            }
+            const int ty0 = conv ? 42 : (int) t[0]->type, ty1 = conv ? 42 : (int) t[1]->type, ty2 = conv ? 42 : (int) t[2]->type;
+            if (!native_fmt(ty0, ty2, n_embd, n_ff, f, err, ty1)) {
                 std::string where = "experts from the GGUF: block ";
                 where += std::to_string(moe_blocks[(size_t) l]);
                 where += ": ";
                 err.insert(0, where);
                 return false;
             }
-            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.bytes - f.down_off};
+            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.d_row * (uint64_t) n_embd};
+            L.tail.emplace_back();
+            if (t[0]->type == 40 || t[1]->type == 40 || t[2]->type == 40) {
+                // NVFP4: each role's per-expert weight_scale_2 (`.scale`, F32 [n_expert], llama.cpp's converter) rides at
+                // the blob's end, so every tier and kernel finds it beside the expert's rows
+                std::vector<float>& tl = L.tail.back();
+                tl.assign((size_t) (4 * n_expert), 0.0f);
+                for (int r = 0; r < 3; ++r) {
+                    size_t ss = 0;
+                    const std::string sname = "blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_" + roles[r] +
+                                              "_exps.scale";
+                    const strata::TensorInfo* ts = model.find(sname, &ss);
+                    const bool have = ts != nullptr && ts->type == 0 && ts->shape.size() == 1 &&
+                                      ts->shape[0] == (uint64_t) n_expert && model.in_bounds(*ts, ss);
+                    if (ts != nullptr && !have) {
+                        err = "experts from the GGUF: " + sname + " is not F32 [" + std::to_string(n_expert) + "]";
+                        return false;
+                    }
+                    const float* sv = have ? reinterpret_cast<const float*>(model.shard(ss).tensor_data(*ts)) : nullptr;
+                    for (int64_t e = 0; e < n_expert; ++e) tl[(size_t) (4 * e + r)] = sv != nullptr ? sv[e] : 1.0f;
+                }
+                f.tail_off = f.bytes;
+                f.bytes += 16;
+            }
             for (int r = 0; r < 3; ++r) {
-                if (strata::tensor_payload_bytes(*t[r]) != per[r] * (uint64_t) n_expert) {
+                if (strata::tensor_payload_bytes(*t[r]) != (conv ? per[r] / 36 * 28 : per[r]) * (uint64_t) n_expert) {
                     err = "experts from the GGUF: block " + std::to_string(moe_blocks[(size_t) l]) + "'s " + roles[r] +
                           " tensor is not " + std::to_string(per[r]) + " B per expert";
                     return false;
@@ -3479,19 +3703,19 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
         std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const auto& fm = lay.fmt[(size_t) l];
-            const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, fm.d_row * (uint64_t) fm.n_embd};
             for (int r = 0; r < 3; ++r) {
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
                 const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
-                const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
+                const bool conv = lay.from_ptq1(l);
+                const uint64_t want_type = conv ? 143 : (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
                 const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
                 const uint64_t rows = (uint64_t) (r < 2 ? fm.n_ff : fm.n_embd);
-                const uint64_t bytes = per[r] * (uint64_t) lay.n_expert;
+                const uint64_t bytes = (conv ? per[r] / 36 * 28 : per[r]) * (uint64_t) lay.n_expert;
                 const uint64_t payload = f->file_size() - f->data_start();
                 std::string why;
                 if (t == nullptr) why = "is not in it";
@@ -3548,8 +3772,7 @@ LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
             const auto& fm = lay.fmt[(size_t) l];
-            const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, fm.d_row * (uint64_t) fm.n_embd};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string name = file_of(l, r);
@@ -3561,21 +3784,27 @@ LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>
                     open_name = name;
                 }
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
-                const uint64_t total = per[r] * (uint64_t) lay.n_expert;
-                const uint64_t chunk = per[r] * 16;           // 16 experts per read
+                const bool conv = lay.from_ptq1(l);   // b70-local STRATA_PTQ1_AS_Q2: PTQ1_0 in the file, Q2_0 in the blob
+                const uint64_t fper = conv ? per[r] / 36 * 28 : per[r];
+                const uint64_t total = fper * (uint64_t) lay.n_expert;
+                const uint64_t chunk = fper * 16;             // 16 experts per read
                 buf.resize((size_t) chunk);
                 for (uint64_t done = 0; done < total; done += chunk) {
                     const uint64_t n = std::min<uint64_t>(chunk, total - done);
                     f.seekg((std::streamoff) (src + done));
                     f.read((char*) buf.data(), (std::streamsize) n);
                     if ((uint64_t) f.gcount() != n) { bad = true; return; }
-                    for (uint64_t k = 0; k < n / per[r]; ++k) {
-                        const uint64_t e = done / per[r] + k;
-                        std::memcpy(layer_dst[(size_t) l] + (lay.blob_offset(l, (int64_t) e) - lay.layer_offset(l)) + at[r],
-                                    buf.data() + k * per[r], (size_t) per[r]);
+                    for (uint64_t k = 0; k < n / fper; ++k) {
+                        const uint64_t e = done / fper + k;
+                        uint8_t* d = layer_dst[(size_t) l] + (lay.blob_offset(l, (int64_t) e) - lay.layer_offset(l)) + at[r];
+                        if (conv) strata::kernels::cpu::ptq1_to_q2(buf.data() + k * fper, d, fper / 28);
+                        else std::memcpy(d, buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }
             }
+            if (fm.tail_off != 0)
+                for (int64_t e = 0; e < lay.n_expert; ++e)
+                    lay.write_tail(l, e, layer_dst[(size_t) l] + (lay.blob_offset(l, e) - lay.layer_offset(l)));
         }
     };
     std::vector<std::thread> pool;

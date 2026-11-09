@@ -187,6 +187,16 @@ public:
     /// stays valid for the layer it was asked in and the next one or two; a consumer that keeps a blob longer (the
     /// prompt path's stager queues a whole chunk) copies it with `copy_blob` instead.
     virtual bool transient(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// b70-local (cold experts, STRATA_COLD_GU_TYPE): the layout of `blob(layer, expert)` when it differs from the
+    /// layer's (a RAM copy blob whose gate/up rows were requantized for the CPU), else null.  Such a blob is for the
+    /// CPU only: `low` says so, and the GPU paths take `copy_blob` (the file's original rows) instead.
+    virtual const strata::kernels::cpu::NativeFmt* cpu_fmt(int64_t layer, int64_t expert) const {
+        (void) layer; (void) expert; return nullptr;
+    }
+    bool low(int64_t layer, int64_t expert) const { return cpu_fmt(layer, expert) != nullptr; }
+    /// b70-local: the layout of the layer's requantized (cold) blobs when it has any, else nullptr: its activation
+    /// format may differ from the layer's (NVFP4's Q8_0 against a K-quant's Q8_K), so the CPU quantizes both
+    virtual const strata::kernels::cpu::NativeFmt* cold_layer_fmt(int64_t layer) const { (void) layer; return nullptr; }
     /// #1353 (upstream 83a7dbc0): of the bytes `transient` experts would be copied from, the share whose pages are in
     /// RAM right now (a GGUF read in place whose page cache is warm), measured on a sample of up to `samples` experts;
     /// -1 when this source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager
@@ -426,6 +436,7 @@ struct ExpertDispatch {
     std::vector<strata::kernels::cpu::ActQ> act_multi;
     /// Plan v0.3 P6: a native pack's per-token activations (MAXT).
     std::vector<strata::kernels::cpu::NativeAct> nact_multi;
+    std::vector<strata::kernels::cpu::NativeAct> nact_cold;   ///< b70-local: the tokens in a cold layout's activation
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
     std::vector<int16_t> job_of;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
@@ -706,6 +717,11 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
+    const strata::kernels::cpu::NativeFmt* cpu_fmt(int64_t layer, int64_t expert) const override;
+    const strata::kernels::cpu::NativeFmt* cold_layer_fmt(int64_t layer) const override;
+    /// b70-local: requantizes the RAM copy's blobs' gate/up rows to `type` for the CPU (see cpu_fmt); once, after
+    /// the copy is filled.  Returns the experts converted.
+    int64_t convert_cold(int type);
     double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
@@ -799,6 +815,8 @@ public:
 private:
     /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null
     const uint8_t* resident_blob(size_t index) const;
+    std::vector<uint8_t> cold_;                                   ///< b70-local: per (layer, expert), converted
+    std::vector<strata::kernels::cpu::NativeFmt> cold_fmt_;       ///< b70-local: per layer, the converted layout
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;

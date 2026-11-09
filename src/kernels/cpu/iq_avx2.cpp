@@ -37,6 +37,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -642,4 +643,73 @@ void q80_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* 
     q80_256_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
+}  // namespace strata::kernels::cpu
+
+// b70-local: NVFP4 rows (ggml type 40, NVIDIA's FP4 experts) against nt Q8_0 activations (its vec_dot_type), the
+// weights decoded once a block for every token.  Each token's sum takes ggml-cpu's AVX-2 vec_dot_nvfp4_q8_0 steps
+// (the same products, fma order and horizontal sum), so it is that dot's value bit for bit.
+namespace strata::kernels::cpu {
+namespace {
+inline float nv_ue4m3_half(uint8_t x) {   // ggml_ue4m3_to_fp32: half the UE4M3 value (kvalues_fp4 is twice E2M1)
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    const uint32_t bits = (uint32_t) (e + 119) << 23 | (uint32_t) m << 20;   // (1 + m/8) * 2^(e-7) * 0.5, exact
+    float v;
+    std::memcpy(&v, &bits, 4);
+    return v;
+}
+inline float nv_hsum8(__m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+struct NvQ80 { uint16_t d; int8_t qs[32]; };   // block_q8_0
+}  // namespace
+
+void nvfp4_rows_mt(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                   int r0, int r1) {
+    static const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const __m128i values128 = _mm_loadu_si128((const __m128i*) kv);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+    const int nb = n / 64;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int tn = std::min(8, nt - t0);
+            __m256 accum[8];
+            for (int t = 0; t < tn; ++t) accum[t] = _mm256_setzero_ps();
+            for (int ib = 0; ib < nb; ++ib) {
+                const uint8_t* b = row + (size_t) ib * 36;   // 4 UE4M3 scales, 32 bytes of codes
+                const __m128i q4bits_01 = _mm_loadu_si128((const __m128i*) (b + 4));
+                const __m128i q4bits_23 = _mm_loadu_si128((const __m128i*) (b + 20));
+                const __m128i q4_01_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_01, m4b));
+                const __m128i q4_01_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_01, 4), m4b));
+                const __m128i q4_23_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_23, m4b));
+                const __m128i q4_23_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_23, 4), m4b));
+                const __m256i q4_01 = _mm256_set_m128i(_mm_unpackhi_epi64(q4_01_lo, q4_01_hi), _mm_unpacklo_epi64(q4_01_lo, q4_01_hi));
+                const __m256i q4_23 = _mm256_set_m128i(_mm_unpackhi_epi64(q4_23_lo, q4_23_hi), _mm_unpacklo_epi64(q4_23_lo, q4_23_hi));
+                const __m256i ax01 = _mm256_sign_epi8(q4_01, q4_01), ax23 = _mm256_sign_epi8(q4_23, q4_23);
+                const __m256 wv01 = _mm256_set_m128(_mm_set1_ps(nv_ue4m3_half(b[1])), _mm_set1_ps(nv_ue4m3_half(b[0])));
+                const __m256 wv23 = _mm256_set_m128(_mm_set1_ps(nv_ue4m3_half(b[3])), _mm_set1_ps(nv_ue4m3_half(b[2])));
+                for (int t = 0; t < tn; ++t) {
+                    const NvQ80* y = static_cast<const NvQ80*>(act[t0 + t]) + 2 * ib;
+                    const __m256i q8_01 = _mm256_loadu_si256((const __m256i*) y[0].qs);
+                    const __m256i q8_23 = _mm256_loadu_si256((const __m256i*) y[1].qs);
+                    const __m256i p_1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax01, _mm256_sign_epi8(q8_01, q4_01)), mone);
+                    const __m256i p_2 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax23, _mm256_sign_epi8(q8_23, q4_23)), mone);
+                    // the weight scale times the token's block scale, one rounding each, as ggml's scalar products
+                    const __m256 scales01 = _mm256_mul_ps(wv01, _mm256_set1_ps(_cvtsh_ss(y[0].d)));
+                    const __m256 scales23 = _mm256_mul_ps(wv23, _mm256_set1_ps(_cvtsh_ss(y[1].d)));
+                    accum[t] = _mm256_fmadd_ps(scales01, _mm256_cvtepi32_ps(p_1), accum[t]);
+                    accum[t] = _mm256_fmadd_ps(scales23, _mm256_cvtepi32_ps(p_2), accum[t]);
+                }
+            }
+            for (int t = 0; t < tn; ++t) out[t0 + t][r] = nv_hsum8(accum[t]);
+        }
+    }
+}
 }  // namespace strata::kernels::cpu

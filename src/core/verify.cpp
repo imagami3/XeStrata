@@ -1091,6 +1091,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        stamp(l, 30, grp);   // profile split of hc-read1+router (slots 30-32)
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -1119,6 +1120,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (!g_ready)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE,
                                               N, NE, n, cs);
+                stamp(l, 31, grp);
                 if (router_publish && !recording_res_ && route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
                                                 m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
@@ -1253,6 +1255,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
+                L.tail_off = f.tail_off;   // NVFP4: the per-expert scales at the blob's end
+                if (f.tail_off != 0) L.bytes = f.bytes;
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs, grid_groups);
@@ -1437,7 +1441,7 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 read", "  router gemv", "  top10+plan"};
     std::string out;
     char b[80];
     double total = 0;
@@ -1905,6 +1909,10 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
             prev = x;
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+        {   // hc-read1+router shown split where its inner stamps exist
+            const double r0 = gap(at(l, 30), at(l, 16)), r1 = gap(at(l, 31), at(l, 30)), r2 = gap(at(l, 17), at(l, 31));
+            if (r0 > 0 && r1 > 0 && r2 > 0) { prof_sum_[kind][30] += r0; prof_sum_[kind][31] += r1; prof_sum_[kind][32] += r2; }
+        }
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
         if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
             prof_sum_[kind][27] += dn;      // hc-read0: norm

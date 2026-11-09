@@ -71,6 +71,9 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);
+/// b70-local: `nrows` rows of `n` floats to ggml type `type` (ggml_quantize_chunk; `imatrix` n weights or null).
+/// Returns the bytes written, 0 when the type cannot be written.
+size_t native_quantize_rows(int type, const float* src, void* dst, int64_t nrows, int64_t n, const float* imatrix);
 
 /// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes), rotated first when the layer is
 /// Hadamard-folded: a Q2_0 layer's is Strata's ActQ, any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is

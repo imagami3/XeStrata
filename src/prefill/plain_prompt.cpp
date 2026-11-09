@@ -156,6 +156,11 @@ bool PlainModel::prompt_return(std::string& err) {
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
     borrow_first_ = -1;
+    // b70-local STRATA_PROMPT_KEEP_LENT=1: the displaced experts are not read back (the tier's lowest-ranked ones; the
+    // decode computes them as misses, or skips them with STRATA_ROUTE_TAIL_SKIP): on GLM-5.3 UD-IQ4_XS the read-back
+    // took 1.6 + 3.3 + 2.3 s a prompt through the chipset cards' links
+    static const bool keep_lent = [] { const char* v = std::getenv("STRATA_PROMPT_KEEP_LENT"); return v != nullptr && v[0] == '1'; }();
+    if (keep_lent) { borrowed_res_.clear(); return true; }
     // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
     static const bool ret_prof = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;   // b70-local
     const auto tr0 = std::chrono::steady_clock::now();
@@ -164,7 +169,7 @@ bool PlainModel::prompt_return(std::string& err) {
         if (ret_prof) { if (src_->transient(l, e)) ++n_transient; }
         auto& f = free_[(size_t) l];
         if (f.empty()) break;
-        const uint8_t* hb = src_->transient(l, e) ? nullptr : src_->blob(l, e);
+        const uint8_t* hb = src_->transient(l, e) || src_->low(l, e) ? nullptr : src_->blob(l, e);   // b70-local: a cold blob is the CPU's
         if (hb != nullptr && (strata::gpu::is_host_usm(hb) || (dev_ >= 0 && src_->registered_on(dev_)))) {
             const int32_t slot = f.back();
             if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, lay.blob_bytes(l), cs_)) {
@@ -199,25 +204,36 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
     const int64_t N = spec_.n_embd;
     const kc::NativeFmt& f = kc::expert_layout().fmt[(size_t) ml];
     std::vector<char> quantized((size_t) P.T, 0);
+    std::vector<char> cold_done;   // b70-local: the tokens quantized for a cold layout (another activation format)
     std::vector<kc::ExpertJobMulti> jobs;
     jobs.reserve(experts.size());
     int64_t q = 0;
     for (int32_t e : experts) {
         kc::ExpertJobMulti j;
         j.blob = src_->blob(ml, e);
+        j.fmt = src_->cpu_fmt(ml, e);   // b70-local: a cold blob's own layout
         if (j.blob == nullptr) { err = "plain prompt: an expert could not be read for the CPU"; return false; }
         for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r) {
             if (j.nt == kc::MAXT) {   // b70-local: an expert of more rows than a job takes: another job of the same weights
                 jobs.push_back(j);
                 const uint8_t* b = j.blob;
+                const kc::NativeFmt* bf = j.fmt;
                 j = kc::ExpertJobMulti{};
                 j.blob = b;
+                j.fmt = bf;
             }
             const int32_t tok = P.h_src[r];
             uint8_t* act = P.h_nact + (size_t) tok * kc::kNativeActBytes;
             if (!quantized[(size_t) tok]) {
                 kc::native_quant_act(f, P.h_hn + (size_t) tok * N, act);
                 quantized[(size_t) tok] = 1;
+            }
+            if (j.fmt != nullptr && j.fmt->gu_act != f.gu_act) {   // b70-local: a cold blob of another activation format
+                static thread_local std::vector<uint8_t> cold_act;
+                if (cold_act.size() < (size_t) P.T * kc::kNativeActBytes) cold_act.resize((size_t) P.T * kc::kNativeActBytes);
+                if (cold_done.empty()) cold_done.assign((size_t) P.T, 0);
+                act = cold_act.data() + (size_t) tok * kc::kNativeActBytes;
+                if (!cold_done[(size_t) tok]) { kc::native_quant_act(*j.fmt, P.h_hn + (size_t) tok * N, act); cold_done[(size_t) tok] = 1; }
             }
             j.nact[j.nt] = act;
             j.out[j.nt] = P.h_cpu + q * N;
@@ -340,6 +356,27 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     }
     dump_routes(ml, P.h_ids, T, K);
     if (routes != nullptr) std::copy(P.h_ids, P.h_ids + T * K, routes);
+    // b70-local STRATA_PROMPT_TAIL_SKIP=R (the decode's STRATA_ROUTE_TAIL_SKIP for the prompt): a routing entry of rank
+    // >= R whose expert is not in this stage's VRAM is neither staged nor computed; its row of parts stays zero (no
+    // renormalisation, as the decode's).  The int8 path only (it writes parts by entry; the FP16 gather reads every row).
+    static const int prompt_skip = [] { const char* v = std::getenv("STRATA_PROMPT_TAIL_SKIP"); return v ? std::atoi(v) : 0; }();
+    std::vector<char> skip;
+    int64_t nskip = 0;
+    if (prompt_skip > 0 && prompt_skip < K && use_mmq) {
+        skip.assign((size_t) (T * K), 0);
+        for (int64_t i = 0; i < T * K; ++i) {
+            const int32_t e = P.h_ids[i];
+            if (i % K >= prompt_skip && res_[(size_t) (ml * E + e)] < 0) {
+                skip[(size_t) i] = 1;
+                --count[(size_t) e];
+                ++nskip;
+            }
+        }
+        if (nskip > 0 && !strata::gpu::memset_async(P.parts, 0, (size_t) (T * K * N) * 4, cs)) {
+            err = std::string("plain prompt: zeroing the skipped rows: ") + strata::gpu::last_error();
+            return false;
+        }
+    }
     const auto& f = lay.fmt[(size_t) ml];
     // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
     // the f experts not in VRAM, pcie_split_m's count over PCIe from the times measured at load, the rest
@@ -364,7 +401,16 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         // rows (its weights read once a job), where those jobs' measured time is below the expert's copy
         // (STRATA_PROMPT_CPU_SPLIT_ROWS=0: as before)
         static const bool split_rows = [] { const char* v = std::getenv("STRATA_PROMPT_CPU_SPLIT_ROWS"); return v == nullptr || v[0] != '0'; }();
+        // b70-local: cold experts (requantized RAM blobs) are the CPU's first: the GPU would read them from the file
         for (const auto& [c, e] : missed) {
+            if (!src_->low(ml, e) || rows + c > P.cpu_cap) continue;
+            on_cpu[(size_t) e] = 1;
+            cpu_experts.push_back(e);
+            rows += c;
+            --want;
+        }
+        for (const auto& [c, e] : missed) {
+            if (on_cpu[(size_t) e]) continue;
             if (rows + c > P.cpu_cap) break;
             if (c <= k::cpu::MAXT) {
                 if (want <= 0) continue;
@@ -395,7 +441,9 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     }
     {
         std::vector<int32_t> fill(start);
+        for (int64_t r = T * K - nskip; r < T * K; ++r) { P.h_src[r] = 0; P.h_entry[r] = 0; }   // rows no group reads
         for (int64_t i = 0; i < T * K; ++i) {
+            if (nskip > 0 && skip[(size_t) i]) continue;   // b70-local: a skipped entry has no row
             const int32_t e = P.h_ids[i], row = fill[(size_t) e]++;
             P.h_src[row] = (int32_t) (i / K);   // the token whose row it reads
             P.h_slot[i] = row;                  // where routing entry i finds its expert's output
@@ -496,13 +544,23 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
                 uint8_t* dst = P.stage + at;
                 const auto tb0 = std::chrono::steady_clock::now();
                 const uint8_t* hb = src_->blob(ml, e);
-                if (bounce && hb != nullptr) {
+                const bool cold = src_->low(ml, e);
+                if (cold) {   // b70-local: the GPU takes the file's rows, not the CPU's requantized copy
+                    static thread_local std::vector<uint8_t> cold_tmp;
+                    cold_tmp.resize(lay.max_blob);
+                    hb = src_->copy_blob(ml, e, cold_tmp.data()) ? cold_tmp.data() : nullptr;
+                    if (hb != nullptr && bounce) { std::memcpy(P.h_stage + at, hb, f.bytes); hb = P.h_stage + at; }
+                    else if (hb != nullptr && !strata::gpu::copy(dst, hb, f.bytes)) hb = nullptr;
+                    else if (hb != nullptr) hb = dst;   // copied already
+                }
+                if (bounce && hb != nullptr && !cold) {
                     std::memcpy(P.h_stage + at, hb, f.bytes);
                     hb = P.h_stage + at;
                 }
                 const auto tb1 = std::chrono::steady_clock::now();
-                const bool copied = hb != nullptr && (transient && !bounce ? strata::gpu::copy(dst, hb, f.bytes)
-                                                                           : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
+                const bool copied = hb != nullptr && (cold && hb == dst ? true
+                                                      : transient && !bounce ? strata::gpu::copy(dst, hb, f.bytes)
+                                                                             : strata::gpu::copy_async(dst, hb, f.bytes, ccs));
                 if (prof_rst_ == &st) {
                     st.blob_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
                     st.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb1).count();
@@ -549,6 +607,9 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
         }
         pg.mmq.run(gu, cs);
+        // NVFP4: gate and up times their expert's weight_scale_2 before the clamp and the SiLU
+        prefill::mmq::scale_rows_by_group(P.gu, 2 * FF, nullptr, r0, nr, 2 * FF, P.rbounds + g0 + gi, G, P.wtab + g0,
+                                          f.tail_off, 0, 1, FF, cs);
         prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
                              /*interleaved=*/false, cs);
         prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
@@ -557,6 +618,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
         dn.dst = P.parts; dn.ld_dst = N; dn.wtab = P.wtab + g0; dn.woff = f.down_off;   // routing order
         pg.mmq.run(dn, cs);
+        prefill::mmq::scale_rows_by_group(P.parts, N, P.entry + r0, 0, nr, N, P.rbounds + g0 + gi, G, P.wtab + g0,
+                                          f.tail_off, 2, 2, 0, cs);   // NVFP4: down's weight_scale_2
         if (gsync && prof_rst_ == &st) {
             strata::gpu::stream_sync(cs);
             st.gmmq_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tgs).count();
@@ -594,12 +657,30 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             } else {
                 uint8_t* dst = P.stage + (size_t) q * lay.max_blob;
                 const uint8_t* hb = src_->blob(ml, e);
-                const bool copied = hb != nullptr &&
-                    (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs));
+                static thread_local std::vector<uint8_t> cold_tmp2;
+                if (src_->low(ml, e)) {   // b70-local: the file's rows for the GPU
+                    cold_tmp2.resize(lay.max_blob);
+                    hb = src_->copy_blob(ml, e, cold_tmp2.data()) ? cold_tmp2.data() : nullptr;
+                    if (hb != nullptr && !strata::gpu::copy(dst, hb, f.bytes)) hb = nullptr;
+                    if (hb != nullptr) hb = dst;
+                }
+                const bool copied = hb != nullptr && (hb == dst ||
+                    (transient ? strata::gpu::copy(dst, hb, f.bytes) : strata::gpu::copy_async(dst, hb, f.bytes, cs)));
                 if (!copied) { err = "plain prompt: an expert could not be read"; return false; }
                 blob = dst;
             }
             uint16_t* dq = P.dq_gu + (size_t) q * P.gu_elems;
+            if (f.tail_off != 0) {   // NVFP4: each role times its per-expert weight_scale_2 (the blob's tail, host copy)
+                const float* sc = lay.tail[(size_t) ml].data() + 4 * (size_t) e;
+                auto dq_role = [&](int ty, const uint8_t* src, int64_t rows, int64_t cols, uint16_t* dst, float s) {
+                    if (ty == 40) k::dequant_f16_scaled(ty, src, 0, rows, cols, dst, s, cs);
+                    else k::dequant_f16(ty, src, 0, rows, cols, dst, cs);
+                };
+                dq_role(f.gu_type, blob, FF, N, dq, sc[0]);
+                dq_role(f.up_type >= 0 ? f.up_type : f.gu_type, blob + f.up_off, FF, N, dq + FF * N, sc[1]);
+                dq_role(f.d_type, blob + f.down_off, N, FF, P.dq_d + (size_t) q * P.d_elems, sc[2]);
+                continue;
+            }
             if (k::cpu::native_mixed_gu(f)) {   // gate and up of different types: each by its own
                 k::dequant_f16(f.gu_type, blob, 0, FF, N, dq, cs);
                 k::dequant_f16(f.up_type, blob + f.up_off, 0, FF, N, dq + FF * N, cs);
@@ -683,10 +764,10 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
     };
     lap("borrow");
     bool ok = true;
-    // b70-local: STRATA_PROMPT_PIPELINE (on; =0 off) - the stages side by side, a thread each: stage s reads chunk k once stage
+    // b70-local: STRATA_PROMPT_PIPELINE=1 (off by default) - the stages side by side, a thread each: stage s reads chunk k once stage
     // s - 1 has finished it, and starts chunk k + 1 once stage s + 1 has copied chunk k out of its pinned rows (the
     // stages one after another left two of three B70s idle through every chunk)
-    static const bool pipeline = [] { const char* v = std::getenv("STRATA_PROMPT_PIPELINE"); return v == nullptr || v[0] != '0'; }();
+    static const bool pipeline = [] { const char* v = std::getenv("STRATA_PROMPT_PIPELINE"); return v != nullptr && v[0] == '1'; }();   // off: answers degraded after long sessions with it on (2026-10-27)
     const int64_t n_chunks = (n + longest - 1) / longest;
     if (pipeline && c.size() > 1 && n_chunks > 1) {
         std::mutex mu;

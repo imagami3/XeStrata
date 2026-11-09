@@ -42,6 +42,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace strata {
 class GgufModel;
@@ -150,6 +151,8 @@ public:
     /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
     /// seed repeats a run.
     void set_sampler(const strata::kernels::SamplerParams& sp);
+    /// b70-local: the request's tokens so far (the prompt), for --spec lookup drafts (STRATA_SPEC_LOOKUP)
+    void set_context(const int32_t* ids, int64_t n);
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
@@ -226,6 +229,18 @@ private:
     int64_t hand_w_ = 0;               ///< the hand-off's floats a row
     float *h_in_ = nullptr, *m_in_ = nullptr;       ///< mapped: a later stage's input rows
     float *h_hand_ = nullptr, *m_hand_ = nullptr;   ///< mapped: an earlier stage's output rows
+    /// b70-local EAGLE-3 (STRATA_EAGLE_LAYERS=a,b,c): the mean of the four streams entering those layers, the window's
+    /// rows, written by the stage holding the layer into its mapped slot (slot = position in the list)
+    int eg_layer_[3] = {-1, -1, -1};
+    float* h_eg_[3] = {nullptr, nullptr, nullptr};
+    float* m_eg_[3] = {nullptr, nullptr, nullptr};
+    float* eg_tmp_ = nullptr;
+    int64_t n_embd_eagle() const { return spec_.n_embd; }
+    /// the streams' mean of a prompt chunk's rows entering slot j's layer -> STRATA_DUMP_EAGLE ".prompt" records
+    bool eagle_prompt_rows(int j, const float* hs, const int32_t* tokens, int64_t T, int64_t p0, strata::gpu::Stream cs,
+                           std::string& err);
+    float* eg_ptmp_ = nullptr;
+    int64_t eg_ptmp_rows_ = 0;
     /// pinned: a layer split's prompt rows in and out, up to prompt_chunk of them (each stage reads them in chunks of
     /// its own, as long as its tier lends the buffers for)
     float* hand_host_ = nullptr;
@@ -489,6 +504,10 @@ private:
     ExpertCache cache_;
     ExpertDispatch disp_;
     MoeWindow win_;
+    bool setup_device_plan(std::string& err);
+    bool setup_draft_head(std::string& err);
+    bool dev_plan_tried_ = false;
+    double last_graph_ms_ = 0;   ///< b70-local: the last stage_forward's launch-to-sync time
     std::vector<int32_t> res_;                    ///< [moe layer][expert] slot or -1
     std::vector<std::vector<int32_t>> free_;      ///< per moe layer, its free slots
     std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
@@ -532,6 +551,17 @@ private:
     bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)
     int last_T_ = 0;           ///< the last forward window's size
     int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;
+    int64_t probe_n_ = 0, probe_full_ = 0, probe_hit_ = 0;   ///< b70-local: STRATA_PIPE_PROBE
+    int32_t probe_guess_ = -1;
+    float last_draft_p_ = 1.0f, draft_cum_p_ = 1.0f;   ///< b70-local: STRATA_SPEC_ADAPT_P
+    // b70-local: STRATA_SPEC_LOOKUP - the context's tokens (prompt and every token since) and the last position of
+    // each 3-gram, for drafts copied from an earlier stretch of the text
+    std::vector<int32_t> lk_hist_;
+    std::unordered_map<uint64_t, int64_t> lk_tri_;
+    int64_t lk_used_ = 0, lk_windows_ = 0;
+    void lk_push(int32_t t);
+    int lk_propose(int32_t pending, int max_n, int32_t* out) const;
+    static float spec_adapt_p();
     double spec_ms_check_ = 0, spec_ms_draft_ = 0;
     std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block
     int32_t* page_table_ = nullptr;

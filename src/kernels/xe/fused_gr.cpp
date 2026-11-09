@@ -62,6 +62,7 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
+
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 // Upstream's latency-hidden norm and up kernels (aaa323fe: gfx906's, which upstream runs on sm_70 too; V100-SXM2: 50.9
@@ -182,6 +183,8 @@ private:
 template <int T, int COLS>
 sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const float* ssg) {
     static_assert(COLS == 16 || COLS == 32, "a work-group's columns");
+    static const bool up8_s = [] { const char* v = std::getenv("STRATA_HC_UP8"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool up8 = up8_s;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) kFusedGrMaxT * LR / 4), h);
         sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) kFusedGrMaxT * HC), h);
@@ -222,6 +225,52 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 }
             }
             sycl::group_barrier(it.get_group());
+            if (up8) {
+                // 8 lanes a row, 4 rows a sub-group (STRATA_HC_UP8, default on; B70 hc_q8_bench T=4 38.5 -> 31.0 us, T=8 67.4 -> 52.5): lane `sub` holds
+                // the row's 4-value chunks sub + 8 s (s = 0..9, chunk s of each Q8_0 block, so its scale is block s's),
+                // a token's dot is 10 float4 FMAs and a 3-step xor tree, and lane sub keeps token sub's sum for the
+                // epilogue (T <= 8).  The sums' order differs from the sub-group-a-row form (not bitwise).
+                const int sub = lane & 7, rq = lane >> 3;
+                for (int rb = warp * 4; rb < HC * COLS; rb += WARPS * 4) {
+                    const int r = rb + rq, c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+                    const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
+                    const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
+                    float4 w[LR / 32];
+#pragma unroll
+                    for (int st = 0; st < LR / 32; ++st)
+                        w[st] = q8_four(*reinterpret_cast<const uint32_t*>(qrow + 4 * (sub + 8 * st)), drow[st]);
+                    const auto& mt = tok(m, sub < T ? sub : 0);
+                    float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+                    bool apply = false;
+                    if (sub < T) {
+                        rv = mt.R[i];
+                        wn = mt.w_norm[i];
+                        apply = mt.apply;
+                        if (apply) { bo = mt.bo_prev[d0 + dd]; ip = mt.inj_prev[c]; }
+                    }
+                    float mine = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < T; ++k) {
+                        float acc = 0.0f;
+#pragma unroll
+                        for (int st = 0; st < LR / 32; ++st) {
+                            const float4 x = lo[k * LR / 4 + sub + 8 * st];
+                            acc = sycl::fma(w[st].x(), x.x(), acc); acc = sycl::fma(w[st].y(), x.y(), acc);
+                            acc = sycl::fma(w[st].z(), x.z(), acc); acc = sycl::fma(w[st].w(), x.w(), acc);
+                        }
+                        for (int o = 4; o > 0; o >>= 1) acc += sycl::permute_group_by_xor(sg, acc, o);
+                        if (sub == k) mine = acc;
+                    }
+                    if (sub < T) {
+                        if (apply) {
+                            rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                            mt.R_out[i] = rv;
+                        }
+                        const float x = rv * wn * rs_s[sub * HC + c];
+                        g[(sub * HC + c) * COLS + dd] = x * sigmoidf_(mine);
+                    }
+                }
+            } else {
             const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
             for (int r = warp; r < HC * COLS; r += WARPS) {
                 const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
@@ -266,6 +315,7 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                     g[(lane * HC + c) * COLS + dd] = x * sigmoidf_(mine);
                 }
             }
+            }   // up8
             sycl::group_barrier(it.get_group());
             for (int i = t; i < T * COLS; i += THREADS) {
                 const int k = i / COLS, col = i - k * COLS;
@@ -403,7 +453,8 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
         gpu_stamp(stamp_buf, stamp_i0, &q);
         gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
     }
-    return m.a[0].q8_mixed != nullptr ? gr_up_q8<T, 32>(q, m, part, ssg) : gr_up_q8<T, 16>(q, m, part, ssg);
+    static const int cols_s = [] { const char* v = std::getenv("STRATA_HC_UP_COLS"); return v ? std::atoi(v) : 16; }();   // 16 (32: B70 T=4 31.0 -> 33.9 us)
+    return (m.a[0].q8_mixed != nullptr || cols_s == 32) ? gr_up_q8<T, 32>(q, m, part, ssg) : gr_up_q8<T, 16>(q, m, part, ssg);
 }
 
 // Upstream's latency-hidden up projection (gr_fast): 8 lanes a row instead of a sub-group.  Lane j holds the default

@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 
 #include "ggml.h"
 
@@ -120,18 +121,23 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     // llama.cpp's graph does
     std::vector<float> xr(x);
     if (f.had_gu) for (int k = 0; k < NT; ++k) cpu::hadamard_rotate(xr.data() + k * H, (int) H, f.had_block, f.gu_signs);
+    // NVFP4 (f.tail_off): the expert's three weight_scale_2 from the blob's tail, on each projection's output
+    float tsc[3] = {1.f, 1.f, 1.f};
+    if (f.tail_off != 0) std::memcpy(tsc, blob.data() + f.tail_off, sizeof tsc);
     for (int k = 0; k < NT; ++k) {
         std::vector<float> h(FF);
         for (int64_t r = 0; r < FF; ++r) {
             double g = 0, u = 0;
             for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * xr[k * H + i]; u += (double) U[r * H + i] * xr[k * H + i]; }
+            g *= tsc[0];
+            u *= tsc[1];
             h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
         }
         if (f.had_d) cpu::hadamard_rotate(h.data(), (int) FF, f.had_block, f.d_signs);
         for (int64_t r = 0; r < H; ++r) {
             double o = 0;
             for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
-            ref[k * H + r] = (float) o;
+            ref[k * H + r] = (float) (o * tsc[2]);
         }
     }
     // (b) the CPU
@@ -317,6 +323,8 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     // (c) the GPU: one group holding the NT entries
     {
         auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, f.up_type);
+        L.tail_off = f.tail_off;   // NVFP4's per-expert scales
+        if (f.tail_off != 0) L.bytes = f.bytes;
         if (f.had_d) { L.had_block = f.had_block; L.d_signs = strata::kernels::hadamard_device_signs(f.d_signs, (int) FF); }
         namespace par = strata::parity;
         void* dblob = par::alloc_bytes(blob.size());
@@ -515,10 +523,18 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
         f.gu_signs = sx.data();
         f.d_signs = sh.data();
     }
+    // NVFP4: the blob carries the per-expert weight_scale_2 of gate, up and down at its end (expert_layout_from_gguf);
+    // scales far from 1 and different per role, so a scale on the wrong output or missing shows
+    const bool nv = gu == 40 || dt == 40;
+    if (nv) { f.tail_off = f.bytes; f.bytes += 16; }
     XorShift32 rng{1234};   // the same weights every run
     std::normal_distribution<float> nd(0.f, 0.05f);
     std::vector<float> w((size_t) FF * H);
     std::vector<uint8_t> blob(f.bytes);
+    if (nv) {
+        const float tail[4] = {gu == 40 ? 0.37f : 1.f, gu == 40 ? 2.3f : 1.f, dt == 40 ? 0.61f : 1.f, 0.f};
+        std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
+    }
     for (int part = 0; part < 2; ++part) {   // gate, up
         for (auto& v : w) v = nd(rng);
         ggml_quantize_chunk((ggml_type) gu, w.data(), blob.data() + (size_t) part * f.up_off, 0, FF, H, nullptr);
@@ -535,7 +551,8 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
         void* d_src = par::alloc_bytes((size_t) ggml_row_size((ggml_type) t, n));
         auto* d_out = static_cast<float*>(par::alloc_bytes((size_t) n * 4));
         par::copy_bytes_in(d_src, src, ggml_row_size((ggml_type) t, n));
-        strata::kernels::iq_dequant_f32(t, d_src, n, d_out, s);
+        if (strata::kernels::iq_supported(t)) strata::kernels::iq_dequant_f32(t, d_src, n, d_out, s);
+        else strata::kernels::dequant_f32(t, d_src, 0, 1, n, d_out, s);   // the prompt path's dequantizer (NVFP4)
         par::sync();
         par::copy_bytes_out(got.data(), d_out, (size_t) n * 4);
         size_t differ = 0;

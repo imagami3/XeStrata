@@ -79,6 +79,11 @@ public:
                void* user, strata::gpu::Stream cs, std::string& err);
     /// The plan the pool fills (ExpertDispatch::plan).
     GpuPlanSink* sink() { return &sink_; }
+    /// b70-local: every routed expert of every MoE layer has a VRAM slot: the plan is built on the device
+    /// (resident_plan) and the host is asked nothing (no doorbell, no flags: serve gets 0 rings).  `d_res` is the
+    /// device residency table (n_layers * n_expert slots), `d_slot_off` the slots' byte offsets (or null).
+    bool set_device_plan(const int32_t* d_res, const unsigned long long* d_slot_off, std::string& err);
+    bool device_plan() const { return d_res_ != nullptr; }
 
 private:
     static void publish_plan(void* ctx);
@@ -123,6 +128,10 @@ private:
     uint8_t* hit_xq_ = nullptr;
     float* hit_xs_ = nullptr;
     uint8_t* hit_scratch_ = nullptr;
+    const int32_t* d_res_ = nullptr;                 ///< device_plan: the residency table
+    const unsigned long long* d_slot_off_ = nullptr;
+    uint32_t* d_skip_ = nullptr;                     ///< resident_plan's "a non-resident expert" flag
+    const int32_t* last_ids_ = nullptr;              ///< publish's ids, for experts' device plan
 };
 
 }  // namespace strata::core

@@ -385,7 +385,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
+                                    src/kernels/xe/native_mmvq.cpp src/kernels/xe/q6k_xmx.cpp src/kernels/xe/q8_dpas.cpp src/kernels/xe/ptq1_dpas.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
                                     src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
@@ -1019,6 +1019,8 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(native_multi_parity PRIVATE strata_kernels)
     add_test(NAME native_multi_parity COMMAND native_multi_parity)
     # #783 PR-g: the multi-token hyper-connection write against the per-token one, memcmp
+    add_executable(hc_q8_bench src/kernels/hc_q8_bench.cpp)   # timing / output check of the Q8_0 hyper-connection read
+    target_link_libraries(hc_q8_bench PRIVATE strata_kernels)
     add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
     target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
     add_test(NAME gr_multi_parity COMMAND gr_multi_parity)
@@ -1267,9 +1269,11 @@ if(STRATA_NATIVE_EXPERTS)
     # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
     # at Ornith-1.5's shape (2048/512): its official files' experts (Q6_K, Q4_K and Q5_K down, Q8_0, BF16) and its
     # GSQ-RCO files' (Q2_K and Q3_K both ways); at llm-jp-4.1's (2560/960): Q4_K with its Q8_0 and Q5_0 down
+    # NVFP4 (NVIDIA ModelOpt's FP4 experts, GLM-5.3-Flash's 4096/2048): alone, and as the down rows of an i-quant layer
     foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
                  q6_K/q8_0 q6_K/q6_K@2048x512 q4_K/q4_K@2048x512 q5_K/q5_K@2048x512 q8_0/q8_0@2048x512
-                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960)
+                 bf16/bf16@2048x512 q2_K/q3_K@2048x512 q3_K/q2_K@2048x512 q4_K/q8_0@2560x960 q4_K/q5_0@2560x960
+                 nvfp4/nvfp4@4096x2048 iq3_s/nvfp4@4096x2048)
       string(REPLACE "/" "_" pair_name "${pair}")
       string(REPLACE "@" "_" pair_name "${pair_name}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})

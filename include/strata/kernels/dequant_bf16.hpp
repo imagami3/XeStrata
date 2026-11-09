@@ -24,6 +24,10 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                  void* stream);
 
+/// b70-local: dequant_f16 times `scale` (an NVFP4 expert's per-expert weight_scale_2); NVFP4 (ggml type 40) only.
+void dequant_f16_scaled(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
+                        float scale, void* stream);
+
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);
 

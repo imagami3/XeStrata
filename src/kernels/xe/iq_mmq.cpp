@@ -214,6 +214,30 @@ template<> struct Dec<20> {   // IQ4_NL: d
         return r;
     }
 };
+template<> struct Dec<40> {   // NVFP4: a UE4M3 scale a 16 (ggml_ue4m3_to_fp32: half; kvalues_fp4: twice E2M1)
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_nvfp4);
+    static float ue4m3_half(uint8_t x) {
+        if (x == 0 || x == 0x7F) return 0.0f;
+        const int e = (x >> 3) & 0xF, m = x & 7;
+        if (e == 0) return (float) m * (1.0f / 1024.0f);
+        return sycl::bit_cast<float>((uint32_t) (e + 119) << 23 | (uint32_t) m << 20);
+    }
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_nvfp4* b = reinterpret_cast<const block_nvfp4*>(row) + sb / 2;
+        const int s0 = 2 * (sb % 2);   // sub-blocks s0 (values 0-15) and s0 + 1 (16-31)
+        Sub r;
+        for (int h = 0; h < 2; ++h) {
+            for (int l = 0; l < 2; ++l) {   // bytes 4l..4l+3 of the sub-block: values 4l.. (low) and 8 + 4l.. (high)
+                const Int2 t = get_int_from_table_16(get_int_b4(b->qs, 2 * (s0 + h) + l), kvalues_fp4);
+                r.v[4 * h + l] = (uint32_t) t.x;
+                r.v[4 * h + 2 + l] = (uint32_t) t.y;
+            }
+        }
+        r.s0 = ue4m3_half(b->d[s0]);
+        r.s1 = ue4m3_half(b->d[s0 + 1]);
+        return r;
+    }
+};
 template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq4_xs);
     static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
@@ -474,7 +498,7 @@ template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp):
 };
 
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
+constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11 || TY == 40; }   // NVFP4: a scale a 16
 template<int TY>
 constexpr bool has_min() { return TY == 12 || TY == 13; }
 
@@ -1261,7 +1285,7 @@ bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
 bool iq_mmq_type_ok(int t) {
     switch (t) {
         case 6: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
-        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: case 40: return true;
         default: return false;
     }
 }
@@ -1287,6 +1311,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 19: return (size_t) (cols / Dec<19>::QK) * Dec<19>::BSZ;
         case 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 40: return (size_t) (cols / Dec<40>::QK) * Dec<40>::BSZ;
         default: return 0;
     }
 }
@@ -1398,6 +1423,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(29);
         STRATA_MMQ_CASE(19);
         STRATA_MMQ_CASE(42);
+        STRATA_MMQ_CASE(40);
         default: return {};
     }
 #undef STRATA_MMQ_CASE

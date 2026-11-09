@@ -34,6 +34,7 @@ inline void put(H16* o, int i, float v) { o[i].v = f16_from_f32(v); }
 inline void put(float* o, int i, float v) { o[i] = v; }
 
 constexpr int8_t kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+constexpr int8_t kv_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};   // ggml's kvalues_fp4
 
 inline void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
@@ -87,6 +88,22 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
         const uint8_t* qs = row_blocks + (size_t) gi_in_row * 32;
         const float d = h2f(row_blocks + (size_t) groups_per_row * 32 + (size_t) gi_in_row * 2);
         for (int j = 0; j < 32; ++j) put(out, j, (float) (int8_t) qs[j] * d);
+    } else if constexpr (TYPE == 40) {                             // NVFP4: 64 per block of 36 B, a UE4M3 scale a 16
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 2) * 36;
+        for (int h = 0; h < 2; ++h) {
+            const int sb = (gi_in_row % 2) * 2 + h;
+            const uint8_t x = b[sb];
+            const int ex = (x >> 3) & 0xF, m = x & 7;
+            // ggml_ue4m3_to_fp32: half the UE4M3 value (kvalues_fp4 is twice E2M1); 0x00 and 0x7F are 0
+            const float d = x == 0 || x == 0x7F ? 0.0f
+                            : ex == 0 ? (float) m * (1.0f / 1024.0f)
+                                      : sycl::bit_cast<float>((uint32_t) (ex + 119) << 23 | (uint32_t) m << 20);
+            const uint8_t* qs = b + 4 + sb * 8;
+            for (int j = 0; j < 8; ++j) {
+                put(out, h * 16 + j, d * (float) kv_fp4[qs[j] & 0xf]);
+                put(out, h * 16 + 8 + j, d * (float) kv_fp4[qs[j] >> 4]);
+            }
+        }
     } else if constexpr (TYPE == 20) {                             // IQ4_NL
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
         const float d = h2f(b);
@@ -233,6 +250,20 @@ sycl::event dequant_kernel(sycl::queue& q, const uint8_t* blocks, int64_t row_by
     });
 }
 
+// b70-local: the same values times `scale` (an NVFP4 expert's weight_scale_2), each rounded once to T
+template <int TYPE, typename T>
+sycl::event dequant_kernel_scaled(sycl::queue& q, const uint8_t* blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                                  int64_t groups_per_row, T* out, float scale) {
+    return q.parallel_for(sycl::range<1>((size_t) (rows * groups_per_row)), [=](sycl::id<1> id) {
+        const int64_t g = (int64_t) id[0];
+        const int64_t r = g / groups_per_row, gi = g % groups_per_row;
+        float v[32];
+        group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, (int) groups_per_row, v);
+        T* o = out + r * groups_per_row * 32 + gi * 32;
+        for (int j = 0; j < 32; ++j) put(o, j, v[j] * scale);
+    });
+}
+
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
@@ -249,6 +280,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case kNativeQ8Rows: block_elems = 64; block_bytes = 68; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
+    case 40: block_elems = 64; block_bytes = 36; return true;
     case 30: block_elems = 32; block_bytes = 64; return true;   // BF16, in 32-value pieces
     default: return false;
     }
@@ -281,6 +313,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);
+    case 40: STRATA_DQ(40);
     case 30: STRATA_DQ(30);
     }
 #undef STRATA_DQ
@@ -289,6 +322,17 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 
 }  // namespace
 
+void dequant_f16_scaled(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
+                        float scale, void* stream) {
+    int be = 0, bb = 0;
+    if (ggml_type != 40 || !geometry(ggml_type, be, bb) || cols % be != 0 || rows <= 0)
+        throw core::DeviceError("dequant_f16_scaled: type " + std::to_string(ggml_type) + " (NVFP4 only) or shape");
+    auto& q = core::Runtime::get().stream(stream);
+    const sycl::event e = dequant_kernel_scaled<40, H16>(q, (const uint8_t*) blocks, cols / be * bb, row0, rows, cols / 32,
+                                                         reinterpret_cast<H16*>(out), scale);
+    if (!stream) core::Runtime::get().wait(e, "dequant_f16_scaled");
+}
+
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;
     return geometry(ggml_type, a, b);
@@ -296,7 +340,7 @@ bool dequant_bf16_supported(int ggml_type) noexcept {
 
 namespace {
 // plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
-bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
+bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29 || t == 143; }   // b70-local: + PTQ1_0
 }  // namespace
 
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,

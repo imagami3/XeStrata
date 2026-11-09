@@ -13,6 +13,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,13 @@ struct ExpertLayout {
     /// have no routed experts (GLM-5.3's three dense ones) numbers its MoE layers apart from its blocks.  Empty: the
     /// same numbers.
     std::vector<int64_t> block;
+    /// NVFP4 layers (fmt.tail_off != 0): per layer, n_expert x {s_gate, s_up, s_down, 0}, the blob's tail (the GGUF's
+    /// `blk.<b>.ffn_*_exps.scale` tensors, ModelOpt's weight_scale_2; 1 where a role has none).  Empty for others.
+    std::vector<std::vector<float>> tail;
+    /// b70-local, STRATA_PTQ1_AS_Q2=1: per layer, 1 when its three tensors are PTQ1_0 (143) in the GGUF and are
+    /// re-packed into Q2_0 (42) as they are read (fmt says 42; a file slice is 28/36 of the blob's).  Empty: none.
+    std::vector<char> ptq1_q2;
+    bool from_ptq1(int64_t layer) const { return !ptq1_q2.empty() && ptq1_q2[(size_t) layer] != 0; }
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
@@ -45,6 +53,12 @@ struct ExpertLayout {
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
         return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+    }
+    /// Writes the blob's tail (NVFP4 layers) after its three role slices; nothing for a layer without one.
+    void write_tail(int64_t layer, int64_t expert, uint8_t* blob) const {
+        if (!native || (size_t) layer >= fmt.size() || fmt[(size_t) layer].tail_off == 0) return;
+        const std::vector<float>& t = tail[(size_t) layer];
+        std::memcpy(blob + fmt[(size_t) layer].tail_off, t.data() + 4 * (size_t) expert, 4 * sizeof(float));
     }
 };
 
@@ -88,4 +102,38 @@ void expert_layout_set(const ExpertLayout& layout);
 /// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
 inline constexpr int kExpertLayoutVersion = 5;
 
+}  // namespace strata::kernels::cpu
+
+namespace strata::kernels::cpu {
+/// b70-local (STRATA_PTQ1_AS_Q2=1): PTQ1_0 blocks (128 trits as 26 B of base-3 digits + fp16 d) into Q2_0 blocks
+/// (64 values as fp16 d + 16 B of 2-bit codes, value = code - 1): each 128 becomes two 64-blocks with the same d,
+/// the exact inverse of tools' make_t3p.py, so the result is the Q2_0 container's bytes.  `n128` blocks: 28 n128
+/// bytes read, 36 n128 written.
+inline void ptq1_to_q2(const uint8_t* src, uint8_t* dst, uint64_t n128) {
+    static const auto tab = [] {   // tab[byte][n] = the n-th trit (0..2) of a digit byte
+        struct T { uint8_t t[256][5]; } r{};
+        static const uint16_t pw[5] = {1, 3, 9, 27, 81};
+        for (int b = 0; b < 256; ++b)
+            for (int n = 0; n < 5; ++n) r.t[b][n] = (uint8_t) ((((uint16_t) (b * pw[n]) & 255) * 3) >> 8);
+        return r;
+    }();
+    for (uint64_t k = 0; k < n128; ++k, src += 28, dst += 36) {
+        uint8_t v[128];
+        for (int i = 0; i < 16; ++i)
+            for (int n = 0; n < 5; ++n) v[16 * n + i] = tab.t[src[i]][n];
+        for (int i = 0; i < 8; ++i)
+            for (int n = 0; n < 5; ++n) v[80 + 8 * n + i] = tab.t[src[16 + i]][n];
+        for (int i = 0; i < 2; ++i)
+            for (int n = 0; n < 4; ++n) v[120 + 2 * n + i] = tab.t[src[24 + i]][n];
+        for (int h = 0; h < 2; ++h) {
+            uint8_t* q = dst + 18 * h;
+            q[0] = src[26];
+            q[1] = src[27];
+            for (int i = 0; i < 16; ++i) {
+                const uint8_t* w = v + 64 * h + 4 * i;
+                q[2 + i] = (uint8_t) (w[0] | (w[1] << 2) | (w[2] << 4) | (w[3] << 6));
+            }
+        }
+    }
+}
 }  // namespace strata::kernels::cpu

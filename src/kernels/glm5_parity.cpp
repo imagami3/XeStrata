@@ -6,8 +6,11 @@
 // third_party/main/ggml/LICENSE): the mHC read, write and mean, the sigmoid router, the KDA gate and step, the clamped
 // SwiGLU.  The references are in double where ggml sums in float, so the tolerances are those of float rounding.
 #include "strata/kernels/glm5.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -633,7 +636,433 @@ int test_mmvq_batched() {
     return bad;
 }
 
+namespace strata::kernels { void ptq1_dpas_probe(int* map, int* rows, void* stream);
+bool ptq1_rows_dpas(const void* weights, const float* x, float* y, int n_in, int n_out, int T, int ks, void* stream); }
+
+// b70-local: PARITY_MMVQ_BENCH=1 - decode matrix-vector speed by weight type (GLM-5.3's 4096 x 8192 attention shape;
+// random bytes, timing only): which dense type reads closest to the card's 608 GB/s
+int bench_mmvq() {
+    using namespace strata::kernels;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const int NI = std::getenv("PARITY_NI") ? std::atoi(std::getenv("PARITY_NI")) : 4096;
+    const int NO = std::getenv("PARITY_NO") ? std::atoi(std::getenv("PARITY_NO")) : 8192;
+    strata::parity::Device dev;
+    std::mt19937 g(1);
+    struct Ty { int t; const char* name; };
+    const Ty types[] = {{14, "Q6_K"}, {kNativeQ6KRows, "Q6_K rows"}, {13, "Q5_K"}, {12, "Q4_K"}, {23, "IQ4_XS"}, {8, "Q8_0"}, {29, "IQ1_M"}, {16, "IQ2_XXS"}, {kNativeQ8Rows, "Q8_0 rows"}};
+    std::vector<float> x = randn((size_t) NI * 8, 1.0f);
+    float* dx = dev.upload(x);
+    uint8_t* dq = dev.alloc<uint8_t>(native_q8_1_rows_bytes(NI, 4));
+    native_quantize_q8_1_rows(dx, dq, NI, 4, strata::parity::stream());
+    float* dy = dev.alloc<float>((size_t) NO * 4);
+    for (const Ty& ty : types) {
+        if (!native_mmvq_supported(ty.t)) continue;
+        const size_t wb = native_mmvq_weight_bytes(ty.t, NI, NO);
+        std::vector<uint8_t> w(wb);
+        for (auto& b : w) b = (uint8_t) (g() & 0x3f);   // small bytes: finite scales
+        uint8_t* dw = dev.upload(w);
+        for (int T : {1, 3}) {
+            for (int i = 0; i < 20; ++i) native_mmvq(ty.t, dw, dq, dy, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            const int reps = 300;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) native_mmvq(ty.t, dw, dq, dy, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            std::printf("  mmvq %-10s T=%d: %7.1f us  %6.1f GB/s  (%.2f MB)\n", ty.name, T, us, wb / us / 1e3, wb / 1e6);
+        }
+    }
+    // the same Q6_K rows product on the int8 matrix engines (iq_mmq_grouped, one "expert" of T rows), and its
+    // agreement with mmvq on real-ish weights (random 6-bit values, small scales)
+    {
+        auto& q = *static_cast<sycl::queue*>(strata::parity::stream());
+        std::printf("  iq_mmq: usable %d path %s type ok %d\n", (int) iq_mmq_usable(q), iq_mmq_path(q) ? iq_mmq_path(q) : "-",
+                    (int) iq_mmq_type_ok(kNativeQ6KRows));
+        std::fflush(stdout);
+        const int t6 = kNativeQ6KRows;
+        const size_t wb = native_mmvq_weight_bytes(t6, NI, NO);
+        std::vector<uint8_t> w(wb);
+        for (auto& b : w) b = (uint8_t) (g() & 0xff);
+        // d (the half at bpr*208 + kbx*2 of each row) small and finite: 0x2000 ~ 0.0078
+        const int bpr = NI / 256;
+        for (int r = 0; r < NO; ++r)
+            for (int kb = 0; kb < bpr; ++kb) {
+                uint8_t* base = w.data() + (size_t) r * bpr * 210;
+                base[(size_t) bpr * 208 + kb * 2] = 0x00;
+                base[(size_t) bpr * 208 + kb * 2 + 1] = 0x20;
+            }
+        uint8_t* dw = dev.upload(w);
+        std::vector<int32_t> bounds = {0, 8}, ids(256); for (int i = 0; i < 256; ++i) ids[i] = i;
+        int32_t* db = dev.upload(bounds);
+        int32_t* di = dev.upload(ids);
+        uint8_t* xi = dev.alloc<uint8_t>(iq_mmq_act_bytes(256, NI));
+        float* y2 = dev.alloc<float>((size_t) NO * 256);
+        for (int T : {1, 2, 3, 4}) {
+            std::vector<int32_t> bd = {0, T};
+            strata::parity::copy_in(db, bd.data(), bd.size());
+            native_mmvq(t6, dw, dq, dy, NI, NO, T, strata::parity::stream());
+            iq_mmq_quantize(q, dx, nullptr, xi, NI, NI, T, false);
+            iq_mmq_grouped(q, t6, dw, wb, NO, NI, 1, xi, T, db, T, di, y2, NO);
+            strata::parity::sync();
+            std::vector<float> a((size_t) NO * T), b((size_t) NO * T);
+            strata::parity::copy_out(a.data(), dy, a.size());
+            strata::parity::copy_out(b.data(), y2, b.size());
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); ++i) { num += (a[i] - b[i]) * (a[i] - b[i]); den += a[i] * a[i]; }
+            const int reps = 300;
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                iq_mmq_quantize(q, dx, nullptr, xi, NI, NI, T, false);
+                iq_mmq_grouped(q, t6, dw, wb, NO, NI, 1, xi, T, db, T, di, y2, NO);
+            }
+            strata::parity::sync();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) native_mmvq(t6, dw, dq, dy, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            const double us2 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            std::printf("  Q6_K rows T=%d: mmvq %.1f us, iq_mmq (with its quantize) %.1f us, rel diff %.2e\n", T, us2, us,
+                        std::sqrt(num / (den > 0 ? den : 1)));
+            // the XMX form (q6k_xmx.cpp): its FP16 conversion and product
+            {
+                static sycl::half* xh = nullptr;
+                if (xh == nullptr) {
+                    xh = dev.alloc<sycl::half>((size_t) NI * 8);
+                    std::vector<sycl::half> z((size_t) NI * 8, (sycl::half) 0.0f);
+                    strata::parity::copy_in(xh, z.data(), z.size());
+                }
+                native_f32_to_f16_rows(dx, xh, NI, T, strata::parity::stream());
+                native_q6k_rows_xmx(dw, xh, y2, NI, NO, T, strata::parity::stream());
+                strata::parity::sync();
+                strata::parity::copy_out(b.data(), y2, b.size());
+                double n2 = 0;
+                for (size_t i = 0; i < a.size(); ++i) n2 += (a[i] - b[i]) * (a[i] - b[i]);
+                auto t2 = std::chrono::steady_clock::now();
+                for (int i = 0; i < reps; ++i) {
+                    native_f32_to_f16_rows(dx, xh, NI, T, strata::parity::stream());
+                    native_q6k_rows_xmx(dw, xh, y2, NI, NO, T, strata::parity::stream());
+                }
+                strata::parity::sync();
+                const double us3 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t2).count() / reps;
+                std::printf("  Q6_K rows T=%d: XMX %.1f us (with its conversion), rel diff to mmvq %.2e\n", T, us3,
+                            std::sqrt(n2 / (den > 0 ? den : 1)));
+            }
+        }
+    }
+    // b70-local: the Q8_0 rows product on XMX (STRATA_Q8_XMX) against native_mmvq, 2-8 tokens
+    {
+        const int t8 = kNativeQ8Rows;
+        const int bpr = NI / 32;
+        std::vector<uint8_t> w((size_t) NO * bpr * 34);
+        for (int r = 0; r < NO; ++r) {
+            uint8_t* base = w.data() + (size_t) r * bpr * 34;
+            for (int i = 0; i < bpr * 32; ++i) base[i] = (uint8_t) (g() & 0xff);
+            for (int kb = 0; kb < bpr; ++kb) { base[(size_t) bpr * 32 + kb * 2] = 0x00; base[(size_t) bpr * 32 + kb * 2 + 1] = 0x20; }
+        }
+        uint8_t* dw = dev.upload(w);
+        float* y1 = dev.alloc<float>((size_t) NO * 8);
+        float* y2 = dev.alloc<float>((size_t) NO * 8);
+        uint8_t* dq8 = dev.alloc<uint8_t>(native_q8_1_rows_bytes(NI, 8));
+        for (int T : {1, 2, 3, 4, 6, 8}) {
+            native_quantize_q8_1_rows(dx, dq8, NI, T, strata::parity::stream());
+            native_mmvq(t8, dw, dq8, y1, NI, NO, T, strata::parity::stream());
+            native_q8_rows_dpas(dw, dx, y2, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            std::vector<float> a((size_t) NO * T), b((size_t) NO * T);
+            strata::parity::copy_out(a.data(), y1, a.size());
+            strata::parity::copy_out(b.data(), y2, b.size());
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); ++i) { num += (a[i] - b[i]) * (a[i] - b[i]); den += a[i] * a[i]; }
+            const int reps = 300;
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) native_mmvq(t8, dw, dq8, y1, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            const double us1 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) native_q8_rows_dpas(dw, dx, y2, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            const double us2 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            std::printf("  Q8_0 rows T=%d: mmvq %.1f us, DPAS %.1f us, rel diff %.2e  y[0] %g / %g\n", T, us1, us2,
+                        std::sqrt(num / (den > 0 ? den : 1)), a[0], b[0]);
+            // v2: from the q8_1 rows, weights as B (STRATA_Q8_DPAS2)
+            {
+                const void* ws[1] = {dw}; float* ys[1] = {y2}; const int nos[1] = {NO};
+                native_q8_rows_dpas_xq(1, ws, ys, nos, dq8, NI, T, strata::parity::stream());
+                strata::parity::sync();
+                strata::parity::copy_out(b.data(), y2, b.size());
+                double n3 = 0;
+                for (size_t i = 0; i < a.size(); ++i) n3 += (a[i] - b[i]) * (a[i] - b[i]);
+                t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < reps; ++i) native_q8_rows_dpas_xq(1, ws, ys, nos, dq8, NI, T, strata::parity::stream());
+                strata::parity::sync();
+                const double us3 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+                std::printf("  Q8_0 rows T=%d: DPAS v2 (q8_1 in) %.1f us, rel diff to mmvq %.2e\n", T, us3, std::sqrt(n3 / (den > 0 ? den : 1)));
+                native_q8_rows_dpas_xq3(1, ws, ys, nos, dq8, NI, T, strata::parity::stream());
+                strata::parity::sync();
+                strata::parity::copy_out(b.data(), y2, b.size());
+                double n4 = 0;
+                for (size_t i = 0; i < a.size(); ++i) n4 += (a[i] - b[i]) * (a[i] - b[i]);
+                t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < reps; ++i) native_q8_rows_dpas_xq3(1, ws, ys, nos, dq8, NI, T, strata::parity::stream());
+                strata::parity::sync();
+                const double us4 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+                std::printf("  Q8_0 rows T=%d: DPAS v3 (gemvx, q8_1 in) %.1f us, rel diff to mmvq %.2e\n", T, us4, std::sqrt(n4 / (den > 0 ? den : 1)));
+            }
+        }
+    }
+    return 0;
+}
+
+// b70-local: PARITY_SMALL_BENCH=1 - the decode's small kernels of a GLM-5.3-Flash block at T tokens (default 3), each
+// timed alone over many launches: where the ~0.35 ms a layer outside the big products goes
+int bench_small() {
+    using namespace strata::kernels;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const int T = std::getenv("PARITY_T") ? std::atoi(std::getenv("PARITY_T")) : 3;
+    const int N = 4096, HC = 4, H = 64, S = 128, E = 288, K = 8;
+    strata::parity::Device dev;
+    auto* q = strata::parity::stream();
+    std::vector<float> hs = randn((size_t) T * HC * N, 1.0f), mix = randn((size_t) T * 24, 0.1f), sc = randn(3, 0.1f),
+                       bs = randn(24, 0.1f), gam = randn(N, 1.0f), rw = randn((size_t) E * N, 0.02f),
+                       rb = randn(E, 0.1f), st = randn((size_t) H * S * S, 0.01f), qkv = randn((size_t) T * H * S, 0.1f),
+                       beta = randn((size_t) T * H, 0.5f);
+    float *dhs = dev.upload(hs), *dmix = dev.upload(mix), *dsc = dev.upload(sc), *dbs = dev.upload(bs),
+          *dg = dev.upload(gam), *drw = dev.upload(rw), *drb = dev.upload(rb), *dst = dev.upload(st),
+          *dq = dev.upload(qkv), *dk = dev.upload(qkv), *dv = dev.upload(qkv), *dgg = dev.upload(qkv),
+          *dbeta = dev.upload(beta);
+    float *dy = dev.alloc<float>((size_t) T * N), *dpost = dev.alloc<float>((size_t) T * 4),
+          *dcomb = dev.alloc<float>((size_t) T * 16), *dhn = dev.alloc<float>((size_t) T * N),
+          *dlog = dev.alloc<float>((size_t) T * E), *dw = dev.alloc<float>((size_t) T * K),
+          *dout = dev.alloc<float>((size_t) T * H * S);
+    int32_t* dids = dev.alloc<int32_t>((size_t) T * K);
+    uint8_t* dxq = dev.alloc<uint8_t>(native_q8_1_rows_bytes(HC * N, T) + native_q8_1_rows_bytes(N, T));
+    std::vector<float*> snaps;
+    for (int i = 0; i < T - 1; ++i) snaps.push_back(dev.alloc<float>((size_t) H * S * S));
+    auto time = [&](const char* name, auto&& fn) {
+        for (int i = 0; i < 20; ++i) fn();
+        strata::parity::sync();
+        const int reps = 400;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) fn();
+        strata::parity::sync();
+        std::printf("  %-44s T=%d: %7.1f us\n", name, T,
+                    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+    };
+    time("quantize_q8_1 (4 streams, hc_read)", [&] { native_quantize_q8_1(dhs, dxq, HC * N, T, q); });
+    time("hc_pre (sinkhorn, y, post, comb)", [&] { glm5_hc_pre(dhs, dmix, dsc, dbs, 1e-6f, 1e-6f, 20, dy, dpost, dcomb, N, T, q); });
+    time("rms_norm_weighted_q8_1", [&] { native_qsa_rms_norm_weighted_q8_1(dy, dg, dhn, dxq, N, T, 1e-6f, q); });
+    time("hc_post", [&] { glm5_hc_post(dy, dhs, dpost, dcomb, dhs, N, T, q); });
+    time("router f32 gemv (4096 x 288, F32)", [&] { f32_gemv_fp32_mmvf_multi(dhn, N, drw, dlog, E, N, E, T, q); });
+    time("router sigmoid top-8", [&] { glm5_router_sigmoid(dlog, drb, T, E, K, true, 1.0f, dids, dw, q); });
+    time("kda scan (H 64, S 128, snapshots)", [&] { glm5_kda_scan(dst, dq, dk, dv, dgg, dbeta, dout, H, T, q, snaps.data(), (int) snaps.size()); });
+    time("kda scan (no snapshots)", [&] { glm5_kda_scan(dst, dq, dk, dv, dgg, dbeta, dout, H, T, q); });
+    time("l2 heads", [&] { glm5_l2_heads(dq, H, 1e-6f, T, q); });
+    time("empty-ish launch (hc_mean, 1 token)", [&] { glm5_hc_mean(dhs, dy, N, 1, q); });
+    return 0;
+}
+
+// b70-local: PARITY_EXPERT_BENCH=1 - native_expert_grouped as a GLM-5.3 decode window uses it: T tokens x 8 experts,
+// distinct experts (one entry each), IQ1_M gate/up and IQ2_XXS down, 4096 x 2048, random blobs (timing only)
+int bench_experts() {
+    using namespace strata::kernels;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const int T = std::getenv("PARITY_T") ? std::atoi(std::getenv("PARITY_T")) : 3;
+    const int K = 8, NG = T * K, N = 4096, FF = 2048;
+    const int gu = std::getenv("PARITY_GU") ? std::atoi(std::getenv("PARITY_GU")) : 29;
+    const int dt = std::getenv("PARITY_DT") ? std::atoi(std::getenv("PARITY_DT")) : 16;
+    const NativeExpertLayout L = native_expert_layout(gu, dt, N, FF);
+    strata::parity::Device dev;
+    std::mt19937 g(3);
+    const size_t blob = (L.bytes + 255) & ~(size_t) 255;
+    std::vector<uint8_t> w(blob * NG);
+    for (auto& b : w) b = (uint8_t) (g() & 0x3f);
+    uint8_t* dw = dev.upload(w);
+    std::vector<unsigned long long> ptr(NG);
+    std::vector<int32_t> start(NG + 1), dst(NG), tok(NG), ng = {NG};
+    for (int i = 0; i < NG; ++i) { ptr[i] = (unsigned long long) (dw + (size_t) i * blob); start[i] = i; dst[i] = i; tok[i] = i / K; }
+    start[NG] = NG;
+    auto* dptr = dev.upload(ptr);
+    int32_t *dst_d = dev.upload(start), *ddst = dev.upload(dst), *dtok = dev.upload(tok), *dng = dev.upload(ng);
+    std::vector<float> x = randn((size_t) T * N, 1.0f);
+    float* dx = dev.upload(x);
+    uint8_t* xq = dev.alloc<uint8_t>(native_q8_1_rows_bytes(N, T));
+    native_quantize_q8_1_rows(dx, xq, N, T, strata::parity::stream());
+    void* scratch = dev.alloc<uint8_t>(native_expert_scratch_bytes(NG, FF));
+    float* out = dev.alloc<float>((size_t) NG * N);
+    auto run = [&] { native_expert_grouped(L, dptr, dst_d, dng, ddst, dtok, NG, NG, xq, scratch, out, strata::parity::stream(), NG); };
+    for (int i = 0; i < 10; ++i) run();
+    strata::parity::sync();
+    const int reps = 200;
+    // a different set of blobs each rep would be the real (cold) case: rotate through 8 copies when they fit
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) run();
+    strata::parity::sync();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+    std::printf("  experts T=%d (%d groups, gu %d, down %d, blob %.2f MB): %.1f us, %.0f GB/s (warm)\n", T, NG, gu, dt,
+                L.bytes / 1e6, us, (double) L.bytes * NG / us / 1e3);
+    return 0;
+}
+
+// b70-local: PARITY_PTQ1_DPAS=1 - PTQ1_0 rows on DPAS (ptq1_dpas.cpp) against a host reference and iq_mmvq's dp4a path,
+// and both against Q2_0 (iq_mmvq 42) on the experts' shapes (8 experts' rows in one matrix)
+int bench_ptq1_dpas() {
+    using namespace strata::kernels;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    strata::parity::Device dev;
+    std::mt19937 g(7);
+    const int ksel = std::getenv("PARITY_KS") ? std::atoi(std::getenv("PARITY_KS")) : 0;
+    struct Sh { int NO, NI; const char* name; };
+    for (const Sh sh : {Sh{16384, 4096, "gate/up x8"}, Sh{32768, 2048, "down x8"}}) {
+        const int NO = sh.NO, NI = sh.NI, G = NI / 128;
+        std::vector<uint8_t> w((size_t) NO * G * 28);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = (uint8_t) (g() & 0xFF);
+        std::vector<float> dref((size_t) NO * G);
+        for (int r = 0; r < NO; ++r)
+            for (int b = 0; b < G; ++b) {
+                uint8_t* blk = w.data() + ((size_t) r * G + b) * 28;
+                const float d = 0.002f + 0.001f * (float) (g() % 8);
+                const sycl::half hd = (sycl::half) d;
+                std::memcpy(blk + 26, &hd, 2);
+                dref[(size_t) r * G + b] = (float) hd;
+            }
+        std::vector<float> x = randn((size_t) NI * 8, 1.0f);
+        float* dx = dev.upload(x);
+        uint8_t* dw = dev.upload(w);
+        float* dy = dev.alloc<float>((size_t) NO * 8);
+        float* dy2 = dev.alloc<float>((size_t) NO * 8);
+        uint8_t* dq = dev.alloc<uint8_t>((size_t) 8 * NI / 32 * 36);
+        quantize_q8_1_rows(dx, 8, NI, dq, strata::parity::stream());
+        // host reference for a few rows
+        auto trit = [&](const uint8_t* b, int v) {
+            int byte, n;
+            if (v < 80) { byte = b[v & 15]; n = v >> 4; }
+            else if (v < 120) { const int u = v - 80; byte = b[16 + (u & 7)]; n = u >> 3; }
+            else { const int u = v - 120; byte = b[24 + (u & 1)]; n = u >> 1; }
+            const int p3 = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
+            return ((((byte * p3) & 255) * 3) >> 8) - 1;
+        };
+        for (int T : {1, 2, 4, 8}) {
+            ptq1_rows_dpas(dw, dx, dy, NI, NO, T, ksel, strata::parity::stream());
+            iq_mmvq(143, dw, dq, dy2, NI, NO, T, strata::parity::stream());
+            strata::parity::sync();
+            std::vector<float> y((size_t) NO * T), y2((size_t) NO * T);
+            strata::parity::copy_out(y.data(), dy, y.size());
+            strata::parity::copy_out(y2.data(), dy2, y2.size());
+            double e1 = 0, e2 = 0, ss = 0;
+            for (int t = 0; t < T; ++t)
+                for (int r = 0; r < NO; r += 997) {
+                    double ref = 0;
+                    for (int b = 0; b < G; ++b)
+                        for (int v = 0; v < 128; ++v) ref += (double) trit(w.data() + ((size_t) r * G + b) * 28, v) * dref[(size_t) r * G + b] * x[(size_t) t * NI + b * 128 + v];
+                    e1 += (y[(size_t) t * NO + r] - ref) * (y[(size_t) t * NO + r] - ref);
+                    e2 += (y2[(size_t) t * NO + r] - ref) * (y2[(size_t) t * NO + r] - ref);
+                    ss += ref * ref;
+                }
+            auto tm = [&](auto&& f) {
+                for (int i = 0; i < 10; ++i) f();
+                strata::parity::sync();
+                const int reps = 200;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < reps; ++i) f();
+                strata::parity::sync();
+                return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+            };
+            const double ud = tm([&] { ptq1_rows_dpas(dw, dx, dy, NI, NO, T, ksel, strata::parity::stream()); });
+            const double um = tm([&] { iq_mmvq(143, dw, dq, dy2, NI, NO, T, strata::parity::stream()); });
+            std::printf("  %-10s T=%d  dpas %7.1f us  dp4a(143) %7.1f us   rel err dpas %.2e dp4a %.2e\n", sh.name, T, ud, um, std::sqrt(e1 / ss), std::sqrt(e2 / ss));
+        }
+        // Q2_0 (64 a block, 18 B) on the same shape, dp4a: the container the engine uses now
+        {
+            std::vector<uint8_t> w2((size_t) NO * (NI / 64) * 18);
+            for (size_t i = 0; i < w2.size(); ++i) w2[i] = (uint8_t) (g() & 0xFF);
+            for (size_t b = 0; b < w2.size() / 18; ++b) { w2[b * 18] = 0x00; w2[b * 18 + 1] = 0x18; }
+            uint8_t* dw2 = dev.upload(w2);
+            for (int T : {1, 2, 4, 8}) {
+                for (int i = 0; i < 10; ++i) iq_mmvq(42, dw2, dq, dy2, NI, NO, T, strata::parity::stream());
+                strata::parity::sync();
+                const int reps = 200;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < reps; ++i) iq_mmvq(42, dw2, dq, dy2, NI, NO, T, strata::parity::stream());
+                strata::parity::sync();
+                std::printf("  %-10s T=%d  Q2_0 dp4a %7.1f us\n", sh.name, T, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+            }
+        }
+    }
+    return 0;
+}
+
+// b70-local: PARITY_PTQ1_EXPERTS=1 - native_expert_grouped on PTQ1_0 experts (GLM-5.3: 4096 x 2048), a verify window's
+// shape: NG groups of one entry each (6 tokens x 8 experts = 48), from 288 copies (past the caches); dp4a vs DPAS by env
+int bench_ptq1_experts() {
+    using namespace strata::kernels;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    strata::parity::Device dev;
+    const int64_t H = 4096, FF = 2048;
+    const int NG = std::getenv("PARITY_NG") ? std::atoi(std::getenv("PARITY_NG")) : 48, NCOPY = 288;
+    const int TY = std::getenv("PARITY_TYPE") ? std::atoi(std::getenv("PARITY_TYPE")) : 143;
+    NativeExpertLayout L = native_expert_layout(TY, TY, H, FF);
+    std::mt19937 g(3);
+    std::vector<uint8_t> blob(L.bytes);
+    for (auto& b : blob) b = (uint8_t) (g() & 0xFF);
+    if (TY == 143) for (size_t i = 0; i + 28 <= L.bytes; i += 28) { const sycl::half d = (sycl::half) 0.003f; std::memcpy(&blob[i + 26], &d, 2); }
+    if (TY == 42) for (size_t i = 0; i + 18 <= L.bytes; i += 18) { const sycl::half d = (sycl::half) 0.003f; std::memcpy(&blob[i], &d, 2); }
+    uint8_t* many = dev.alloc<uint8_t>(L.bytes * NCOPY);
+    for (int c = 0; c < NCOPY; ++c) strata::parity::copy_in(many + L.bytes * c, blob.data(), blob.size());
+    std::vector<float> x = randn((size_t) H * 8, 1.0f);
+    float* dx = dev.upload(x);
+    uint8_t* xq = dev.alloc<uint8_t>((size_t) 8 * H / 32 * 36);
+    quantize_q8_1_rows(dx, 8, H, xq, strata::parity::stream());
+    std::vector<int32_t> st(NG + 1), dst(NG), tok(NG);
+    for (int i = 0; i <= NG; ++i) st[i] = i;
+    for (int i = 0; i < NG; ++i) { dst[i] = i; tok[i] = i % 6; }
+    int32_t* dst_d = dev.upload(st);
+    int32_t* ddst = dev.upload(dst);
+    int32_t* dtok = dev.upload(tok);
+    std::vector<int32_t> ng1 = {NG};
+    int32_t* dng = dev.upload(ng1);
+    const int SETS = NCOPY / NG;
+    std::vector<unsigned long long> ptr((size_t) SETS * NG);
+    for (int i = 0; i < SETS * NG; ++i) ptr[i] = (unsigned long long) (many + L.bytes * (size_t) ((i * 7) % NCOPY));
+    unsigned long long* dptr = dev.upload(ptr);
+    void* scratch = dev.alloc<uint8_t>(native_expert_scratch_bytes(NG, FF));
+    float* out = dev.alloc<float>((size_t) NG * H);
+    auto run = [&](int i) { native_expert_grouped(L, dptr + (size_t) (i % SETS) * NG, dst_d, dng, ddst, dtok, NG, NG, xq, scratch, out, strata::parity::stream(), NG); };
+    for (int i = 0; i < 20; ++i) run(i);
+    strata::parity::sync();
+    const int reps = 300;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) run(i);
+    strata::parity::sync();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+    std::vector<float> y((size_t) NG * H);
+    strata::parity::copy_out(y.data(), out, y.size());
+    double cs = 0; for (float v : y) cs += std::fabs(v);
+    std::printf("  ptq1 experts NG=%d: %8.1f us  %6.1f GB/s  (|out| %.4g; out %.5g %.5g %.5g %.5g)\n", NG, us, (double) L.bytes * NG / us / 1e3, cs / y.size(), y[0], y[1], y[H * 5 + 7], y[H * 47 + 4095 < y.size() ? H * 47 + 4095 : 0]);
+    return 0;
+}
+
+// b70-local: PARITY_DPAS_PROBE=1 - the s2 x s8 DPAS B layout (ptq1_dpas.cpp)
+int dpas_probe() {
+    int map[512], rows[512];
+    strata::kernels::ptq1_dpas_probe(map, rows, strata::parity::stream());
+    for (int w = 0; w < 32; ++w) {
+        std::printf("w%02d:", w);
+        for (int f = 0; f < 16; ++f) {
+            const int v = map[w * 16 + f];
+            if (v < 0) std::printf(" %3d", v); else std::printf(" n%02dk%02d/%d", v / 64, v % 64, rows[w * 16 + f]);
+        }
+        std::printf("\n");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (std::getenv("PARITY_DPAS_PROBE")) return dpas_probe();
+    if (std::getenv("PARITY_PTQ1_DPAS")) return bench_ptq1_dpas();
+    if (std::getenv("PARITY_PTQ1_EXPERTS")) return bench_ptq1_experts();
+    if (std::getenv("PARITY_EXPERT_BENCH")) return bench_experts();
+    if (std::getenv("PARITY_SMALL_BENCH")) return bench_small();
+    if (std::getenv("PARITY_MMVQ_BENCH")) return bench_mmvq();
     if (std::getenv("PARITY_MLA_BENCH")) return bench_mla();
     if (std::getenv("PARITY_MMVQ_BATCHED")) return test_mmvq_batched();
     for (int i = 1; i < argc; ++i)

@@ -326,6 +326,21 @@ bool PlainModel::load_glm5(std::string& err) {
         err = "plain model: mapped staging allocation failed";
         return false;
     }
+    if (const char* el = std::getenv("STRATA_EAGLE_LAYERS")) {   // b70-local EAGLE-3 features
+        int j = 0;
+        for (const char* c = el; *c && j < 3; ++j) {
+            const int L = std::atoi(c);
+            if ((L >= lb_ && L < le_) || (L == le_ && last())) {   // le_ on the last stage: the trunk's output
+                eg_layer_[j] = L;
+                if (!mapped(T * N * 4, (void**) &h_eg_[j], (void**) &m_eg_[j])) {
+                    err = "plain model: mapped EAGLE feature allocation failed";
+                    return false;
+                }
+            }
+            while (*c && *c != ',') ++c;
+            if (*c == ',') ++c;
+        }
+    }
     // the q8_1 rows: a token's 4N stream values, the widest input, or the MLA's per-head rows of every token
     const size_t xq = std::max({k::native_q8_1_bytes((int) (kHC * N), (int) T), k::native_q8_1_bytes((int) FW, (int) T),
                                 k::native_q8_1_bytes((int) (NH * VD), (int) T),
@@ -342,7 +357,7 @@ bool PlainModel::load_glm5(std::string& err) {
     if (!dev(&step_, T * k::kStepCount * 4) || !dev(&g_steps_, T * k::kStepCount * 4) || !dev(&x_, T * N * 4) ||
         !dev(&hn_, T * N * 4) || !dev(&mix_, T * N * 4) || !dev(&g_xq_, xq) || !dev(&g_hs_, T * kHC * N * 4) ||
         !dev(&g_mixes_, T * kMix * 4) || !dev(&g_post_, T * kHC * 4) || !dev(&g_comb_, T * kHC * kHC * 4) ||
-        !dev(&g_y_, T * N * 4) ||
+        !dev(&g_y_, T * N * 4) || !dev(&eg_tmp_, T * N * 4) ||
         // KDA
         !dev(&g_q_, UC * 4) || !dev(&g_k_, UC * 4) || !dev(&g_v_, UC * 4) || !dev(&g_qc_, UC * 4) ||
         !dev(&g_kc_, UC * 4) || !dev(&g_vc_, UC * 4) || !dev(&g_fa_, T * (uint64_t) S * 4) || !dev(&g_f_, UC * 4) ||
@@ -370,6 +385,7 @@ bool PlainModel::load_glm5(std::string& err) {
     segs_.assign((size_t) opt_.max_t + 1, {});
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
     msegs_.assign((size_t) opt_.max_t + 1, {});
+    if (!setup_draft_head(err)) return false;   // b70-local: --draft-vocab on GLM-5.3's MTP layer too
     if (root_ == this)
         std::fprintf(stderr, "strata plain: GLM-5.3-Flash, %lld KDA and %lld DSA blocks, %lld cells; the prompt in chunks "
                              "of %lld%s\n", (long long) n_kda, (long long) (has_mtp_ ? n_dsa - 1 : n_dsa),
@@ -387,7 +403,26 @@ bool PlainModel::reset_glm5(std::string& err) {
     return ok;
 }
 
+// b70-local: STRATA_Q8_DPAS3=N - kNativeQ8Rows projections of N or more tokens on DPAS from the q8_1 rows already made
+// (native_q8_rows_dpas_xq3; the same integer sums as native_mmvq), for matrices of STRATA_Q8_DPAS3_MIN_OUT (2048) or
+// more rows; several sharing x in one launch
+namespace {
+int q8v3_min_tokens() { static const int v = [] { const char* e = std::getenv("STRATA_Q8_DPAS3"); return e ? std::atoi(e) : 0; }(); return v; }
+int q8v3_min_out() { static const int v = [] { const char* e = std::getenv("STRATA_Q8_DPAS3_MIN_OUT"); return e ? std::atoi(e) : 2048; }(); return v; }
+}  // namespace
+
 void PlainModel::gproj(const W& w, const float* x, float* y, int T, bool quantized, strata::gpu::Stream cs) {
+    // b70-local: STRATA_Q8_DPAS - the MTP window's Q8_0 projections on int8 XMX (x: the floats g_xq_ came from, if quantized)
+    if (w.type == k::kNativeQ8Rows && k::native_q8_dpas_enabled() && T >= k::native_q8_dpas_min_tokens() &&
+        k::native_q8_rows_dpas(w.data, x, y, (int) w.n_in, (int) w.n_out, T, cs))
+        return;
+    if (w.type == k::kNativeQ8Rows && q8v3_min_tokens() > 0 && T >= q8v3_min_tokens() && w.n_out >= q8v3_min_out()) {
+        if (!quantized) k::native_quantize_q8_1(x, g_xq_, w.n_in, T, cs);
+        const void* ws[1] = {w.data}; float* ys[1] = {y}; const int no[1] = {(int) w.n_out};
+        if (k::native_q8_rows_dpas_xq3(1, ws, ys, no, g_xq_, (int) w.n_in, T, cs)) return;
+        k::native_mmvq(w.type, w.data, g_xq_, y, w.n_in, w.n_out, T, cs);
+        return;
+    }
     if (!quantized) k::native_quantize_q8_1(x, g_xq_, w.n_in, T, cs);
     k::native_mmvq(w.type, w.data, g_xq_, y, w.n_in, w.n_out, T, cs);
 }
@@ -396,10 +431,16 @@ void PlainModel::gproj(const W& w, const float* x, float* y, int T, bool quantiz
 // (0 start, 1 hc_read, 2 mixer, 3 hc_post + hc_read of the FFN, 4 router + shared expert, 5 routed experts + combine),
 // read after each window (glm5_decode_prof_read) and printed every 64 windows as each part's share of the ticks.
 namespace {
-struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}, kda[5] = {}; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
+struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}, kda[5] = {}, dsa_vb = 0; int o_type = 0, o_in = 0, o_out = 0; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
 std::unordered_map<const void*, DecProf>& dec_profs() { static std::unordered_map<const void*, DecProf> m; return m; }
 bool dec_prof_on() { static const bool on = std::getenv("STRATA_DECODE_PROFILE") != nullptr && k::gpu_stamp_available(); return on; }
 constexpr int kDecSlots = 12, kDecLayers = 96;
+}
+
+void glm5_decode_note_o(const void* model, int type, int n_in, int n_out) {
+    if (!dec_prof_on()) return;
+    DecProf& d = dec_profs()[model];
+    d.o_type = type; d.o_in = n_in; d.o_out = n_out;
 }
 
 void glm5_decode_stamp(const void* model, int64_t l, int i, strata::gpu::Stream cs) {
@@ -432,6 +473,7 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
         if (kk == 1 && st[6] && st[10]) {   // the DSA mixer's parts: 1 -> 6 projections, 6 -> 7 indexer, 7 -> 8 k_b, 8 -> 9 attention, 9 -> 10 v_b + o
             const unsigned long long p[6] = {st[1], st[6], st[7], st[8], st[9], st[10]};
             for (int i = 0; i < 5; ++i) d.dsa[i] += (double) (p[i + 1] - p[i]);
+            if (st[11]) d.dsa_vb += (double) (st[11] - st[9]);
         }
         ++d.n[kk];
     }
@@ -449,6 +491,9 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
     if (d.windows % 64 == 0 && d.n[1] > 0)
         std::fprintf(stderr, "strata decode profile %p DSA mixer a layer: projections %.0f, indexer %.0f, k_b %.0f, attention %.0f, v_b+o %.0f ticks\n",
                      model, d.dsa[0] / d.n[1], d.dsa[1] / d.n[1], d.dsa[2] / d.n[1], d.dsa[3] / d.n[1], d.dsa[4] / d.n[1]);
+    if (d.windows % 64 == 0 && d.n[1] > 0)
+        std::fprintf(stderr, "strata decode profile %p DSA v_b (to the transpose) %.0f, o %.0f ticks; o: type %d n_in %d n_out %d\n",
+                     model, d.dsa_vb / d.n[1], (d.dsa[4] - d.dsa_vb) / d.n[1], d.o_type, d.o_in, d.o_out);
 }
 
 bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
@@ -458,7 +503,13 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
     const float eps = (float) s.rms_eps, hc_eps = (float) s.hc_eps;
     const int iters = (int) s.hc_sinkhorn_iters;
     // hc_pre: the mixes of the four streams as they are (their RMS is applied in glm5_hc_pre), then the block's row
+    static const bool hc_fused = [] { const char* e = std::getenv("STRATA_HC_FUSED"); return e != nullptr && e[0] == '1'; }();
     auto hc_read = [&](const W& fn, const float* scale, const float* base, const float* norm) {
+        if (hc_fused && fn.type == k::kNativeQ8Rows && fn.n_out == 24) {   // b70-local: the four in one launch
+            k::glm5_hc_read_fused(g_hs_, fn.data, scale, base, eps, hc_eps, iters, norm, eps, hn_, g_xq_, g_post_,
+                                  g_comb_, N, T, cs);
+            return;
+        }
         k::native_quantize_q8_1(g_hs_, g_xq_, (int) (kHC * N), T, cs);
         k::native_mmvq(fn.type, fn.data, g_xq_, g_mixes_, fn.n_in, fn.n_out, T, cs);
         k::glm5_hc_pre(g_hs_, g_mixes_, scale, base, eps, hc_eps, iters, g_y_, g_post_, g_comb_, N, T, cs);
@@ -483,6 +534,23 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         }
         {   // b70-local: the six from the block row in as few launches as their types allow (native_mmvq_multi)
             bool done[6] = {};
+            if (q8v3_min_tokens() > 0 && T >= q8v3_min_tokens()) {   // b70-local: STRATA_Q8_DPAS3, the big ones in one launch
+                const void* ws[6]; float* ys[6]; int no[6]; int idx[6]; int c = 0;
+                for (int i = 0; i < 6; ++i) {
+                    const W& w = *from_row[i].first;
+                    if (w.type == k::kNativeQ8Rows && w.n_out >= q8v3_min_out() && w.n_in == from_row[0].first->n_in) {
+                        ws[c] = w.data; ys[c] = from_row[i].second; no[c] = (int) w.n_out; idx[c++] = i;
+                    }
+                }
+                if (c > 0 && k::native_q8_rows_dpas_xq3(c, ws, ys, no, g_xq_, (int) from_row[0].first->n_in, T, cs))
+                    for (int j = 0; j < c; ++j) done[idx[j]] = true;
+            }
+            if (k::native_q8_dpas_enabled() && T >= k::native_q8_dpas_min_tokens())   // b70-local: STRATA_Q8_DPAS
+                for (int i = 0; i < 6; ++i) {
+                    const W& w = *from_row[i].first;
+                    done[i] = w.type == k::kNativeQ8Rows &&
+                              k::native_q8_rows_dpas(w.data, hn_, from_row[i].second, (int) w.n_in, (int) w.n_out, T, cs);
+                }
             for (int i = 0; i < 6; ++i) {
                 if (done[i]) continue;
                 const void* ws[6]; float* ys[6]; int no[6]; int idx[6]; int c = 0;
@@ -544,7 +612,15 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
     glm5_decode_stamp(this, l, 3, cs);
     auto swiglu = [&](float* out) {   // gate / up from hn_'s q8_1, the clamp, down
         const int FW = b.ffn_gate.n_out;
-        if (b.ffn_gate.type != b.ffn_up.type ||
+        const bool gx = k::native_q8_dpas_enabled() && T >= k::native_q8_dpas_min_tokens() && b.ffn_gate.type == k::kNativeQ8Rows &&
+                        b.ffn_up.type == k::kNativeQ8Rows && k::native_q8_dpas_ok((int) N, FW, T) &&
+                        k::native_q8_rows_dpas(b.ffn_gate.data, hn_, g_ffg_, (int) N, FW, T, cs) &&
+                        k::native_q8_rows_dpas(b.ffn_up.data, hn_, g_ffu_, (int) N, FW, T, cs);   // b70-local: STRATA_Q8_DPAS
+        const void* g3w[2] = {b.ffn_gate.data, b.ffn_up.data}; float* g3y[2] = {g_ffg_, g_ffu_}; const int g3n[2] = {FW, FW};
+        const bool g3 = !gx && q8v3_min_tokens() > 0 && T >= q8v3_min_tokens() && FW >= q8v3_min_out() && b.ffn_gate.type == k::kNativeQ8Rows &&
+                        b.ffn_up.type == k::kNativeQ8Rows && k::native_q8_rows_dpas_xq3(2, g3w, g3y, g3n, g_xq_, (int) N, T, cs);   // STRATA_Q8_DPAS3
+        if (gx || g3) {
+        } else if (b.ffn_gate.type != b.ffn_up.type ||
             !k::native_mmvq_pair(b.ffn_gate.type, b.ffn_gate.data, b.ffn_up.data, g_xq_, g_ffg_, g_ffu_, (int) N, FW, T,
                                  cs)) {
             k::native_mmvq(b.ffn_gate.type, b.ffn_gate.data, g_xq_, g_ffg_, (int) N, FW, T, cs);
@@ -621,6 +697,8 @@ void PlainModel::record_dsa(const GBlock& b, int T, strata::gpu::Stream cs) {
                            g_xq_ + k::native_q8_1_rows_bytes((int) KVR, h * T), g_voT_ + h * T * VD, (int) KVR,
                            (int) VD, T, cs);
         k::glm5_transpose_abd(g_voT_, g_vo_, H, T, VD, cs);
+        glm5_decode_stamp(this, dsa_layer_, 11, cs);
+        glm5_decode_note_o(this, b.o.type, (int) b.o.n_in, (int) b.o.n_out);
         gproj(b.o, g_vo_, mix_, T, false, cs);
         glm5_decode_stamp(this, dsa_layer_, 10, cs);
 }
@@ -636,7 +714,15 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
     win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
     {   // the shared expert while the host serves: gate / up from hn_'s q8_1, the clamp, down
         const int FW = b.ffn_gate.n_out;
-        if (b.ffn_gate.type != b.ffn_up.type ||
+        const bool gx = k::native_q8_dpas_enabled() && T >= k::native_q8_dpas_min_tokens() && b.ffn_gate.type == k::kNativeQ8Rows &&
+                        b.ffn_up.type == k::kNativeQ8Rows && k::native_q8_dpas_ok((int) N, FW, T) &&
+                        k::native_q8_rows_dpas(b.ffn_gate.data, hn_, g_ffg_, (int) N, FW, T, cs) &&
+                        k::native_q8_rows_dpas(b.ffn_up.data, hn_, g_ffu_, (int) N, FW, T, cs);   // b70-local: STRATA_Q8_DPAS
+        const void* g3w[2] = {b.ffn_gate.data, b.ffn_up.data}; float* g3y[2] = {g_ffg_, g_ffu_}; const int g3n[2] = {FW, FW};
+        const bool g3 = !gx && q8v3_min_tokens() > 0 && T >= q8v3_min_tokens() && FW >= q8v3_min_out() && b.ffn_gate.type == k::kNativeQ8Rows &&
+                        b.ffn_up.type == k::kNativeQ8Rows && k::native_q8_rows_dpas_xq3(2, g3w, g3y, g3n, g_xq_, (int) N, T, cs);   // STRATA_Q8_DPAS3
+        if (gx || g3) {
+        } else if (b.ffn_gate.type != b.ffn_up.type ||
             !k::native_mmvq_pair(b.ffn_gate.type, b.ffn_gate.data, b.ffn_up.data, g_xq_, g_ffg_, g_ffu_, (int) N, FW, T,
                                  cs)) {
             k::native_mmvq(b.ffn_gate.type, b.ffn_gate.data, g_xq_, g_ffg_, (int) N, FW, T, cs);
@@ -684,7 +770,49 @@ bool PlainModel::record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    head_logits(hn_, 1, cs);
+    if (dhead_ != nullptr) {   // b70-local: the drafts' head over the --draft-vocab subset (logits_[i]: dvocab_[i])
+        if (head_.type == kBF16) {
+            k::bf16_gemv_fp32_mmvf_multi(hn_, head_.n_in, static_cast<const uint16_t*>(dhead_), logits_,
+                                         (int) n_dvocab_, head_.n_in, (int) n_dvocab_, 1, cs);
+        } else {
+            k::native_quantize_q8_1(hn_, xq_, head_.n_in, 1, cs);
+            k::native_mmvq(head_.type, dhead_, xq_, logits_, head_.n_in, (int) n_dvocab_, 1, cs);
+        }
+    } else {
+        head_logits(hn_, 1, cs);
+    }
+    return true;
+}
+
+bool PlainModel::eagle_prompt_rows(int j, const float* hs, const int32_t* tokens, int64_t T, int64_t p0,
+                                   strata::gpu::Stream cs, std::string& err) {
+    static FILE* df = [] {
+        const char* p = std::getenv("STRATA_DUMP_EAGLE");
+        return p ? std::fopen((std::string(p) + ".prompt").c_str(), "ab") : (FILE*) nullptr;
+    }();
+    if (df == nullptr) return true;
+    const int64_t N = spec_.n_embd;
+    if (eg_ptmp_rows_ < T) {
+        void* d = nullptr;
+        if (!strata::gpu::alloc_device(&d, (size_t) (T * N) * 4)) {
+            err = "plain prompt: no VRAM for the EAGLE features";
+            return false;
+        }
+        allocs_.push_back(d);
+        eg_ptmp_ = (float*) d;
+        eg_ptmp_rows_ = T;
+    }
+    k::glm5_hc_mean(hs, eg_ptmp_, N, T, cs);
+    std::vector<float> h((size_t) (T * N));
+    if (!strata::gpu::stream_sync(cs) || !strata::gpu::copy(h.data(), eg_ptmp_, h.size() * 4)) {
+        err = std::string("plain prompt: the EAGLE features: ") + strata::gpu::last_error();
+        return false;
+    }
+    const int32_t hd[3] = {(int32_t) p0, (int32_t) T, j};   // pos, T, slot, tokens[T], T x N floats
+    std::fwrite(hd, 4, 3, df);
+    std::fwrite(tokens, 4, (size_t) T, df);
+    std::fwrite(h.data(), 4, h.size(), df);
+    std::fflush(df);
     return true;
 }
 
@@ -702,8 +830,19 @@ bool PlainModel::record_window_glm5(int T, strata::gpu::Stream cs, std::string& 
         k::copy_from_mapped(g_hs_, m_in_, (int64_t) T * kHC * N, cs);
     }
     uint32_t ring = 0;
-    for (int64_t l = lb_; l < le_; ++l)
+    for (int64_t l = lb_; l < le_; ++l) {
+        for (int j = 0; j < 3; ++j)
+            if (eg_layer_[j] == l) {   // b70-local EAGLE-3: the streams' mean entering layer l
+                k::glm5_hc_mean(g_hs_, eg_tmp_, N, T, cs);
+                k::copy_from_mapped(m_eg_[j], eg_tmp_, (int64_t) T * N, cs);
+            }
         if (!record_gblock(gblocks_[(size_t) l], l, T, ring, segs_[(size_t) T], cs, err)) return false;
+    }
+    for (int j = 0; j < 3; ++j)
+        if (eg_layer_[j] == le_) {   // b70-local: the streams' mean after the trunk (before out_norm)
+            k::glm5_hc_mean(g_hs_, eg_tmp_, N, T, cs);
+            k::copy_from_mapped(m_eg_[j], eg_tmp_, (int64_t) T * N, cs);
+        }
     if (!last()) {
         k::copy_from_mapped(m_hand_, g_hs_, (int64_t) T * kHC * N, cs);
         return true;

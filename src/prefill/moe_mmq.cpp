@@ -142,4 +142,19 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     if (n > 0) Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { dst[i] = (int32_t) i[0]; });
 }
 
+void scale_rows_by_group(float* dst, int64_t ld, const int32_t* row_ids, int64_t r0, int64_t nr, int64_t cols,
+                         const int32_t* rbounds, int n, const uint8_t* const* wtab, size_t tail_off, int s_lo, int s_hi,
+                         int64_t split, void* stream) {
+    if (nr <= 0 || tail_off == 0) return;
+    Q(stream).parallel_for(sycl::range<2>((size_t) nr, (size_t) cols), [=](sycl::id<2> id) {
+        const int64_t i = (int64_t) id[0], c = (int64_t) id[1];
+        int g = 0;   // the group holding relative row i (n is a handful: a linear walk)
+        while (g + 1 < n && rbounds[g + 1] <= i) ++g;
+        const float* tail = reinterpret_cast<const float*>(wtab[g] + tail_off);
+        const float s = tail[c < split ? s_lo : s_hi];
+        const int64_t row = row_ids != nullptr ? row_ids[i] : r0 + i;
+        dst[row * ld + c] *= s;
+    });
+}
+
 }  // namespace strata::prefill::mmq

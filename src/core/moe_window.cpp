@@ -192,14 +192,26 @@ void MoeWindow::publish_plan(void* ctx) {
     *(volatile uint32_t*) w->h_flagA_ = w->cur_ring_;
 }
 
+bool MoeWindow::set_device_plan(const int32_t* d_res, const unsigned long long* d_slot_off, std::string& err) {
+    if (d_skip_ == nullptr && !strata::gpu::alloc_device((void**) &d_skip_, 64)) {
+        err = "moe window: device plan flag";
+        return false;
+    }
+    d_res_ = d_res;
+    d_slot_off_ = d_slot_off;
+    return true;
+}
+
 void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, const int32_t* ids, const float* w,
                         strata::gpu::Stream cs) {
     (void) ring;
     (void) grp;
     using namespace strata::kernels;
     const int64_t N = sh_.n_embd, K = sh_.k;
-    doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
-                     m_w_ + (size_t) tb * K, m_seq_, cs);
+    last_ids_ = ids + (size_t) tb * K;
+    if (d_res_ == nullptr)   // device_plan: the host is not asked
+        doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
+                         m_w_ + (size_t) tb * K, m_seq_, cs);
     if (cpu::expert_layout().native) quantize_q8_1_rows(x, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
     else quantize_q8_0_scaled(x, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
     if (bf16_) copy_from_mapped(nat_xf_ + (size_t) tb * N, x, (int64_t) n * N, cs);   // the BF16 experts' FP32 rows
@@ -212,8 +224,14 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     const int64_t N = sh_.n_embd, K = sh_.k;
     const int64_t cap = (int64_t) n * K, capx = (int64_t) sh_.max_t * K;
     int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-    if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);   // the pool published this group's GPU plan
-    copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+    if (d_res_ != nullptr) {   // device_plan: every expert resident, the plan from the router's ids on the device
+        resident_plan(last_ids_, (int) (n * K), (int) K, d_res_ + (size_t) layer * (size_t) sh_.n_expert,
+                      (int) sh_.n_expert, tier_.cache_base, d_slot_off_, (long long) tier_.blob, pl, (long long) capx,
+                      d_skip_, ring, cs);
+    } else {
+        if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);   // the pool published this group's GPU plan
+        copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+    }
     const int32_t* p_counts = pl;
     const int32_t* p_start = pl + 4;
     const int32_t* p_dst = p_start + capx + 1;
@@ -228,7 +246,9 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
             if (lay.native) {
                 const auto& f = lay.fmt[(size_t) layer];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
+                NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
+                L.tail_off = f.tail_off;   // NVFP4: the per-expert scales at the blob's end
+                if (f.tail_off != 0) L.bytes = f.bytes;
                 if (f.gu_type == 30)
                     native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
                                                hit_scratch_, hit_out, cs, grid_groups);
@@ -241,6 +261,12 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
             }
         };
         grouped(p_ptr, p_start, p_counts, cap);
+        if (d_res_ != nullptr) {   // device_plan: no PCIe share and no CPU rows; zero the rows the GPU did not write
+            copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst,
+                                  p_counts + 1, cs);
+            moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            return true;
+        }
         if (!segmented_) wait_flag_ge(m_flagB_, ring, cs);   // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                          // stage it with a copy kernel, then point at staging
             const int64_t per = sh_.groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;

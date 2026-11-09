@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 
 namespace strata::kernels {
@@ -182,20 +183,6 @@ inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const ha
         sumf_m += d8[i] * (float) dp4a(m, u[i], 0);
     }
     return low(dm2) * sumf_d - high(dm2) * sumf_m;
-}
-
-// Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
-// signed-byte subtraction, DP4A order, and the float accumulation sequence.
-inline float q6_q8_dot_impl(int vl, int vh, const int* u, const int8_t* scales, float d, const float* d8) {
-    float sumf = 0.0f;
-    for (int i = 0; i < 2; ++i) {
-        const int sc = scales[4 * i];
-        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
-    }
-    return d * sumf;
 }
 
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
@@ -419,26 +406,35 @@ struct Q6KTraits {
     using Block = Q6KBlock;
     static constexpr int DIV = 256, T = 32, KBY = 8, BPI = WARPS * WARP / 32;
     static int kqs(int tid) { return tid % 32; }
-    struct W { int vl, vh; float d; const int8_t* scales; int bq8_offset; };
-    static W load(const Block* w, int iqs) {
+    // b70-local: the 6-bit values and their scales unpacked once in load, not again for every activation column in
+    // apply (ncols 2-8: the MTP window verifies 3 tokens; the unpack dominated, 1.7x the ncols-1 time).  The same
+    // integers reach the same dp4a and the same float steps, so every column is bitwise what it was.
+    struct W { int vi[2]; int sc[2]; float d; int bq8_offset; };
+    static W unpack(int vl, int vh, const int8_t* scales, float d, int bq8_offset) {
         W r;
-        r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
-        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
-        const int vh_shift = 2 * ((iqs % 16) / 8);
-        r.vl = load_int_b2(w->ql, iqs);
-        r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
-        r.scales = w->scales + scale_offset;
-        r.d = (float) w->d;
+        for (int i = 0; i < 2; ++i) {
+            r.sc[i] = scales[4 * i];
+            const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            r.vi[i] = vsubss4(vil | vih, 0x20202020);
+        }
+        r.d = d;
+        r.bq8_offset = bq8_offset;
         return r;
     }
+    static W load(const Block* w, int iqs) {
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+        return unpack(load_int_b2(w->ql, iqs), load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift,
+                      w->scales + scale_offset, (float) w->d, 4 * (iqs / 16) + (iqs % 16) / 8);
+    }
     static float apply(const W& r, const Q81Block* x, int iqs) {
-        int u[2];
-        float d8[2];
+        float sumf = 0.0f;
         for (int i = 0; i < 2; ++i) {
-            u[i] = load_int(x[r.bq8_offset + 2 * i].qs, iqs % 8);
-            d8[i] = low(x[r.bq8_offset + 2 * i].ds);
+            const Q81Block& xb = x[r.bq8_offset + 2 * i];
+            sumf += low(xb.ds) * (dp4a(r.vi[i], load_int(xb.qs, iqs % 8), 0) * r.sc[i]);
         }
-        return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
+        return r.d * sumf;
     }
 };
 // kNativeQ6KRows: Q6KTraits' loads from the row's split arrays, every 32-bit load aligned; the same values reach
@@ -448,15 +444,12 @@ struct Q6KRowTraits : Q6KTraits {
         const uint8_t* base = weights + std::size_t(row) * bpr * sizeof(Q6KBlock);
         const uint8_t* ql = base + std::size_t(kbx) * 128;
         const uint8_t* qh = base + std::size_t(bpr) * 128 + std::size_t(kbx) * 64;
-        W r;
-        r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
         const int vh_shift = 2 * ((iqs % 16) / 8);
-        r.vl = load_int(ql, iqs);
-        r.vh = load_int(qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
-        r.scales = reinterpret_cast<const int8_t*>(base + std::size_t(bpr) * 192 + std::size_t(kbx) * 16) + scale_offset;
-        r.d = (float) *reinterpret_cast<const half*>(base + std::size_t(bpr) * 208 + std::size_t(kbx) * 2);
-        return r;
+        return unpack(load_int(ql, iqs), load_int(qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift,
+                      reinterpret_cast<const int8_t*>(base + std::size_t(bpr) * 192 + std::size_t(kbx) * 16) + scale_offset,
+                      (float) *reinterpret_cast<const half*>(base + std::size_t(bpr) * 208 + std::size_t(kbx) * 2),
+                      4 * (iqs / 16) + (iqs % 16) / 8);
     }
 };
 // Exact pinned vec_dot_iq4_xs_q8_1: a lane consumes one 32-element subblock, computes integer dot products, applies
@@ -619,6 +612,99 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
     });
 }
 
+
+// b70-local: the Q6_K rows product for 2-8 columns with the activations loaded once for ROWS rows.  launch_kernel's
+// apply loads a column's two q8_1 ints and their scales again for every row, and at the MTP window's 3 columns those
+// loads, not the arithmetic, set the time (T = 3 was 1.6x T = 1).  Here a lane loads them once a block and applies
+// them to ROWS rows' weights; each row's sum is Q6KTraits::apply's steps in launch_kernel's order (NW = WARPS,
+// ROWS rows a work-group), so the results are bitwise launch_kernel's.  STRATA_MMVQ_Q6K_XREUSE=0: as before.
+template<int NCOLS, int ROWS>
+sycl::event launch_q6k_rows_xreuse(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+    using F = Q6KRowTraits;
+    constexpr int NW = WARPS;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const size_t groups = (std::size_t(n_out) + ROWS - 1) / ROWS;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> partial(sycl::range<1>((NW - 1) * NCOLS * ROWS * WARP), h);
+        h.parallel_for(sycl::nd_range<1>(groups * NW * WARP, NW * WARP),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            constexpr int BPI = F::BPI * NW / WARPS;
+            const sycl::sub_group sg = it.get_sub_group();
+            const int ty = (int) sg.get_group_linear_id(), tx = (int) sg.get_local_linear_id();
+            const int tid = WARP * ty + tx;
+            const int row0 = ROWS * (int) it.get_group(0);
+            const int blocks_per_row = n_in / F::DIV;
+            const int x_stride = n_in / Q8K;
+            float tmp[NCOLS][ROWS] = {};
+            const int iqs = F::kqs(tid);
+            const int bq8 = 4 * (iqs / 16) + (iqs % 16) / 8;
+            for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
+                const int kby = kbx * F::KBY;
+                int u[NCOLS][2];
+                float d8[NCOLS][2];
+                #pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const Q81Block* xb = x + std::size_t(j) * x_stride + kby;
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        u[j][i] = load_int(xb[bq8 + 2 * i].qs, iqs % 8);
+                        d8[j][i] = low(xb[bq8 + 2 * i].ds);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    if (row0 + r >= n_out) continue;
+                    const F::W wv = F::load_row(static_cast<const uint8_t*>(weights), row0 + r, kbx, blocks_per_row, iqs);
+                    #pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) {
+                        float sumf = 0.0f;   // Q6KTraits::apply
+                        #pragma unroll
+                        for (int i = 0; i < 2; ++i) sumf += d8[j][i] * (dp4a(wv.vi[i], u[j][i], 0) * wv.sc[i]);
+                        tmp[j][r] += wv.d * sumf;
+                    }
+                }
+            }
+            auto at = [&](int l, int j, int i, int lane) -> float& {
+                return partial[((l * NCOLS + j) * ROWS + i) * WARP + lane];
+            };
+            if (ty > 0) {
+                #pragma unroll
+                for (int j = 0; j < NCOLS; ++j)
+                    #pragma unroll
+                    for (int i = 0; i < ROWS; ++i) at(ty - 1, j, i, tx) = tmp[j][i];
+            }
+            sycl::group_barrier(it.get_group());
+            if (ty > 0) return;
+            #pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                #pragma unroll
+                for (int i = 0; i < ROWS; ++i) {
+                    for (int l = 0; l < NW - 1; ++l) tmp[j][i] += at(l, j, i, tx);
+                    tmp[j][i] = warp_sum(sg, tmp[j][i]);
+                    if (tx == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+                }
+            }
+        });
+    });
+}
+
+inline bool q6k_xreuse() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMVQ_Q6K_XREUSE"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+inline int q6k_xreuse_rows() {
+    static const int r = [] { const char* e = std::getenv("STRATA_MMVQ_Q6K_XROWS"); return e ? std::atoi(e) : 2; }();
+    return r;
+}
+
+// b70-local: STRATA_MMVQ_ROWS=2|4 - rows a work-group for 2-8 columns (the MTP window's 3 tokens).  One row a group
+// read the activations once a row: at 3 columns 4x the weight bytes in loads, 1.7x the 1-column time.  A row's sum
+// keeps its lanes and order, so the results do not change.
+inline int multi_rows() {
+    static const int r = [] { const char* e = std::getenv("STRATA_MMVQ_ROWS"); return e ? std::atoi(e) : 0; }();
+    return r;
+}
+
 template<typename F, int NCOLS>
 void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
     if (NCOLS > 1 && !g_multi_exact) {
@@ -634,9 +720,21 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
         return;
     }
+    if constexpr (std::is_same_v<F, Q6KRowTraits> && NCOLS > 1) {
+        if (n_in / F::DIV >= F::BPI && q6k_xreuse()) {
+            if (q6k_xreuse_rows() == 8) launch_q6k_rows_xreuse<NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
+            else if (q6k_xreuse_rows() == 4) launch_q6k_rows_xreuse<NCOLS, 4>(q, weights, x_q8_1, y, n_in, n_out);
+            else launch_q6k_rows_xreuse<NCOLS, 2>(q, weights, x_q8_1, y, n_in, n_out);
+            return;
+        }
+    }
     if (n_in / F::DIV < F::BPI)
         launch_kernel<F, NCOLS, WARPS, WARPS>(q, weights, x_q8_1, y, n_in, n_out,
                                               (std::size_t(n_out) + WARPS - 1) / WARPS);
+    else if (NCOLS > 1 && multi_rows() == 2)
+        launch_kernel<F, NCOLS, WARPS, 2>(q, weights, x_q8_1, y, n_in, n_out, (std::size_t(n_out) + 1) / 2);
+    else if (NCOLS > 1 && multi_rows() == 4)
+        launch_kernel<F, NCOLS, WARPS, 4>(q, weights, x_q8_1, y, n_in, n_out, (std::size_t(n_out) + 3) / 4);
     else
         launch_kernel<F, NCOLS, WARPS, 1>(q, weights, x_q8_1, y, n_in, n_out, std::size_t(n_out));
 }

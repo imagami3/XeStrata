@@ -18,6 +18,7 @@
 #include "tq_states.hpp"
 
 #include <immintrin.h>
+#include <cmath>
 
 namespace strata::kernels::cpu::tq_detail {
 namespace {
@@ -99,6 +100,33 @@ void rows_nt(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, i
 }
 
 }  // namespace
+
+void ptq1_rows_avx2(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                    int r1) {
+    const int nb = n / 128;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        float acc[kTqMaxTokens][4] = {};
+        alignas(64) int16_t tw[128];
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * 28;
+            ptq1_block_trits(blk, tw);
+            const float dx = tq_half_to_float(tq_ld16(blk + 26));
+            for (int t = 0; t < nt; ++t) {
+                const int16_t* q = a[t]->q + 128 * i;
+                for (int k = 0; k < 4; ++k) {
+                    const __m256i w0 = _mm256_load_si256((const __m256i*) (tw + 32 * k)), w1 = _mm256_load_si256((const __m256i*) (tw + 32 * k + 16));
+                    const __m256i q0 = _mm256_loadu_si256((const __m256i*) (q + 32 * k)), q1 = _mm256_loadu_si256((const __m256i*) (q + 32 * k + 16));
+                    __m256i p = _mm256_add_epi32(_mm256_madd_epi16(w0, q0), _mm256_madd_epi16(w1, q1));
+                    __m128i h = _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
+                    h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0x4E)); h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0xB1));
+                    acc[t][k] = std::fma((float) _mm_cvtsi128_si32(h), dx * a[t]->d[4 * i + k], acc[t][k]);
+                }
+            }
+        }
+        for (int t = 0; t < nt; ++t) out[t][r] = (acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3]);
+    }
+}
 
 void tq_rows_avx2(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {

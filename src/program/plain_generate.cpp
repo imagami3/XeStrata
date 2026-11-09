@@ -433,8 +433,16 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     std::fflush(stdout);
                     return 1;
                 }
-                live = std::move(best->ids);
-                cache.parked.erase(best);
+                // b70-local: with boundary copies the copy stays parked (moved to the front): an agent comes back to
+                // the same point from a think call and from its next step
+                static const bool keep_copy = std::getenv("STRATA_PLAIN_BOUNDARY_IDS") != nullptr;
+                if (keep_copy) {
+                    live = best->ids;
+                    cache.parked.splice(cache.parked.begin(), cache.parked, best);
+                } else {
+                    live = std::move(best->ids);
+                    cache.parked.erase(best);
+                }
                 resume = best_r;
             } else if (resume < (int64_t) live.size()) {
                 park_live(cache.parked.end());   // the request starts another conversation: keep this one
@@ -455,19 +463,61 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         bool ok = true;
         int32_t next = -1;
         bool windows = opt.prompt_chunk <= 0;
-        if (!windows) {
-            ok = model.prompt(ids.data() + resume, n - resume, resume, out.data(), nullptr, err);
-            next = out[0];
-            if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
-        }
-        if (windows) {
-            for (int64_t p = resume; ok && p < n;) {
-                const int w = (int) std::min<int64_t>(opt.max_t, n - p);
+        auto read = [&](int64_t from, int64_t to) {
+            if (!windows) {
+                ok = model.prompt(ids.data() + from, to - from, from, out.data(), nullptr, err);
+                next = out[0];
+                if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
+                else return;
+            }
+            for (int64_t p = from; ok && p < to;) {
+                const int w = (int) std::min<int64_t>(opt.max_t, to - p);
                 ok = model.forward(ids.data() + p, w, p, out.data(), nullptr, err);
                 p += w;
                 next = out[(size_t) w - 1];
             }
+        };
+        // b70-local: STRATA_PLAIN_BOUNDARY_IDS (the chat template's role tokens, comma-separated).  A recurrent state
+        // serves only a request that extends all of it, and an agent harness ends a request with a message the next
+        // one drops (a note, a question): each step read the whole history again (GLM-5.3, a 10K-token history:
+        // ~30 s a step).  Read to the start of the last message before the reply's role token, park a copy of the
+        // state there, then read the rest; the next request that replaces the last message resumes from the copy.
+        static const std::vector<int32_t> boundary_ids = [] {
+            std::vector<int32_t> v;
+            const char* e = std::getenv("STRATA_PLAIN_BOUNDARY_IDS");
+            for (const char* p = e; p != nullptr && *p != '\0';) {
+                char* q = nullptr;
+                const long t = std::strtol(p, &q, 10);
+                if (q == p) break;
+                v.push_back((int32_t) t);
+                p = *q == ',' ? q + 1 : q;
+            }
+            return v;
+        }();
+        int64_t split = resume;
+        if (!boundary_ids.empty() && cache.budget > 0 && model.recurrent()) {
+            int64_t seen = 0;
+            for (int64_t p = n - 1; p > resume; --p)
+                if (std::find(boundary_ids.begin(), boundary_ids.end(), ids[(size_t) p]) != boundary_ids.end() &&
+                    ++seen == 2) {
+                    split = p;
+                    break;
+                }
+            const bool parked_already = std::any_of(cache.parked.begin(), cache.parked.end(), [&](const auto& e) {
+                return (int64_t) e.ids.size() == split && std::equal(e.ids.begin(), e.ids.end(), ids.begin());
+            });
+            if (split - resume < 256 || parked_already) split = resume;
         }
+        if (split > resume) {
+            read(resume, split);
+            if (ok) {
+                live.assign(ids.begin(), ids.begin() + split);
+                park_live(cache.parked.end());
+                std::fprintf(stderr, "[strata] boundary copy at %lld tokens (%zu parked)\n", (long long) split,
+                             cache.parked.size());
+            }
+        }
+        if (ok) read(split, n);
         if (!ok) {   // the state is the device's, half written: the next request starts over
             live.clear();
             std::printf("ERR %s\n", err.c_str());
@@ -479,8 +529,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const char* finish = "length";
         long long produced = 0;
         // with drafts (greedy requests): a window emits the accepted drafts and the token after them, sent one by one;
-        // the state holds every one of them but the last, as `live` does
-        const bool spec = model.drafts() > 0 && sp.greedy;
+        // the state holds every one of them but the last, as `live` does.  b70-local: sampled requests too
+        // (STRATA_PLAIN_SPEC_SAMPLED=0: greedy only, as before) - a window's row t draws at position pos + t, the
+        // draw a token alone at that position takes (Philox on the seed and the position), so a draft is kept exactly
+        // when the sampler picks it there and the text is the serial loop's (no penalties here: the history is not
+        // part of the draw)
+        static const bool spec_sampled = [] { const char* e = std::getenv("STRATA_PLAIN_SPEC_SAMPLED"); return e == nullptr || e[0] != '0'; }();
+        const bool spec = model.drafts() > 0 && (sp.greedy || spec_sampled);
+        if (spec) model.set_context(live.data(), (int64_t) live.size());   // b70-local: lookup drafts' context
         if (spec && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
         std::vector<int32_t> pend;
         size_t at = 0;

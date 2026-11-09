@@ -18,6 +18,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <new>
@@ -72,6 +73,12 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
     return true;
 }
 
+size_t native_quantize_rows(int type, const float* src, void* dst, int64_t nrows, int64_t n, const float* imatrix) {
+    if (native_row_bytes(type, n) == 0) return 0;
+    ggml_quantize_init((ggml_type) type);
+    return ggml_quantize_chunk((ggml_type) type, src, dst, 0, nrows, n, imatrix);
+}
+
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
     if (up_type < 0) up_type = gu_type;
@@ -123,11 +130,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
-    f.act_bytes = gu_type == 42 ? sizeof(ActQ) : ggml_row_size(vdt_g, n_embd);
-    if (gu_type == 42 && n_embd > H) {
-        err = "native experts: a Q2_0 layer wider than the ActQ";
-        return false;
-    }
+    // b70-local: a Q2_0 layer wider than the ActQ (GLM-5.3's 4096) goes through ggml's vec_dot on Q8_0 activations
+    f.act_bytes = gu_type == 42 && n_embd <= H ? sizeof(ActQ) : ggml_row_size(vdt_g, n_embd);
     f.h_bytes = ggml_row_size(vdt_d, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
         err = "native experts: activation larger than the pool's buffers";
@@ -162,7 +166,7 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
         return;
     }
     // native_gu_rows reads a Q2_0 layer's ActQ, not ggml's vec_dot_type
-    if (f.gu_type == 42) { act_quant_any(x, (int) f.n_embd, *new (dst) ActQ); return; }
+    if (f.gu_type == 42 && f.n_embd <= H) { act_quant_any(x, (int) f.n_embd, *new (dst) ActQ); return; }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
@@ -248,7 +252,7 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
-    if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
+    if (f.gu_type == 42 && f.n_embd <= H) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
         float* up[MAXT] = {};
         const ActQ* qa[MAXT] = {};
@@ -316,9 +320,28 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         else kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+    // b70-local: NVFP4 gate/up for a few tokens (a verify window's group): the weights decoded once for all of them,
+    // each token's dot ggml's bit for bit (GLM-5.3 shape, 3 tokens: 0.566 -> ~0.37 ms an expert, 7 threads)
+    static const bool nv_mt = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_MT") == nullptr;
+    if (f.gu_type == 40 && !native_mixed_gu(f) && nt >= 2 && nv_mt) {
+        thread_local float ub[MAXT][kNativeMaxFF];
+        float* up[MAXT] = {};
+        for (int t = 0; t < nt; ++t) up[t] = ub[t];
+        nvfp4_rows_mt(blob, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1);
+        nvfp4_rows_mt(blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
+        float sg = 1.f, su = 1.f;
+        if (f.tail_off != 0) { std::memcpy(&sg, blob + f.tail_off, 4); std::memcpy(&su, blob + f.tail_off + 4, 4); }
+        const float lim = expert_swiglu_limit();
+        for (int t = 0; t < nt; ++t)
+            for (int r = r0; r < r1; ++r) ff[t][r] = swiglu_host(ff[t][r] * sg, up[t][r] * su, lim);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     const float lim = expert_swiglu_limit();
+    // NVFP4 (tail_off): the expert's weight_scale_2 of gate and up on their outputs, before the clamp and the SiLU
+    float sg = 1.f, su = 1.f;
+    if (f.tail_off != 0 && f.gu_type == 40) { std::memcpy(&sg, blob + f.tail_off, 4); std::memcpy(&su, blob + f.tail_off + 4, 4); }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -326,7 +349,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
-            ff[t][r] = swiglu_host(g, u, lim);
+            ff[t][r] = swiglu_host(g * sg, u * su, lim);
         }
     }
 }
@@ -368,12 +391,22 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+    float sd = 1.f;   // NVFP4 (tail_off): the expert's down weight_scale_2
+    if (f.tail_off != 0 && f.d_type == 40) std::memcpy(&sd, blob + f.tail_off + 8, 4);
+    static const bool nv_mt = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_MT") == nullptr;
+    if (f.d_type == 40 && nt >= 2 && nv_mt) {   // b70-local: as the gate/up rows above
+        nvfp4_rows_mt(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+        if (sd != 1.f)
+            for (int t = 0; t < nt; ++t)
+                for (int r = r0; r < r1; ++r) out[t][r] *= sd;
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = s * sd;
         }
     }
 }

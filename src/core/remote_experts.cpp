@@ -292,6 +292,8 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
             }
             strata::kernels::quantize_q8_1_rows(xin, n_tok, H, d_q8_, s);
             auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.up_type);
+            L.tail_off = fmt.tail_off;   // NVFP4: the per-expert scales at the blob's end
+            if (fmt.tail_off != 0) L.bytes = fmt.bytes;
             if (fmt.had_d) {   // APR: and the down weights the rotated h
                 L.had_block = fmt.had_block;
                 L.d_signs = strata::kernels::hadamard_device_signs(fmt.d_signs, (int) fmt.n_ff);

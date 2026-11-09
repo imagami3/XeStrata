@@ -92,6 +92,12 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// b70-local, NVFP4 experts: rows [0, nr) of a batch of n expert groups (relative bounds `rbounds`, on the device) of
+/// `dst` (row r0 + i, or row_ids[i]) times their expert's weight_scale_2 from its blob's tail (wtab[g] + tail_off):
+/// float s_lo for the columns below `split`, s_hi from it (gate/up: 0, 1, n_ff; down: 2, 2, 0).  tail_off 0: nothing.
+void scale_rows_by_group(float* dst, int64_t ld, const int32_t* row_ids, int64_t r0, int64_t nr, int64_t cols,
+                         const int32_t* rbounds, int n, const uint8_t* const* wtab, size_t tail_off, int s_lo, int s_hi,
+                         int64_t split, void* stream);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

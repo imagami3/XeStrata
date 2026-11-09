@@ -176,6 +176,8 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
             };
             for (int64_t l = lb_; l < le_; ++l) {
                 const GBlock& b = gblocks_[(size_t) l];
+                for (int j = 0; j < 3; ++j)   // b70-local EAGLE-3: the prompt rows' features (STRATA_DUMP_EAGLE only for now)
+                    if (eg_layer_[j] == l && !eagle_prompt_rows(j, P.g_hs, tokens + c0, T, p0, cs, err)) return false;
                 hc_read(b.hc_attn_fn, b.hc_attn_scale, b.hc_attn_base, b.attn_norm);
                 if (b.kda) {
                     float* state = gdn_state_[(size_t) b.idx];
@@ -283,6 +285,8 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 }
                 k::glm5_hc_post(ffn_out, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs);
             }
+            for (int j = 0; j < 3; ++j)   // b70-local: the trunk's output rows (before out_norm)
+                if (eg_layer_[j] == le_ && !eagle_prompt_rows(j, P.g_hs, tokens + c0, T, p0, cs, err)) return false;
             // the MTP layer after the trunk, its caches a cell ahead: row t pairs the trunk's normed row t with the
             // token after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked).
             // Only its caches are wanted here, so of its block only the latent and the indexer's keys are made.

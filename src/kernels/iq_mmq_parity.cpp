@@ -173,7 +173,8 @@ int bench() {
     const Combo combos[] = {{"ornith-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 512},
                             {"ornith-3bit", GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2048, 512},
                             {"llmjp-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, 2560, 960},
-                            {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640}};
+                            {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640},
+                            {"glm53-nvfp4", GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, 4096, 2048}};
     constexpr int G = 16;
     for (const Combo& c : combos) {
         const int64_t N = c.N, FF = c.FF;
@@ -256,6 +257,7 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
+        bad += check(GGML_TYPE_NVFP4, 128, 512, c);   // NVFP4 experts (GLM-5.3-Flash NVIDIA)
     }
     std::printf(bad ? "FAIL\n" : "PASS\n");
     return bad ? 1 : 0;

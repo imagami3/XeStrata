@@ -168,3 +168,30 @@ bool native_q8_0_rows_ok(int n_in) noexcept;
 void native_q8_0_to_rows(void* weights, int n_in, int n_out, void* stream);
 
 } // namespace strata::kernels
+
+namespace strata::kernels {
+/// b70-local (q6k_xmx.cpp): STRATA_Q6K_XMX=1 - the decode's Q6_K rows products for 2-8 tokens on XMX.
+bool native_q6k_xmx_enabled();
+/// b70-local (q6k_xmx.cpp): STRATA_Q8_XMX=1 - the decode's kNativeQ8Rows projections for 2-8 tokens on XMX (FP16 tokens,
+/// not bitwise native_mmvq's); x: T rows of n_in floats (not quantized), y: T rows of n_out floats.
+/// b70-local (q8_dpas.cpp): STRATA_Q8_DPAS=N - the decode's kNativeQ8Rows projections of N or more tokens (1: 2 or more)
+/// on int8 XMX (ESIMD DPAS, the tokens quantized as q8_1); x: T rows of n_in floats.  false (nothing launched): not this
+/// shape, or no int8 XMX on the device (STRATA_NO_XMX=1 included) - the caller takes native_mmvq.
+bool native_q8_dpas_enabled();
+int native_q8_dpas_min_tokens();
+bool native_q8_dpas_ok(int n_in, int n_out, int T) noexcept;
+bool native_q8_rows_dpas(const void* weights, const float* x, float* y, int n_in, int n_out, int T, void* stream);
+/// b70-local (q8_dpas.cpp v2): STRATA_Q8_DPAS2=N - kNativeQ8Rows on DPAS from the q8_1 rows (0: off), up to 6 matrices
+/// sharing x in one launch (weights as B, tokens as A, T <= 8).
+int native_q8_dpas2_min_tokens();
+bool native_q8_rows_dpas_xq(int count, const void* const* w, float* const* y, const int* n_out, const void* xq, int n_in, int T, void* stream);
+/// v3: the gemvx layout (weights as A, tokens as B, T <= 16) from the q8_1 rows; same contract as _xq
+bool native_q8_rows_dpas_xq3(int count, const void* const* w, float* const* y, const int* n_out, const void* xq, int n_in, int T, void* stream);
+bool native_q8_xmx_enabled();
+bool native_q8_rows_xmx_ok(int n_in, int n_out, int T) noexcept;
+void native_q8_rows_xmx(const void* weights, const float* x, float* y, int n_in, int n_out, int T, void* stream);
+/// x (T rows of n floats) -> xh (T rows of FP16)
+void native_f32_to_f16_rows(const float* x, void* xh, int n, int T, void* stream);
+/// y (T rows of n_out) = kNativeQ6KRows weights x the FP16 rows xh (8 rows of n_in allocated, rows past T finite)
+void native_q6k_rows_xmx(const void* weights, const void* xh, float* y, int n_in, int n_out, int T, void* stream);
+}  // namespace strata::kernels
