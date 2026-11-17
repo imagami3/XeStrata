@@ -209,7 +209,7 @@ void native_f32_to_f16_rows(const float* x, void* xh, int n, int T, void* stream
 // weights: kNativeQ6KRows (a row: its blocks' ql, then qh, then the scales, then d).  xh: 8 rows of n_in FP16 (rows
 // past T finite, e.g. zeros).  y: T rows of n_out floats.  n_out a multiple of 16, n_in of 512.
 void native_q6k_rows_xmx(const void* weights, const void* xh, float* y, int n_in, int n_out, int T, void* stream) {
-    if (n_out % TN != 0 || n_in % (NSG * BLK) != 0 || T < 1 || T > TM)
+    if (n_out % TN != 0 || n_in % BLK != 0 || T < 1 || T > TM)   // b70-local: the blocks need not split evenly among the sub-groups (only sub-group barriers in the loop)
         throw std::invalid_argument("native_q6k_rows_xmx: n_out % 16, n_in % 1024, 1 <= T <= 8");
     const uint8_t* w = static_cast<const uint8_t*>(weights);
     const sycl::half* x = static_cast<const sycl::half*>(xh);

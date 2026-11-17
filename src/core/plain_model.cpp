@@ -247,7 +247,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             return false;
         }
     }
-    if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
+    // b70-local: Inkling 2 with every expert resident takes windows up to 256 (its prompt; checked in open_experts)
+    if (opt_.max_t < 1 || opt_.max_t > 256 || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
@@ -903,6 +904,10 @@ bool PlainModel::open_experts(std::string& err) {
         if (!expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, err)) return false;
     }
     const auto& lay = k::cpu::expert_layout();
+    if (opt_.max_t > k::cpu::MAXT && !(ink_ && lay.mixed)) {
+        err = "plain model: windows past " + std::to_string(k::cpu::MAXT) + " tokens are for Inkling 2's RVQ groups only";
+        return false;
+    }
     for (int64_t l : moe_local_)
         if (!k::native_expert_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type, s.n_embd, s.n_ff_exp,
                                         lay.fmt[(size_t) l].up_type)) {
@@ -1104,6 +1109,7 @@ bool PlainModel::open_experts(std::string& err) {
     ws.n_expert = E;
     ws.k = s.n_expert_used;
     ws.max_t = opt_.max_t;
+    ws.big = opt_.max_t > k::cpu::MAXT;
     MoeWindowTier tier;
     tier.cache_base = n_slots_ > 0 ? cache_.device_slot(0) : nullptr;
     tier.blob = (int64_t) lay.max_blob;
@@ -1800,11 +1806,12 @@ bool PlainModel::setup_device_plan(std::string& err) {
     if (dev_plan_tried_) return true;
     dev_plan_tried_ = true;
     const char* e = std::getenv("STRATA_PLAIN_DEVICE_PLAN");
-    if (e == nullptr || std::strtol(e, nullptr, 10) == 0 || !glm_ || win_.segmented() || res_.empty()) return true;
+    if (e == nullptr || std::strtol(e, nullptr, 10) == 0 || !(glm_ || ink_) || win_.segmented() || res_.empty()) return true;
     const int64_t E = spec_.n_expert;
+    const auto& lay = k::cpu::expert_layout();
     for (int64_t l : moe_local_)
-        for (int64_t x = 0; x < E; ++x)
-            if (res_[(size_t) (l * E + x)] < 0) {
+        for (int64_t x = 0; x < E; ++x)   // b70-local RVQ groups: an absent expert (the router never picks it) needs no slot
+            if (res_[(size_t) (l * E + x)] < 0 && !(lay.mixed && lay.e_ff[(size_t) (l * E + x)] == 0)) {
                 std::fprintf(stderr, "strata plain: device plan off (MoE layer %lld expert %lld has no VRAM slot)\n",
                              (long long) l, (long long) x);
                 return true;
@@ -1826,6 +1833,7 @@ bool PlainModel::setup_device_plan(std::string& err) {
         allocs_.push_back(d_off);
     }
     if (!win_.set_device_plan(d_res, d_off, err)) return false;
+    big_ok_ = true;
     std::fprintf(stderr, "strata plain: device plan on (%lld MoE layers, every expert resident): the host answers no ring\n",
                  (long long) moe_local_.size());
     return true;
@@ -1836,6 +1844,10 @@ bool PlainModel::record(int T, bool mtp, std::string& err) {
     std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
     if (exec != nullptr || !segs.empty()) return true;
     if (!setup_device_plan(err)) return false;
+    if (T > k::cpu::MAXT && !big_ok_) {
+        err = "plain model: a window of " + std::to_string(T) + " tokens needs the device plan (STRATA_PLAIN_DEVICE_PLAN=1)";
+        return false;
+    }
     if (!strata::gpu::begin_capture(cs_)) {
         err = std::string("plain model: begin capture: ") + strata::gpu::last_error();
         return false;
@@ -1947,6 +1959,10 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         }
         std::fflush(df);
     }
+    if (logits != nullptr && T > k::cpu::MAXT) {   // b70-local: a big window (Inkling's prompt) has its last row's only
+        err = "plain model: a window past " + std::to_string(k::cpu::MAXT) + " tokens has no logits to read";
+        return false;
+    }
     if (logits != nullptr && !strata::gpu::copy(logits, t.logits_, (size_t) T * (size_t) n_vocab_ * 4)) {
         err = "plain model: reading the logits failed";
         return false;
@@ -1965,6 +1981,10 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     if (last()) {
         k::SamplerParams sp = sampler_;
         sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
+        if (ink_ && T > k::cpu::MAXT) {   // b70-local: a prompt window's head is its last row's (record_window_inkling2)
+            sp.counter = (uint64_t) (pos + T - 1);
+            k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_ + (T - 1), cs_);
+        } else
         k::sample_tokens(logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
     }
     if (!strata::gpu::stream_sync(cs_)) {

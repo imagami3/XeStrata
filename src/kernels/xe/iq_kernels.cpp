@@ -2791,11 +2791,11 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
 // tail (tail_off): f16 gains of the gate rows (n_ff), the up rows (n_ff), the down rows (n_embd), then the books F32
 // [2][256][8].  Against the tokens' FP32 rows `x`, as native_expert_grouped_bf16 (same scratch and grouping).
 namespace {
-template <int D>
+template <int D, int EP>
 inline void rvq_dot_multi(const sycl::sub_group& sg, const uint16_t* codes, const float* book, const float* const* xs, int n,
                           int64_t K, int lane, float* s) {
-    float acc[kEntriesPass];
-    for (int j = 0; j < kEntriesPass; ++j) acc[j] = 0.0f;
+    float acc[EP];
+    for (int j = 0; j < EP; ++j) acc[j] = 0.0f;
     const int64_t nc = K / D;
     for (int64_t c = lane; c < nc; c += kWarp) {
         const uint32_t code = codes[c];
@@ -2803,7 +2803,7 @@ inline void rvq_dot_multi(const sycl::sub_group& sg, const uint16_t* codes, cons
         const float* b2 = book + 256 * D + (size_t) (code & 255u) * D;
         float w[D];
         for (int k = 0; k < D; ++k) w[k] = b1[k] + b2[k];
-        for (int j = 0; j < kEntriesPass; ++j) {
+        for (int j = 0; j < EP; ++j) {
             if (j >= n) break;
             const float* xv = xs[j] + D * c;
             float d = 0.0f;
@@ -2811,11 +2811,19 @@ inline void rvq_dot_multi(const sycl::sub_group& sg, const uint16_t* codes, cons
             acc[j] += d;
         }
     }
-    for (int j = 0; j < kEntriesPass; ++j) s[j] = j < n ? sycl::reduce_over_group(sg, acc[j], sycl::plus<float>()) : 0.0f;
+    for (int j = 0; j < EP; ++j) s[j] = j < n ? sycl::reduce_over_group(sg, acc[j], sycl::plus<float>()) : 0.0f;
 }
 }  // namespace
 
-template <int D>
+bool rvq_xmx_on(int64_t cap_entries, int64_t N, int64_t FF);
+sycl::event rvq_xmx_gu(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_tok, const float* x, float* gate, float* up,
+                       int64_t N, int64_t FF);
+sycl::event rvq_xmx_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                         const int32_t* n_groups, const int32_t* ent_dst, const float* h, float* out, int64_t N,
+                         int64_t FF);
+
+template <int D, int EP>
 static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
@@ -2834,6 +2842,10 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     // ff/D codes][f16 gains 2ff+N][books]; FF (the layer's widest) sizes the grid and the scratch, rows past ff are skipped
     const bool mixed = L.mixed;
     const size_t gu_row = L.gu_row;   // n_embd / D codes, the same for every width
+    // b70-local: a big window of mixed experts (an Inkling prompt window) on the XMX engines (rvq_xmx.cpp)
+    const bool use_xmx = D == 8 && mixed && rvq_xmx_on(cap_entries, N, FF);
+    if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
+    else
     q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -2861,12 +2873,12 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
                 book = (const float*) (blob + book_off);
             }
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; e += kEntriesPass) {
-                const int n = sycl::min(kEntriesPass, e1 - e);
-                const float* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = x + (size_t) ent_tok[j < n ? e + j : e] * N;
-                float s[kEntriesPass];
-                rvq_dot_multi<D>(sg, cr, book, xs, n, N, lane, s);
+            for (int e = e0; e < e1; e += EP) {
+                const int n = sycl::min(EP, e1 - e);
+                const float* xs[EP];
+                for (int j = 0; j < EP; ++j) xs[j] = x + (size_t) ent_tok[j < n ? e + j : e] * N;
+                float s[EP];
+                rvq_dot_multi<D, EP>(sg, cr, book, xs, n, N, lane, s);
                 if (lane == 0)
                     for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * FF + r] = s[j] * gain;
             }
@@ -2881,6 +2893,11 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         swiglu_clamp(g, u, lim.lim);
         h[i] = (g / (1.0f + sycl::exp(-g))) * u;
     });
+    if (use_xmx) {
+        const sycl::event ex = rvq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, out, N, FF);
+        sync_if_needed(stream, ex, "native_expert_grouped_rvq (XMX)");
+        return;
+    }
     const sycl::event e = q.parallel_for(
         sycl::nd_range<2>({cg, (size_t) ((N + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
@@ -2908,12 +2925,12 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
                 book = (const float*) (blob + book_off);
             }
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int en = e0; en < e1; en += kEntriesPass) {
-                const int n = sycl::min(kEntriesPass, e1 - en);
-                const float* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = h + (size_t) (j < n ? en + j : en) * FF;
-                float s[kEntriesPass];
-                rvq_dot_multi<D>(sg, cr, book, xs, n, K, lane, s);
+            for (int en = e0; en < e1; en += EP) {
+                const int n = sycl::min(EP, e1 - en);
+                const float* xs[EP];
+                for (int j = 0; j < EP; ++j) xs[j] = h + (size_t) (j < n ? en + j : en) * FF;
+                float s[EP];
+                rvq_dot_multi<D, EP>(sg, cr, book, xs, n, K, lane, s);
                 if (lane == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) ent_dst[en + j] * N + r] = s[j] * gain;
             }
@@ -2929,8 +2946,13 @@ void native_expert_grouped_rvq(const NativeExpertLayout& L, const unsigned long 
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.gu_type != L.d_type || (L.gu_type != 150 && L.gu_type != 151) || L.tail_off == 0)
         throw core::DeviceError("native_expert_grouped_rvq: not an RVQ2X8 / RVQ2X16 expert");
-    if (L.gu_type == 151) native_expert_grouped_rvq_d<16>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
-    else native_expert_grouped_rvq_d<8>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
+    // b70-local: a big window (an Inkling prompt window, many entries an expert) reads each code once for 16 entries
+    static const int ep_big = [] { const char* v = std::getenv("STRATA_RVQ_EP"); return v ? (int) std::strtol(v, nullptr, 10) : 16; }();
+    const bool big = cap_entries > 64;
+    if (L.gu_type == 151) native_expert_grouped_rvq_d<16, kEntriesPass>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
+    else if (big && ep_big == 16) native_expert_grouped_rvq_d<8, 16>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
+    else if (big && ep_big == 8) native_expert_grouped_rvq_d<8, 8>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
+    else native_expert_grouped_rvq_d<8, kEntriesPass>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
 }
 
 }  // namespace strata::kernels

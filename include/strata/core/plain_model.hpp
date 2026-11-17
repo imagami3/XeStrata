@@ -500,6 +500,8 @@ private:
     float *g_ffg_ = nullptr, *g_ffu_ = nullptr;
     /// The recurrent states' sizes in bytes (a GDN's or a KDA's; its convolution history), for reset and spec_step.
     size_t state_bytes_ = 0, conv_bytes_ = 0;
+    bool big_ok_ = false;
+    void* i_xh_ = nullptr;   ///< b70-local: an Inkling prompt window's rows in FP16 (the Q6_K projections on XMX)   ///< b70-local: the device plan is on, so windows past MAXT can run (Inkling 2)
 
     PlainOptions opt_;
     ModelSpec spec_;

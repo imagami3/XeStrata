@@ -37,6 +37,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -230,7 +231,8 @@ bool PlainModel::load_inkling2(std::string& err) {
         err = "plain model: mapped staging allocation failed";
         return false;
     }
-    const size_t xq = std::max(k::native_q8_1_bytes((int) UN, (int) T), k::native_q8_1_bytes((int) HD, (int) T));
+    // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 256)
+    const size_t xq = std::max(k::native_q8_1_bytes((int) UN, 1), k::native_q8_1_bytes((int) HD, 1)) * (size_t) T;
     auto dev = [&](auto** p, uint64_t bytes) {
         void* d = nullptr;
         if (!strata::gpu::alloc_device(&d, (size_t) std::max<uint64_t>(bytes, 256))) return false;
@@ -245,11 +247,20 @@ bool PlainModel::load_inkling2(std::string& err) {
         !dev(&i_v_, T * KV * 4) || !dev(&i_r_, T * R * 4) || !dev(&i_sink_, T * NH * 4) ||
         !dev(&i_gate_, T * HD * 4) || !dev(&i_kp_, T * TAPS * 4) || !dev(&i_vp_, T * TAPS * 4) ||
         !dev(&i_att_, T * HD * 4) || !dev(&i_o_, T * UN * 4) || !dev(&rlog_, T * E * 4) || !dev(&ids_, T * K * 4) ||
-        !dev(&w_, T * K * 4) || !dev(&moe_out_, T * UN * 4) || !dev(&logits_, T * (uint64_t) n_vocab_ * 4)) {
+        !dev(&w_, T * K * 4) || !dev(&moe_out_, T * UN * 4) ||
+        !dev(&logits_, (last() ? std::min<uint64_t>(T, 8) : 1) * (uint64_t) n_vocab_ * 4)) {   // a big window's head: one row
         err = "plain model: no VRAM for the window's buffers";
         return false;
     }
     xq_ = g_xq_;   // the head's q8_1 rows (head_logits)
+    // b70-local: a prompt window's projections in FP16 (gproj in record_iblock): the rows and 8 zero rows past them
+    if (const char* v = std::getenv("STRATA_INK_Q6K_XMX"); T > 8 && (v == nullptr || v[0] != '0')) {   // =0: off
+        const uint64_t wide = std::max<uint64_t>(UN, HD);
+        if ((!dev(&i_xh_, (T + 8) * wide * 2) || !strata::gpu::memset(i_xh_, 0, (size_t) ((T + 8) * wide * 2)))) {
+            err = "plain model: no VRAM for the prompt window's FP16 rows";
+            return false;
+        }
+    }
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
@@ -286,6 +297,44 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     const int64_t E = s.n_expert, K = s.n_expert_used, KT = s.n_shortconv, B = s.attn_res_block;
     const float eps = (float) s.rms_eps;
     const int64_t bstride = (int64_t) opt_.max_t * N;
+    // b70-local: a window past 8 tokens (an Inkling prompt window) runs the 8-row kernels (the projections' MMVQ, the
+    // router's GEMV) in slices of 8 rows; g_xq_ (the rows' q8_1) is pointed at each slice while it is recorded
+    static const bool q8x_on = [] { const char* v = std::getenv("STRATA_INK_Q8_XMX"); return v == nullptr || v[0] != '0'; }();
+    auto gproj = [&](const W& w, const float* x, float* y, int TT, bool quantized, strata::gpu::Stream c) {
+        if (TT <= 8) { this->gproj(w, x, y, TT, quantized, c); return; }
+        // Q6_K rows on the matrix engines (q6k_xmx.cpp: 8 tokens a launch at about one token's cost), the tokens in
+        // FP16: i_xh_ holds the window's rows and 8 zero rows past them
+        if (i_xh_ != nullptr && w.type == k::kNativeQ6KRows && w.n_in % 256 == 0 && w.n_out % 16 == 0 &&
+            k::xmx_available(k::XmxType::f16)) {
+            k::native_f32_to_f16_rows(x, i_xh_, (int) w.n_in, TT, c);
+            for (int t0 = 0; t0 < TT; t0 += 8)
+                k::native_q6k_rows_xmx(w.data, (const uint16_t*) i_xh_ + (size_t) t0 * w.n_in, y + (size_t) t0 * w.n_out,
+                                       (int) w.n_in, (int) w.n_out, std::min(8, TT - t0), c);
+            return;
+        }
+        // Q8_0 rows on the matrix engines likewise (q6k_xmx.cpp native_q8_rows_xmx, 2-8 tokens a launch, FP16 tokens)
+        if (w.type == k::kNativeQ8Rows && k::xmx_available(k::XmxType::f16) && k::native_q8_rows_xmx_ok((int) w.n_in, (int) w.n_out, 8) &&
+            q8x_on) {
+            for (int t0 = 0; t0 < TT; t0 += 8) {
+                const int tn = std::min(8, TT - t0);
+                if (tn >= 2)
+                    k::native_q8_rows_xmx(w.data, x + (size_t) t0 * w.n_in, y + (size_t) t0 * w.n_out, (int) w.n_in, (int) w.n_out, tn, c);
+                else {
+                    if (quantized) k::native_quantize_q8_1(x + (size_t) t0 * w.n_in, g_xq_, (int) w.n_in, 1, c);
+                    this->gproj(w, x + (size_t) t0 * w.n_in, y + (size_t) t0 * w.n_out, 1, false, c);
+                }
+            }
+            return;
+        }
+        uint8_t* const xq0 = (uint8_t*) g_xq_;
+        const size_t qrow = k::native_q8_1_bytes((int) w.n_in, 1);
+        for (int t0 = 0; t0 < TT; t0 += 8) {
+            const int tn = std::min(8, TT - t0);
+            g_xq_ = (decltype(g_xq_)) (xq0 + (quantized ? (size_t) t0 * qrow : 0));
+            this->gproj(w, x + (size_t) t0 * (size_t) w.n_in, y + (size_t) t0 * (size_t) w.n_out, tn, quantized, c);
+        }
+        g_xq_ = (decltype(g_xq_)) xq0;
+    };
     float* conv_k = b.conv;
     float* conv_v = conv_k + KVW * (KT - 1);
     float* conv_a = conv_v + KVW * (KT - 1);
@@ -343,7 +392,8 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     // ---- the MoE: its residual mix, the norm, the router, the experts, the convolution
     k::inkling2_attn_res(i_blocks_, bstride, (int) (l / B + 1), x_, b.ffn_rq, 1, i_in_, N, T, cs);
     k::native_qsa_rms_norm_weighted_q8_1(i_in_, b.ffn_norm, hn_, g_xq_, (int) N, T, eps, cs);
-    k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
+    for (int t0 = 0; t0 < T; t0 += 8)
+        k::f32_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
     ++ring;
@@ -389,6 +439,13 @@ bool PlainModel::record_window_inkling2(int T, strata::gpu::Stream cs, std::stri
     }
     k::inkling2_attn_res(i_blocks_, bstride, (int) i_nblocks_, x_, i_out_rq_, 1, i_in_, N, T, cs);
     k::native_qsa_rms_norm_weighted(i_in_, out_norm_, hn_, (int) N, T, eps, cs);
+    if (T > 8) {   // b70-local: a prompt window: its last row's logits only, in that row's place (forward picks that row)
+        float* lr = logits_;   // row 0 (the buffer holds 8 rows); forward samples it into the last token's place
+        k::native_quantize_q8_1(hn_ + (size_t) (T - 1) * N, xq_, head_.n_in, 1, cs);
+        k::native_mmvq(head_.type, head_.data, xq_, lr, head_.n_in, head_.n_out, 1, cs);
+        k::inkling2_softcap(lr, 1, n_vocab_, n_vocab_, (float) s.final_softcap, cs);
+        return true;
+    }
     head_logits(hn_, T, cs);   // the tokens are picked after the graph (forward), with the run's sampler
     k::inkling2_softcap(logits_, T, n_vocab_, n_vocab_, (float) s.final_softcap, cs);
     return true;

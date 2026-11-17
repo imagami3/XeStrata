@@ -881,6 +881,75 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
     done(stream, e, "resident_plan");
 }
 
+// b70-local (11-17): resident_plan for a window of many entries (an Inkling prompt window: up to thousands): a counting
+// sort by expert in one work-group of 1024.  Groups in expert order, entries in a group in no fixed order (each entry's
+// row goes to dst[] = its own index, so the sums do not depend on it).  The plan layout is resident_plan's.
+void resident_plan_big(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
+                       const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
+                       uint32_t ring, void* stream) {
+    constexpr int WG = 1024, EMAX = 1024;
+    if (n_expert > EMAX || n > capx) throw std::invalid_argument("resident_plan_big: too many experts or entries");
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(EMAX), h);
+        sycl::local_accessor<int32_t, 1> fill(sycl::range<1>(EMAX), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int t = (int) it.get_local_id(0);
+            for (int x = t; x < n_expert; x += WG) { cnt[x] = 0; fill[x] = 0; }
+            sycl::group_barrier(it.get_group());
+            for (int i = t; i < n; i += WG) {
+                const int32_t ex = ids[i];
+                if (ex >= 0 && ex < n_expert) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                     sycl::access::address_space::local_space> a(cnt[ex]);
+                    a.fetch_add(1);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            int32_t* counts = pl;
+            int32_t* start = pl + 4;
+            int32_t* dst = start + capx + 1;
+            int32_t* tok = dst + capx;
+            const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+            unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
+            int32_t* start2 = pl + ptr_off + 4 * capx;
+            if (t == 0) {   // the groups: experts with entries, in order; fill[x] = the group's start
+                int g = 0, at = 0;
+                for (int x = 0; x < n_expert; ++x) {
+                    const int c = cnt[x];
+                    if (c == 0) continue;
+                    const int32_t slot = res[x];
+                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+                    start[g] = at;
+                    fill[x] = at;
+                    at += c;
+                    ++g;
+                }
+                start[g] = at;
+                start2[0] = at;
+                counts[0] = g;
+                counts[1] = at;
+                counts[2] = 0;
+            }
+            sycl::group_barrier(it.get_group());
+            for (int i = t; i < n; i += WG) {
+                const int32_t ex = ids[i];
+                if (ex < 0 || ex >= n_expert) continue;
+                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space> a(fill[ex]);
+                const int p = a.fetch_add(1);
+                dst[p] = i;
+                tok[p] = i / k;
+            }
+            sycl::group_barrier(it.get_group());
+            if (t == 0) {
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                *skip = ring;
+            }
+        });
+    });
+    done(stream, e, "resident_plan_big");
+}
+
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     Q(stream).single_task([=] {
         if (read_host(skip) == value) return;

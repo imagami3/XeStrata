@@ -61,7 +61,8 @@ MoeWindow::~MoeWindow() {
 bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
-        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT ||
+        shape.max_t < 1 || (!shape.big && (shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT)) ||
+        shape.max_t > 512 ||
         (shape.groups != 1 && shape.groups != 2)) {
         err = "moe window: the shape is out of range";
         return false;
@@ -224,7 +225,11 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     const int64_t N = sh_.n_embd, K = sh_.k;
     const int64_t cap = (int64_t) n * K, capx = (int64_t) sh_.max_t * K;
     int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-    if (d_res_ != nullptr) {   // device_plan: every expert resident, the plan from the router's ids on the device
+    if (d_res_ != nullptr && n * K > 128) {   // b70-local: a big window (an Inkling prompt window)
+        resident_plan_big(last_ids_, (int) (n * K), (int) K, d_res_ + (size_t) layer * (size_t) sh_.n_expert,
+                          (int) sh_.n_expert, tier_.cache_base, d_slot_off_, (long long) tier_.blob, pl, (long long) capx,
+                          d_skip_, ring, cs);
+    } else if (d_res_ != nullptr) {   // device_plan: every expert resident, the plan from the router's ids on the device
         resident_plan(last_ids_, (int) (n * K), (int) K, d_res_ + (size_t) layer * (size_t) sh_.n_expert,
                       (int) sh_.n_expert, tier_.cache_base, d_slot_off_, (long long) tier_.blob, pl, (long long) capx,
                       d_skip_, ring, cs);

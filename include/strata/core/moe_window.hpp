@@ -38,6 +38,7 @@ struct MoeWindowShape {
     int64_t k = 0;
     int max_t = 1;          ///< tokens a window holds, 1..kVerifyMaxT
     int groups = 1;         ///< token groups a window is cut into (1 or 2), each with its own plan and staging
+    bool big = false;       ///< b70-local: max_t past kVerifyMaxT (every expert resident, the device plan only)
 };
 
 /// The VRAM expert tier the window reads: its slot arena and the residency table of the MoE layers.
