@@ -2823,6 +2823,16 @@ sycl::event rvq_xmx_down(sycl::queue& q, size_t cg, const unsigned long long* gr
                          const int32_t* n_groups, const int32_t* ent_dst, const float* h, float* out, int64_t N,
                          int64_t FF);
 
+bool rvq_lut_on(sycl::queue& q, int64_t cap_entries, int64_t N, int64_t FF, bool mixed, size_t up_off, size_t down_off,
+                size_t d_row);
+sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_groups, const float* x, float* gate,
+                       float* up, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t up_off, size_t tail);
+sycl::event rvq_lut_down(sycl::queue& q, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                         const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* hh,
+                         float* out, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t down_off, size_t d_row,
+                         size_t tail);
+
 template <int D, int EP>
 static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
@@ -2844,7 +2854,10 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     const size_t gu_row = L.gu_row;   // n_embd / D codes, the same for every width
     // b70-local: a big window of mixed experts (an Inkling prompt window) on the XMX engines (rvq_xmx.cpp)
     const bool use_xmx = D == 8 && mixed && rvq_xmx_on(cap_entries, N, FF);
+    // b70-local: one token (the decode) by lookup tables of the layer's books against x (rvq_lut.cpp)
+    const bool use_lut = D == 8 && !use_xmx && rvq_lut_on(q, cap_entries, N, FF, mixed, L.up_off, L.down_off, L.d_row);
     if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
+    else if (use_lut) rvq_lut_gu(q, grp_ptr, grp_start, n_groups, ent_tok, cap_groups, x, gate, up, N, FF, mixed, gu_row, L.up_off, tail);
     else
     q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
@@ -2893,6 +2906,12 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         swiglu_clamp(g, u, lim.lim);
         h[i] = (g / (1.0f + sycl::exp(-g))) * u;
     });
+    if (use_lut) {
+        const sycl::event el = rvq_lut_down(q, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF, mixed,
+                                            gu_row, L.down_off, L.d_row, tail);
+        sync_if_needed(stream, el, "native_expert_grouped_rvq (LUT)");
+        return;
+    }
     if (use_xmx) {
         const sycl::event ex = rvq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, out, N, FF);
         sync_if_needed(stream, ex, "native_expert_grouped_rvq (XMX)");

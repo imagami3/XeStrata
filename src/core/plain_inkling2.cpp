@@ -290,6 +290,8 @@ bool PlainModel::reset_inkling2(std::string& err) {
     return ok;
 }
 
+void glm5_decode_stamp(const void* model, int64_t l, int i, strata::gpu::Stream cs);
+
 bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring,
                                std::vector<strata::gpu::Graph*>& segs, strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
@@ -341,6 +343,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     float* conv_f = conv_a + N * (KT - 1);
 
     // ---- the attention inputs: the residual mixes of the blocks before this layer and the running row
+    glm5_decode_stamp(this, l, 0, cs);
     const float* in[3] = {x_, x_, x_};
     if (b.n_aq > 0) {
         const int nb = (int) ((l - 1) / B + 1);
@@ -365,6 +368,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     gproj(b.rel, hn_, i_r_, T, true, cs);
     gproj(b.sink, hn_, i_sink_, T, true, cs);
     gproj(b.gate, hn_, i_gate_, T, true, cs);
+    glm5_decode_stamp(this, l, 1, cs);
 
     // ---- k and v through their convolutions, the clips, the cache, the attention
     const float sk = 1.0f / std::sqrt((float) ((b.swa ? 1 : 2) * KT + 1));
@@ -379,6 +383,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::inkling2_attention(i_q_, i_r_, i_sink_, b.kc, b.vc, b.rel_table, step_, (int) H, (int) NKV, (int) D, (int) R,
                           (int) b.extent, b.swa ? (int) s.n_swa : 0, i_att_, T, cs);
     k::inkling2_sigmoid_mul(i_att_, i_gate_, (int64_t) T * H * D, cs);
+    glm5_decode_stamp(this, l, 2, cs);
     gproj(b.o, i_att_, i_o_, T, false, cs);
     const float s1 = 1.0f / std::sqrt((float) (KT + 1));
     k::inkling2_conv(i_o_, conv_a, b.attn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs);
@@ -389,6 +394,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
         k::add_inplace(x_, mix_, (int64_t) T * N, cs);
     }
 
+    glm5_decode_stamp(this, l, 3, cs);
     // ---- the MoE: its residual mix, the norm, the router, the experts, the convolution
     k::inkling2_attn_res(i_blocks_, bstride, (int) (l / B + 1), x_, b.ffn_rq, 1, i_in_, N, T, cs);
     k::native_qsa_rms_norm_weighted_q8_1(i_in_, b.ffn_norm, hn_, g_xq_, (int) N, T, eps, cs);
@@ -396,6 +402,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
         k::f32_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
+    glm5_decode_stamp(this, l, 4, cs);
     ++ring;
     win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
     if (win_.segmented()) {   // a graph ends where the host must answer the ring
@@ -411,6 +418,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
     k::inkling2_conv(moe_out_, conv_f, b.ffn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs);
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+    glm5_decode_stamp(this, l, 5, cs);
     return true;
 }
 

@@ -516,6 +516,32 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
                      model, d.dsa_vb / d.n[1], (d.dsa[4] - d.dsa_vb) / d.n[1], d.o_type, d.o_in, d.o_out);
 }
 
+// b70-local: the same stamps in Inkling 2's layers (record_iblock): 0 start, 1 norms + projections, 2 convolutions +
+// clips + attention, 3 o + its convolution + the residual, 4 MoE norm + router, 5 experts + combine + convolution;
+// layers split by kind (sliding-window or global attention)
+void ink_decode_prof_read(const void* model, const std::vector<char>& is_swa, int64_t first_l, int64_t last_l) {
+    if (!dec_prof_on()) return;
+    auto it = dec_profs().find(model);
+    if (it == dec_profs().end() || it->second.dev == nullptr) return;
+    DecProf& d = it->second;
+    if (!strata::gpu::copy(d.h.data(), d.dev, d.h.size() * 8)) return;
+    for (int64_t l = first_l; l < last_l && l < kDecLayers; ++l) {
+        const unsigned long long* st = &d.h[(size_t) l * kDecSlots];
+        if (st[0] == 0 || st[5] < st[0]) continue;
+        const int kk = l < (int64_t) is_swa.size() && is_swa[(size_t) l] ? 0 : 1;
+        for (int i = 0; i < 5; ++i) d.sum[kk][i] += (double) (st[i + 1] - st[i]);
+        d.sum[kk][5] += (double) (st[5] - st[0]);
+        ++d.n[kk];
+    }
+    if (++d.windows % 64 == 0)
+        for (int kk = 0; kk < 2; ++kk)
+            if (d.n[kk] > 0)
+                std::fprintf(stderr, "strata decode profile %p %s layers (%lld): ticks a layer %.0f = proj %.0f, attn %.0f, "
+                                     "o+res %.0f, router %.0f, experts %.0f\n", model, kk == 0 ? "SWA" : "global", d.n[kk],
+                             d.sum[kk][5] / d.n[kk], d.sum[kk][0] / d.n[kk], d.sum[kk][1] / d.n[kk], d.sum[kk][2] / d.n[kk],
+                             d.sum[kk][3] / d.n[kk], d.sum[kk][4] / d.n[kk]);
+}
+
 bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
                                strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
