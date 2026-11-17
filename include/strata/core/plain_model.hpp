@@ -456,9 +456,41 @@ private:
         float *kc = nullptr, *vc = nullptr, *conv = nullptr;   ///< the cache ([cells][nkv D] F32) and conv history
         float* conv_snap = nullptr;   ///< b70-local: the history after each of a window's rows 0 .. n_snap_ - 1
     };
-    /// b70-local: STRATA_INK_SPEC=lookup - speculative decoding on Inkling 2 (the drafts: ink_draft)
+    /// b70-local: STRATA_INK_SPEC=lookup|dspark - speculative decoding on Inkling 2 (the drafts: ink_draft)
     bool ink_spec_ = false;
     bool ink_draft(std::string& err);
+    // b70-local: the DSpark drafter (plain_dspark.cpp), the last stage's
+    struct DSparkLayer {
+        W q, k, v, o, kctx, vctx, gate, up, down;
+        const float *ctx_norm = nullptr, *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr,
+                    *k_norm = nullptr, *k_ctx_norm = nullptr;
+        float *kc = nullptr, *vc = nullptr;
+        int64_t ring = 0;
+        bool local = false;
+    };
+    bool dspark_ = false;
+    float ds_ema_ = 0.7f;   ///< the drafts' recent acceptance (spec_step), for how many to make
+    int64_t ds_pause_ = 0;
+    std::vector<DSparkLayer> ds_layers_;
+    const float *ds_wmix_ = nullptr, *ds_mask_ = nullptr, *ds_norm_ = nullptr, *ds_rnn_norm_ = nullptr,
+                *ds_tok_norm_ = nullptr, *ds_rnn_b_ = nullptr, *ds_hout_b_ = nullptr;
+    const uint16_t* ds_w1_ = nullptr;
+    W ds_rnn_, ds_hout_;
+    int ds_H_ = 0, ds_KVH_ = 0, ds_HD_ = 0, ds_FF_ = 0, ds_rank_ = 0, ds_swa_ = 0;
+    float ds_theta_ = 0, ds_eps_ = 0, ds_teps_ = 0;
+    float *ds_ctx_ = nullptr, *ds_k_ = nullptr, *ds_v_ = nullptr, *ds_x_ = nullptr, *ds_h_ = nullptr,
+          *ds_q_ = nullptr, *ds_att_ = nullptr, *ds_g_ = nullptr, *ds_u_ = nullptr, *ds_frnn_ = nullptr,
+          *ds_state_ = nullptr, *ds_lat_ = nullptr, *ds_joint_ = nullptr, *ds_jout_ = nullptr, *ds_corr_ = nullptr,
+          *ds_logits_ = nullptr;
+    void* ds_xq_ = nullptr;
+    float *h_anchor_ = nullptr, *m_anchor_ = nullptr;
+    float *h_dprob_ = nullptr, *m_dprob_ = nullptr;   ///< mapped: each draft's confidence
+    int32_t *h_dprev_ = nullptr, *m_dprev_ = nullptr;
+    float* h_tapbuf_ = nullptr;   ///< the root's: the earlier stages' taps on their way to the last stage
+    bool dspark_load(std::string& err);
+    void dspark_mm(const W& w, const float* x, float* y, int rows);
+    bool dspark_ingest(int T, int64_t pos, std::string& err);
+    bool dspark_draft(int n, std::string& err);
     bool ink_ = false;
     std::vector<IBlock> iblocks_;
     int64_t i_nblocks_ = 0;                   ///< the attention residuals' blocks over the whole trunk

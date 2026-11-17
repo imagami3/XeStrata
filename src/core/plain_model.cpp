@@ -1979,7 +1979,35 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         std::fprintf(stderr, "\n");
     }
     PlainModel& t = tail();
-    if (i_taps_ != nullptr) {   // b70-local: STRATA_DUMP_TAPS, each tap from the stage that ran its layer
+    if (t.dspark_) {   // b70-local: the drafter's context: every tap on the last stage, then its K / V
+        const int64_t N = spec_.n_embd, MT = opt_.max_t;
+        if (h_tapbuf_ == nullptr && !strata::gpu::alloc_host((void**) &h_tapbuf_, (size_t) (MT * N) * 4)) {
+            err = "plain model: no pinned memory for the drafter's taps";
+            return false;
+        }
+        for (size_t j = 0; j < t.tap_layers_.size(); ++j) {
+            const int64_t l = t.tap_layers_[j];
+            for (PlainModel* st : chain()) {
+                const bool owns = l >= spec_.n_layer ? st->last() : l >= st->lb_ && l < st->le_;
+                if (!owns || st == &t || st->i_taps_ == nullptr) continue;
+                {
+                    const OnDevice on2(st->dev_);
+                    if (!strata::gpu::copy(h_tapbuf_, st->i_taps_ + (size_t) j * MT * N, (size_t) (T * N) * 4)) {
+                        err = "plain model: the drafter's taps";
+                        return false;
+                    }
+                }
+                const OnDevice on3(t.dev_);
+                if (!strata::gpu::copy(t.i_taps_ + (size_t) j * MT * N, h_tapbuf_, (size_t) (T * N) * 4)) {
+                    err = "plain model: the drafter's taps";
+                    return false;
+                }
+            }
+        }
+        const OnDevice on4(t.dev_);
+        if (!t.dspark_ingest(T, pos, err)) return false;
+    }
+    if (i_taps_ != nullptr && std::getenv("STRATA_DUMP_TAPS") != nullptr) {   // b70-local: STRATA_DUMP_TAPS, each tap from the stage that ran its layer
         static FILE* tf = std::fopen(std::getenv("STRATA_DUMP_TAPS"), "ab");
         const int64_t N = spec_.n_embd, NT = (int64_t) tap_layers_.size(), MT = opt_.max_t;
         std::vector<float> rows((size_t) (NT * T * N));
@@ -2167,7 +2195,20 @@ static inline uint64_t tri_key(int32_t a, int32_t b, int32_t c) {
 }
 // b70-local: Inkling 2's drafts after the pending token cur_ (STRATA_INK_SPEC=lookup: the lookup drafts alone)
 bool PlainModel::ink_draft(std::string& err) {
-    (void) err;
+    if (dspark_) {
+        // b70-local (STRATA_DSPARK_ADAPT=0: off): as many drafts as pay for their window.  On the B70 (11-18) a window
+        // of 3 cost 1.63 one-token steps and the drafts 0.24 more, of 2 about 1.4: two drafts pay from an acceptance
+        // of about 0.6, one from 0.4; under that none, with one now and then to see whether the text changed
+        static const bool adapt = [] { const char* v = std::getenv("STRATA_DSPARK_ADAPT"); return v == nullptr || v[0] != '0'; }();
+        int want = n_snap_;
+        if (adapt) {
+            if (ds_ema_ >= 0.6f) want = n_snap_;
+            else if (ds_ema_ >= 0.4f) want = 1;
+            else if (++ds_pause_ % 16 != 0) { drafts_.clear(); return true; }
+            else want = 1;
+        }
+        return dspark_draft(want, err);
+    }
     drafts_.clear();
     int32_t lk[16];
     const int k = lk_propose(cur_, std::min(n_snap_, 16), lk);
@@ -2294,6 +2335,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     ++spec_windows_;
     spec_drafted_ += nd;
     spec_accepted_ += n;
+    if (ink_spec_ && nd > 0) ds_ema_ = 0.9f * ds_ema_ + 0.1f * (float) n / (float) nd;   // b70-local
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
     if (spec_lookup_on()) {   // the window's pending token and its accepted drafts join the context

@@ -11,6 +11,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -184,10 +185,11 @@ void native_q8_rows_xmx(const void* weights, const float* x, float* y, int n_in,
         std::lock_guard<std::mutex> lk(mu);
         for (auto& b : bufs)
             if (b.first == &q && b.second.second >= (size_t) n_in * TM) xh = b.second.first;
-        if (xh == nullptr) {
-            xh = sycl::malloc_device<sycl::half>((size_t) 16384 * TM, q);
-            q.memset(xh, 0, sizeof(sycl::half) * (size_t) 16384 * TM);
-            bufs.push_back({&q, {xh, (size_t) 16384 * TM}});
+        if (xh == nullptr) {   // b70-local: as wide as the input (a fixed 16384 overran with Inkling's drafter, 18432)
+            const size_t w = (size_t) std::max(n_in, 16384) * TM;
+            xh = sycl::malloc_device<sycl::half>(w, q);
+            q.memset(xh, 0, sizeof(sycl::half) * w);
+            bufs.push_back({&q, {xh, w}});
         }
     }
     const size_t total = (size_t) n_in * (size_t) TM, live = (size_t) n_in * (size_t) T;

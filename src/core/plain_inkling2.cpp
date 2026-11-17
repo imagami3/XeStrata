@@ -276,7 +276,9 @@ bool PlainModel::load_inkling2(std::string& err) {
             return false;
         }
     }
-    if (std::getenv("STRATA_DUMP_TAPS") != nullptr) {   // b70-local: the drafter's taps (forward writes them)
+    const char* spec_kind = std::getenv("STRATA_INK_SPEC");
+    const bool want_dspark = spec_kind != nullptr && std::strcmp(spec_kind, "dspark") == 0 && opt_.spec > 1;
+    if (std::getenv("STRATA_DUMP_TAPS") != nullptr || want_dspark) {   // b70-local: the drafter's taps (forward writes them)
         const char* v = std::getenv("STRATA_TAP_LAYERS");
         const std::string list = v ? v : "5,11,17,23,29,35,41,48";
         for (size_t at = 0; at < list.size();) {
@@ -287,6 +289,7 @@ bool PlainModel::load_inkling2(std::string& err) {
         }
         if (!dev(&i_taps_, (uint64_t) tap_layers_.size() * T * UN * 4)) { err = "plain model: no VRAM for the taps"; return false; }
     }
+    if (want_dspark && last() && !dspark_load(err)) return false;   // before the expert tier takes the VRAM
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
