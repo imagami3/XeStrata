@@ -94,6 +94,18 @@ CHATGLM4_PATTERN = (
     r"|\s+"
 )
 
+# b70-local (11-17) `inkling2` (Inkling 2 Small): the Split regex of its tokenizer.json, verbatim (an o200k-style pattern),
+# with the model's `ignore_merges: true` (a piece in the vocabulary is that one token).
+INKLING2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -101,6 +113,7 @@ PRE_TYPES = {
     "qwen2": (QWEN2_PATTERN, False, "llama.cpp de7fa0a3 src/llama-vocab.cpp L389 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"),
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+    "inkling2": (INKLING2_PATTERN, True, "Inkling 2 Small tokenizer.json pre_tokenizer Split (b70-local 11-17)"),
 }
 
 
