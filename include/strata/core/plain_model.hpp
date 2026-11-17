@@ -506,6 +506,15 @@ private:
     /// The recurrent states' sizes in bytes (a GDN's or a KDA's; its convolution history), for reset and spec_step.
     size_t state_bytes_ = 0, conv_bytes_ = 0;
     bool big_ok_ = false;
+    // b70-local: STRATA_DUMP_TAPS=<file> (Inkling 2): each window's rows at the drafter's taps (the inputs of layers
+    // STRATA_TAP_LAYERS, default 5,11,..,41, and the final normed rows as layer n_layer), [tap][max_t][n_embd] here;
+    // forward appends (pos, token, taps x n_embd floats) per token to the file
+    float* i_taps_ = nullptr;
+    std::vector<int> tap_layers_;
+    int tap_slot(int64_t l) const {
+        for (size_t j = 0; j < tap_layers_.size(); ++j) if (tap_layers_[j] == l) return (int) j;
+        return -1;
+    }
     void* i_xh_ = nullptr;   ///< b70-local: an Inkling prompt window's rows in FP16 (the Q6_K projections on XMX)   ///< b70-local: the device plan is on, so windows past MAXT can run (Inkling 2)
 
     PlainOptions opt_;

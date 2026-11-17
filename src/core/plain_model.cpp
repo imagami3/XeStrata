@@ -1979,6 +1979,26 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         std::fprintf(stderr, "\n");
     }
     PlainModel& t = tail();
+    if (i_taps_ != nullptr) {   // b70-local: STRATA_DUMP_TAPS, each tap from the stage that ran its layer
+        static FILE* tf = std::fopen(std::getenv("STRATA_DUMP_TAPS"), "ab");
+        const int64_t N = spec_.n_embd, NT = (int64_t) tap_layers_.size(), MT = opt_.max_t;
+        std::vector<float> rows((size_t) (NT * T * N));
+        for (int64_t j = 0; j < NT; ++j) {
+            const int64_t l = tap_layers_[(size_t) j];
+            for (PlainModel* st : chain()) {
+                const bool owns = l >= spec_.n_layer ? st->last() : l >= st->lb_ && l < st->le_;
+                if (!owns || st->i_taps_ == nullptr) continue;
+                const OnDevice on2(st->dev_);
+                strata::gpu::copy(rows.data() + (size_t) (j * T * N), st->i_taps_ + (size_t) (j * MT * N), (size_t) (T * N) * 4);
+            }
+        }
+        for (int i = 0; tf != nullptr && i < T; ++i) {
+            const int32_t hd[2] = {(int32_t) (pos + i), tokens[i]};
+            std::fwrite(hd, 4, 2, tf);
+            for (int64_t j = 0; j < NT; ++j) std::fwrite(rows.data() + (size_t) ((j * T + i) * N), 4, (size_t) N, tf);
+        }
+        if (tf != nullptr) std::fflush(tf);
+    }
     const OnDevice on(t.dev_);
     for (int i = 0; i < T; ++i) out[i] = ((volatile int32_t*) t.h_out_)[i];
     // b70-local: STRATA_DUMP_EAGLE=<file> appends each window: pos, T, tokens[T], picks[T], then 3 slots' T x N floats

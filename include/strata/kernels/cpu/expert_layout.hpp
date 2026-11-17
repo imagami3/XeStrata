@@ -50,9 +50,13 @@ struct ExpertLayout {
     /// group order): every expert has its own width and blob.  Per (layer, expert), n_expert a layer: e_ff (0 = absent,
     /// the router never picks it), e_bytes (its blob), e_src (3 absolute file offsets of its gate / up / down codes),
     /// e_gsrc (3 of its gains); per layer, book_src (the layer's books).  bytes[l] is the layer's largest blob.
+    /// The offsets carry their file in the top byte (mixed_src): shard s of mixed_files, the GGUF's split parts.
     bool mixed = false;
     std::vector<int32_t> e_ff;
     std::vector<uint64_t> e_bytes, e_src, e_gsrc, book_src;
+    std::vector<std::string> mixed_files;   ///< the shards' paths, in shard order
+    static constexpr int kMixedShardShift = 56;
+    static uint64_t mixed_src(size_t shard, uint64_t off) { return ((uint64_t) shard << kMixedShardShift) | off; }
     std::vector<int32_t> n_kept;          ///< per layer: experts present (the router's columns in the file)
     uint64_t expert_bytes(int64_t layer, int64_t expert) const {
         return mixed ? e_bytes[(size_t) (layer * n_expert + expert)] : blob_bytes(layer);

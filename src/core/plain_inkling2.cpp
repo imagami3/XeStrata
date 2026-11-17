@@ -261,6 +261,17 @@ bool PlainModel::load_inkling2(std::string& err) {
             return false;
         }
     }
+    if (std::getenv("STRATA_DUMP_TAPS") != nullptr) {   // b70-local: the drafter's taps (forward writes them)
+        const char* v = std::getenv("STRATA_TAP_LAYERS");
+        const std::string list = v ? v : "5,11,17,23,29,35,41,48";
+        for (size_t at = 0; at < list.size();) {
+            tap_layers_.push_back(std::atoi(list.c_str() + at));
+            const size_t c = list.find(',', at);
+            if (c == std::string::npos) break;
+            at = c + 1;
+        }
+        if (!dev(&i_taps_, (uint64_t) tap_layers_.size() * T * UN * 4)) { err = "plain model: no VRAM for the taps"; return false; }
+    }
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
@@ -344,6 +355,8 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
 
     // ---- the attention inputs: the residual mixes of the blocks before this layer and the running row
     glm5_decode_stamp(this, l, 0, cs);
+    if (const int j = tap_slot(l); j >= 0 && i_taps_ != nullptr)   // b70-local: the layer's input, a drafter tap
+        k::copy_from_mapped(i_taps_ + (size_t) j * opt_.max_t * N, x_, (int64_t) T * N, cs);
     const float* in[3] = {x_, x_, x_};
     if (b.n_aq > 0) {
         const int nb = (int) ((l - 1) / B + 1);
@@ -448,6 +461,8 @@ bool PlainModel::record_window_inkling2(int T, strata::gpu::Stream cs, std::stri
     }
     k::inkling2_attn_res(i_blocks_, bstride, (int) i_nblocks_, x_, i_out_rq_, 1, i_in_, N, T, cs);
     k::native_qsa_rms_norm_weighted(i_in_, out_norm_, hn_, (int) N, T, eps, cs);
+    if (const int j = tap_slot(s.n_layer); j >= 0 && i_taps_ != nullptr)   // b70-local: the final rows, a drafter tap
+        k::copy_from_mapped(i_taps_ + (size_t) j * opt_.max_t * N, hn_, (int64_t) T * N, cs);
     if (T > 8) {   // b70-local: a prompt window: its last row's logits only, in that row's place (forward picks that row)
         float* lr = logits_;   // row 0 (the buffer holds 8 rows); forward samples it into the last token's place
         k::native_quantize_q8_1(hn_ + (size_t) (T - 1) * N, xq_, head_.n_in, 1, cs);
