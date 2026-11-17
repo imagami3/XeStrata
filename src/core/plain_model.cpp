@@ -1226,10 +1226,41 @@ bool PlainModel::open_experts(std::string& err) {
     }
     // without a profile each layer's tier takes its first experts (the adaptive tier moves them), so that the RAM copy
     // below leaves out what VRAM holds
-    if (!in_ram_ && !opt_.mmap_experts && opt_.profile.empty() && !lay.mixed)
+    if (!in_ram_ && !opt_.mmap_experts && opt_.profile.empty() && !lay.mixed) {
+        // b70-local: read on 8 threads, each through pinned memory of its own (one at a time: Inkling 2's unpruned
+        // 2-bit, 78 GiB into 3 B70s, took ~110 s from a PCIe 4.0 drive, 0.7 GB/s)
+        struct Fill { int64_t l; int32_t e, slot; };
+        std::vector<Fill> todo;
         for (int64_t l : moe_local_)
             for (int32_t e = 0; e < (int32_t) E && !free_[(size_t) l].empty(); ++e)
-                if (res_[(size_t) (l * E + e)] < 0 && !fill_slot(l, e, err)) return false;
+                if (res_[(size_t) (l * E + e)] < 0) {
+                    todo.push_back({l, e, free_[(size_t) l].back()});
+                    free_[(size_t) l].pop_back();
+                }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> bad{false};
+        auto work = [&]() {
+            const OnDevice on(dev_);
+            uint8_t* buf = nullptr;
+            if (!strata::gpu::alloc_host(&buf, (size_t) lay.max_blob)) { bad = true; return; }
+            for (size_t i; !bad && (i = next.fetch_add(1)) < todo.size();) {
+                const Fill& f = todo[i];
+                if (!src_->copy_blob(f.l, f.e, buf) ||
+                    !strata::gpu::copy(cache_.device_slot(f.slot), buf, (size_t) lay.blob_bytes(f.l)))
+                    bad = true;
+            }
+            strata::gpu::free(buf);
+        };
+        {
+            const int threads = (int) std::clamp<size_t>(todo.size() / 64, 1, 8);
+            std::vector<std::thread> pool;
+            for (int i = 1; i < threads; ++i) pool.emplace_back(work);
+            work();
+            for (auto& t : pool) t.join();
+        }
+        if (bad) { err = "plain model: an expert could not be read for the VRAM tier"; return false; }
+        for (const Fill& f : todo) res_[(size_t) (f.l * E + f.e)] = f.slot;
+    }
     // the slots the prompt path lends for its longest chunk (prompt_borrow): their experts are kept in RAM too
     lend_from_ = -1;
     if (lay.mixed && opt_.prompt_chunk > 0 && prompt_dev_ == nullptr)
@@ -1273,8 +1304,14 @@ void PlainModel::pinned_split() {
     disp_.pcie_split = &split_;
     // the decode's PCIe share (its size from the times: pcie_split_m): chosen by the first windows (pcie_probe);
     // STRATA_PLAIN_DECODE_PCIE=1 / 0: on / off
-    if (const char* v = std::getenv("STRATA_PLAIN_DECODE_PCIE")) {
-        disp_.pcie_num = std::strtol(v, nullptr, 10) != 0 ? 256 : 0;
+    // b70-local: RVQ experts have no CPU kernel, so a stage with RVQ layers never probes the decode without PCIe
+    bool rvq = false;
+    for (int64_t l : moe_local_) {
+        const int gt = k::cpu::expert_layout().fmt[(size_t) l].gu_type;
+        rvq = rvq || gt == 150 || gt == 151;
+    }
+    if (const char* v = std::getenv("STRATA_PLAIN_DECODE_PCIE"); v != nullptr || rvq) {
+        disp_.pcie_num = rvq || std::strtol(v, nullptr, 10) != 0 ? 256 : 0;
     } else {
         disp_.pcie_num = 256;
         pcie_probe_ = 0;

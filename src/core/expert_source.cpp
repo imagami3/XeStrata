@@ -3129,6 +3129,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
         if (pcie_min1 && pcie_ok && d.pcie_split == nullptr && m < 1 && nmiss >= 2) m = 1;
+        // b70-local: RVQ experts have no CPU kernel: every miss of such a layer goes over PCIe (the staging permitting)
+        if (pcie_ok) {
+            const int gt = strata::kernels::cpu::expert_layout().fmt[(size_t) d.layers].gu_type;
+            if (gt == 150 || gt == 151) m = nmiss;
+        }
         if (pcie_ok && d.pcie_split != nullptr) split_m = m;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;

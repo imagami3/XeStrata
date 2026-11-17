@@ -126,7 +126,9 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
     constexpr int kRing = 16, kCap = 8;
     const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
     const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);
-    const size_t xq = (size_t) (f.n_embd / 32) * 36, out = (size_t) kCap * (size_t) f.n_embd * 4;
+    // b70-local: the RVQ experts (types 150 / 151) read the tokens' FP32 rows, the others their q8_1 blocks
+    const bool rvq = f.gu_type == 150 || f.gu_type == 151;
+    const size_t xq = rvq ? (size_t) f.n_embd * 4 : (size_t) (f.n_embd / 32) * 36, out = (size_t) kCap * (size_t) f.n_embd * 4;
     const size_t off_ptr = 0, off_i32 = 256, off_x = 1024, off_out = off_x + ((xq + 255) / 256) * 256;
     const size_t off_scr = off_out + ((out + 255) / 256) * 256, off_blob = off_scr + ((scratch + 255) / 256) * 256;
     uint8_t* buf = nullptr;
@@ -164,6 +166,11 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
             ok = strata::gpu::copy(d_i32, i32, sizeof i32);
             auto run = [&](int times) {
                 for (int i = 0; i < times; ++i, turn = (turn + kCap) % kRing)
+                    if (rvq)
+                        sk::native_expert_grouped_rvq(L, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1, d_i32 + 1 + kCap + 1 + kCap,
+                                                      kCap, kCap, reinterpret_cast<const float*>(buf + off_x), buf + off_scr,
+                                                      reinterpret_cast<float*>(buf + off_out), s);
+                    else
                     sk::native_expert_grouped(L, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1, d_i32 + 1 + kCap + 1 + kCap,
                                               kCap, kCap, buf + off_x, buf + off_scr, reinterpret_cast<float*>(buf + off_out), s);
                 return strata::gpu::stream_sync(s);
