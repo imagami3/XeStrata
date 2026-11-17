@@ -1394,7 +1394,8 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     zc_keys_.clear();
     std::vector<char> zc_ok;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (zc && !role_ptr_.empty() && direct_.empty() && lay.native && !lay.from_ptq1(layer)) {   // NVFP4's tail: see the zero-copy job
+    if (zc && !role_ptr_.empty() && direct_.empty() && lay.native && !lay.from_ptq1(layer) &&
+        !((size_t) layer < lay.tail_raw.size() && !lay.tail_raw[(size_t) layer].empty())) {   // NVFP4's tail: see the zero-copy job; RVQ2X8's gains and books exist only in the blob
         zc_ok.assign((size_t) n, 0);
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -2833,6 +2834,12 @@ bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJob
 bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why) {
     CpuCalJobs cj;
     if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
+    if (const char* g = std::getenv("STRATA_GPU_ONLY_EXPERTS"); g != nullptr && std::strtol(g, nullptr, 10) != 0) {
+        // b70-local 11-17: experts the CPU cannot compute (RVQ2X8, Inkling 2): no CPU calls; a CPU that never wins the split
+        c0 = c = 1e6;
+        std::fprintf(stderr, "strata: STRATA_GPU_ONLY_EXPERTS: the CPU takes no expert (layer %lld picked for the split)\n", (long long) layer);
+        return true;
+    }
     constexpr int kCall = CpuCalJobs::kCall;
     // three rounds, each after 100 ms of calls that keep the clocks up (an idle CPU takes tens of ms to raise them; a
     // decode keeps them up): 1 and 8 experts a call in turns, 32 calls each, the median; the lowest round.  One round's
@@ -3608,11 +3615,18 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
         for (int64_t l = 0; l < n_layers; ++l) {
             const strata::TensorInfo* t[3] = {};
             size_t shard[3] = {};
+            // b70-local: an RVQ layer (types 150/151) may have pruned experts: its width is the gate tensor's rows
+            int64_t n_ff_l = n_ff;
+            {
+                size_t s0 = 0;
+                const strata::TensorInfo* g0 = model.find("blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_gate_exps.weight", &s0);
+                if (g0 != nullptr && (g0->type == 150 || g0->type == 151) && g0->shape.size() == 3) n_ff_l = (int64_t) g0->shape[1];
+            }
             for (int r = 0; r < 3; ++r) {
                 const std::string name = "blk." + std::to_string(moe_blocks[(size_t) l]) + ".ffn_" + roles[r] +
                                          "_exps.weight";
                 t[r] = model.find(name, &shard[r]);
-                const uint64_t cols = (uint64_t) (r < 2 ? n_embd : n_ff), rows = (uint64_t) (r < 2 ? n_ff : n_embd);
+                const uint64_t cols = (uint64_t) (r < 2 ? n_embd : n_ff_l), rows = (uint64_t) (r < 2 ? n_ff_l : n_embd);
                 if (t[r] == nullptr || t[r]->shape.size() != 3 || t[r]->shape[0] != cols || t[r]->shape[1] != rows ||
                     t[r]->shape[2] != (uint64_t) n_expert) {
                     err = "experts from the GGUF: " + name + " is missing or not [" + std::to_string(cols) + ", " +
@@ -3630,20 +3644,20 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
             // (re-packed as it is read: the Q2_0 container's bytes; faster on the XMX kernels, 1.29x the bytes)
             static const bool as_q2 = [] { const char* v = std::getenv("STRATA_PTQ1_AS_Q2"); return v != nullptr && v[0] == '1'; }();
             const bool conv = as_q2 && t[0]->type == 143 && t[1]->type == 143 && t[2]->type == 143 &&
-                              n_embd % 128 == 0 && n_ff % 128 == 0;
+                              n_embd % 128 == 0 && n_ff_l % 128 == 0;
             if (conv) {
                 if (L.ptq1_q2.empty()) L.ptq1_q2.assign((size_t) n_layers, 0);
                 L.ptq1_q2[(size_t) l] = 1;
             }
             const int ty0 = conv ? 42 : (int) t[0]->type, ty1 = conv ? 42 : (int) t[1]->type, ty2 = conv ? 42 : (int) t[2]->type;
-            if (!native_fmt(ty0, ty2, n_embd, n_ff, f, err, ty1)) {
+            if (!native_fmt(ty0, ty2, n_embd, n_ff_l, f, err, ty1)) {
                 std::string where = "experts from the GGUF: block ";
                 where += std::to_string(moe_blocks[(size_t) l]);
                 where += ": ";
                 err.insert(0, where);
                 return false;
             }
-            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff, f.d_row * (uint64_t) n_embd};
+            const uint64_t per[3] = {f.up_off, f.up_row * (uint64_t) n_ff_l, f.d_row * (uint64_t) n_embd};
             L.tail.emplace_back();
             if (t[0]->type == 40 || t[1]->type == 40 || t[2]->type == 40) {
                 // NVFP4: each role's per-expert weight_scale_2 (`.scale`, F32 [n_expert], llama.cpp's converter) rides at
@@ -3666,6 +3680,46 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
                 }
                 f.tail_off = f.bytes;
                 f.bytes += 16;
+            }
+            L.tail_raw.emplace_back(); L.tail_raw_bytes.push_back(0);
+            if (t[0]->type == 150 || t[0]->type == 151) {
+                const uint64_t dim = t[0]->type == 151 ? 16 : 8;
+                // b70-local RVQ2X8: per expert the f16 gains of the gate, up and down rows, then the layer's books
+                // (F32 [2][256][8]), so a slot holds everything its kernel reads
+                const std::string b = "blk." + std::to_string(moe_blocks[(size_t) l]);
+                const uint64_t nrow[3] = {(uint64_t) n_ff_l, (uint64_t) n_ff_l, (uint64_t) n_embd};
+                const uint64_t gbytes = 2 * (nrow[0] + nrow[1] + nrow[2]), bbytes = 2 * 256 * dim * 4, tb = gbytes + bbytes;
+                std::vector<uint8_t>& tr = L.tail_raw.back();
+                tr.assign((size_t) (tb * (uint64_t) n_expert), 0);
+                uint64_t at_g = 0;
+                for (int r = 0; r < 3; ++r) {
+                    size_t ss = 0;
+                    const std::string gname = b + ".ffn_" + roles[r] + "_exps.rvq_gain";
+                    const strata::TensorInfo* tg = model.find(gname, &ss);
+                    if (tg == nullptr || tg->type != 1 || tg->shape.size() != 2 || tg->shape[0] != nrow[r] ||
+                        tg->shape[1] != (uint64_t) n_expert || !model.in_bounds(*tg, ss)) {
+                        err = "experts from the GGUF: " + gname + " is not F16 [" + std::to_string(nrow[r]) + ", " +
+                              std::to_string(n_expert) + "]";
+                        return false;
+                    }
+                    const uint8_t* gv = model.shard(ss).tensor_data(*tg);
+                    for (int64_t e = 0; e < n_expert; ++e)
+                        std::memcpy(tr.data() + tb * (uint64_t) e + at_g, gv + 2 * nrow[r] * (uint64_t) e, 2 * nrow[r]);
+                    at_g += 2 * nrow[r];
+                }
+                size_t sb = 0;
+                const std::string bname = b + ".ffn_exps.rvq_book";
+                const strata::TensorInfo* tbk = model.find(bname, &sb);
+                if (tbk == nullptr || tbk->type != 0 || tbk->shape.size() != 3 || tbk->shape[0] != dim || tbk->shape[1] != 256 ||
+                    tbk->shape[2] != 2 || !model.in_bounds(*tbk, sb)) {
+                    err = "experts from the GGUF: " + bname + " is not F32 [" + std::to_string(dim) + ", 256, 2]";
+                    return false;
+                }
+                const uint8_t* bv = model.shard(sb).tensor_data(*tbk);
+                for (int64_t e = 0; e < n_expert; ++e) std::memcpy(tr.data() + tb * (uint64_t) e + gbytes, bv, bbytes);
+                L.tail_raw_bytes.back() = tb;
+                f.tail_off = f.bytes;
+                f.bytes += tb;
             }
             for (int r = 0; r < 3; ++r) {
                 if (strata::tensor_payload_bytes(*t[r]) != (conv ? per[r] / 36 * 28 : per[r]) * (uint64_t) n_expert) {

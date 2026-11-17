@@ -281,7 +281,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     // A library's first product of a kind loads its kernels for it, inside whichever prompt comes first (rocBLAS on
     // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
     // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
-    if (glm_) return true;   // GLM-5.3-Flash's first prompt loads its products' kernels itself
+    if (glm_ || ink_) return true;   // GLM-5.3-Flash's first prompt loads its products' kernels itself; b70-local: Inkling 2 has no Qwen blocks_ (its prompt warm crashed)
     PromptBufs& P = pb_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;

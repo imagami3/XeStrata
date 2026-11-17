@@ -117,6 +117,11 @@ inline const char* ggml_type_name(uint32_t t) {
     // Agention's llama.cpp fork: the APR trellis expert types (docs/GYRO.md)
     case 143:
         return "PTQ1_0";
+    // b70-local: Inkling 2's routed experts as RVQ 2x8 (a uint16 code per 8 weights; gains and books ride in the blob tail)
+    case 150:
+        return "RVQ2X8";
+    case 151:
+        return "RVQ2X16";
     case 144:
         return "TQ2_T";
     case 145:
@@ -238,6 +243,14 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 143:
         elems = 128;
         bytes = 28;
+        return true;
+    case 150:   // b70-local RVQ2X8: 8 values = one uint16 code (books and per-row gains are separate tensors)
+        elems = 8;
+        bytes = 2;
+        return true;
+    case 151:   // b70-local RVQ2X16: 16 values = one uint16 code
+        elems = 16;
+        bytes = 2;
         return true;
     case 144:
         elems = 128;

@@ -14,6 +14,7 @@
 #include "strata/kernels/cpu/canon_expert.hpp"
 
 #include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 
@@ -380,6 +381,12 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
         } else {
             iq256_canon_rows(f.gu_type, blob, f.gu_row, n, x, dx, nt, g, c0, c1);
             iq256_canon_rows(up_type, blob + f.up_off, up_row, n, x, dx, nt, u, c0, c1);
+        }
+        const ExpertAct xa = expert_act();   // b70-local: Inkling 2's SITU takes the scalar canonical form
+        if (xa.cg > 0.0f) {
+            for (int t = 0; t < nt; ++t)
+                for (int r = c0; r < c1; ++r) ff[t][r] = expert_act_mul(g[t][r], u[t][r], xa);
+            return;
         }
         for (int t = 0; t < nt; ++t) {
             int r = c0;

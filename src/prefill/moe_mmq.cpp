@@ -128,12 +128,13 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
     if (rows <= 0) return;
-    const float lim = kernels::expert_swiglu_limit();   // GLM-5.3-Flash's clamp (0: none)
+    const kernels::ExpertAct lim = kernels::expert_act();   // GLM-5.3-Flash's clamp (0: none), Inkling 2's SITU
     Q(stream).parallel_for(sycl::range<1>((size_t) (rows * n_ff)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], r = i / n_ff, k = i % n_ff;
         const float* row = gu + r * 2 * n_ff;
         float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
-        kernels::swiglu_clamp(g, u, lim);
+        if (lim.cg > 0.0f) { h[i] = kernels::canon::situ_mul(g, u, lim.cg, lim.cu); return; }
+        kernels::swiglu_clamp(g, u, lim.lim);
         h[i] = g / (1.0f + sycl::exp(-g)) * u;
     });
 }

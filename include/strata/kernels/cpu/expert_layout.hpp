@@ -38,6 +38,10 @@ struct ExpertLayout {
     /// NVFP4 layers (fmt.tail_off != 0): per layer, n_expert x {s_gate, s_up, s_down, 0}, the blob's tail (the GGUF's
     /// `blk.<b>.ffn_*_exps.scale` tensors, ModelOpt's weight_scale_2; 1 where a role has none).  Empty for others.
     std::vector<std::vector<float>> tail;
+    /// b70-local RVQ2X8 layers: per layer, n_expert x tail_raw_bytes[layer] bytes (per-row f16 gains of gate, up, down,
+    /// then the layer's two F32 books [2][256][8]), copied to the blob's tail.  Empty for others.
+    std::vector<std::vector<uint8_t>> tail_raw;
+    std::vector<uint64_t> tail_raw_bytes;
     /// b70-local, STRATA_PTQ1_AS_Q2=1: per layer, 1 when its three tensors are PTQ1_0 (143) in the GGUF and are
     /// re-packed into Q2_0 (42) as they are read (fmt says 42; a file slice is 28/36 of the blob's).  Empty: none.
     std::vector<char> ptq1_q2;
@@ -57,6 +61,11 @@ struct ExpertLayout {
     /// Writes the blob's tail (NVFP4 layers) after its three role slices; nothing for a layer without one.
     void write_tail(int64_t layer, int64_t expert, uint8_t* blob) const {
         if (!native || (size_t) layer >= fmt.size() || fmt[(size_t) layer].tail_off == 0) return;
+        if ((size_t) layer < tail_raw.size() && !tail_raw[(size_t) layer].empty()) {
+            const uint64_t tb = tail_raw_bytes[(size_t) layer];
+            std::memcpy(blob + fmt[(size_t) layer].tail_off, tail_raw[(size_t) layer].data() + tb * (uint64_t) expert, tb);
+            return;
+        }
         const std::vector<float>& t = tail[(size_t) layer];
         std::memcpy(blob + fmt[(size_t) layer].tail_off, t.data() + 4 * (size_t) expert, 4 * sizeof(float));
     }

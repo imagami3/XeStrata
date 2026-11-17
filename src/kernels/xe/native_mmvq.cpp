@@ -185,6 +185,20 @@ inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const ha
     return low(dm2) * sumf_d - high(dm2) * sumf_m;
 }
 
+// Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
+// signed-byte subtraction, DP4A order, and the float accumulation sequence.
+inline float q6_q8_dot_impl(int vl, int vh, const int* u, const int8_t* scales, float d, const float* d8) {
+    float sumf = 0.0f;
+    for (int i = 0; i < 2; ++i) {
+        const int sc = scales[4 * i];
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi = vsubss4(vil | vih, 0x20202020);
+        sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
+    }
+    return d * sumf;
+}
+
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
 // Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
 // as the pinned CUDA dot does; a signed-integer code substitution would differ.

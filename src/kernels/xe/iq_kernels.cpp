@@ -1404,7 +1404,7 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
     constexpr int NG = GridOf<TG>::N, RPW = kWarp / LPR, WG = GU_ROWS * kWarp;
     static_assert(kM8Rows % (GU_ROWS * RPW) == 0, "whole passes");
     const int xb = (int) (L.n_embd / 32);
-    const float lim = expert_swiglu_limit();
+    const ExpertAct lim = expert_act();
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<GT, 1> sgrid(sycl::range<1>(NG > 0 ? NG : 1), h);
         sycl::local_accessor<float, 1> res(sycl::range<1>((size_t) kEntriesPass * kM8Rows), h);
@@ -1452,8 +1452,7 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     // the SwiGLU (after GLM-5.3-Flash's clamp; none elsewhere) and the int8 scale of canon_math.hpp,
                     // as native_expert_grouped's pass
                     float gv = res[warp * kM8Rows + lane], uv = res[warp * kM8Rows + 32 + lane];
-                    swiglu_clamp(gv, uv, lim);
-                    const float xi = canon::silu_mul(gv, uv);
+                    const float xi = expert_act_mul(gv, uv, lim);
                     const float amax = warp_max(sg, sycl::fabs(xi));
                     const float sum = warp_sum(sg, xi);
                     const float d = canon::q8_scale(amax);
@@ -2197,6 +2196,8 @@ bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
+        case 150: return (size_t) (n / 8) * 2;   // b70-local RVQ2X8: a uint16 code per 8 values
+        case 151: return (size_t) (n / 16) * 2;  // b70-local RVQ2X16: a uint16 code per 16 values
         case 16: return (size_t) (n / 256) * sizeof(block_iq2_xxs);
         case 17: return (size_t) (n / 256) * sizeof(block_iq2_xs);
         case 18: return (size_t) (n / 256) * sizeof(block_iq3_xxs);
@@ -2477,6 +2478,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
                native_expert_supported(up_type, d_type, n_embd, n_ff);
     // the cases of native_expert_grouped's two switches, and the prompt path's dequantizer (iq_dequant_gu_f16 and the
     // down rows) for both
+    if (gu_type == 150 || d_type == 150 || gu_type == 151 || d_type == 151)   // b70-local RVQ2X8 / RVQ2X16 (native_expert_grouped_rvq)
+        return gu_type == d_type && n_embd > 0 && n_ff > 0 && n_embd % (gu_type == 151 ? 16 : 8) == 0 && n_ff % (gu_type == 151 ? 16 : 8) == 0;
     if (gu_type == 30 || d_type == 30)   // BF16 (native_expert_grouped_bf16): both sides, rows of whole value pairs
         return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
@@ -2533,7 +2536,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t grid_groups) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     auto& q = queue_for(stream);   // in order: the launches below follow one another
-    const float lim = expert_swiglu_limit();
+    const ExpertAct lim = expert_act();
     // upstream 0bc1594: the gate/up and down grids take grid_groups rows of groups (each striding over the groups) and
     // SwiGLU + q8_1 run as one pass over the call's own entries; STRATA_GROUPED_V1=1: a row per possible group and the
     // two passes over every entry (A/B; the same bits)
@@ -2549,7 +2552,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const auto* X = (const block_q8_1*) x_q8_1;
     const size_t cg = (size_t) (v1 || grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
     if (ptq1_experts_dpas_ok(q, L, cap_entries)) {
-        const sycl::event e = ptq1_experts_dpas(q, L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cg, cap_entries, x_q8_1, gate, up, out, lim);
+        const sycl::event e = ptq1_experts_dpas(q, L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cg, cap_entries, x_q8_1, gate, up, out, lim.lim);
         sync_if_needed(stream, e, "native_expert_grouped");
         return;
     }
@@ -2625,8 +2628,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (v1 || had) {
         q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> i) {
             float g = gate[i], u = up[i];
-            swiglu_clamp(g, u, lim);
-            h[i] = canon::silu_mul(g, u);
+            h[i] = expert_act_mul(g, u, lim);
         });
         if (had) launch_hadamard_rows<float>(q, h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, "native_expert_grouped");
         launch_quantize_q8_1_canon(q, h, hq, nh);
@@ -2644,8 +2646,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             // the SwiGLU (after GLM-5.3-Flash's clamp; none elsewhere) and the int8 scale of canon_math.hpp: the CPU's
             // rows of the same expert are the same bits
             float g = gate[i], u = up[i];
-            swiglu_clamp(g, u, lim);
-            const float xi = canon::silu_mul(g, u);
+            const float xi = expert_act_mul(g, u, lim);
             const float amax = warp_max(sg, sycl::fabs(xi));
             const float sum = warp_sum(sg, xi);
             const float d = canon::q8_scale(amax);
@@ -2718,7 +2719,7 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.gu_type != 30 || L.d_type != 30) throw core::DeviceError("native_expert_grouped_bf16: not a BF16 expert");
     auto& q = queue_for(stream);
-    const float lim = expert_swiglu_limit();
+    const ExpertAct lim = expert_act();
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
     float* up = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + fa);
@@ -2755,7 +2756,8 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
         const int64_t i = (int64_t) id[0], e = i / FF;
         if (e < grp_start[0] || e >= grp_start[*n_groups]) return;
         float g = gate[i], u = up[i];
-        swiglu_clamp(g, u, lim);
+        if (lim.cg > 0.0f) { h[i] = canon::situ_mul(g, u, lim.cg, lim.cu); return; }
+        swiglu_clamp(g, u, lim.lim);
         h[i] = (g / (1.0f + sycl::exp(-g))) * u;
     });
     // down: row r of the output for each entry, written to row ent_dst[e]
@@ -2781,6 +2783,123 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
         }
     });
     sync_if_needed(stream, e, "native_expert_grouped_bf16");
+}
+
+
+// b70-local: RVQ 2x8 experts (Inkling 2).  A row of K weights is K/8 uint16 codes c; the 8 weights of code c are
+// gain[row] * (book1[c >> 8][j] + book2[c & 255][j]) (code = i1 * 256 + i2, the Python quantizer's index).  The blob's
+// tail (tail_off): f16 gains of the gate rows (n_ff), the up rows (n_ff), the down rows (n_embd), then the books F32
+// [2][256][8].  Against the tokens' FP32 rows `x`, as native_expert_grouped_bf16 (same scratch and grouping).
+namespace {
+template <int D>
+inline void rvq_dot_multi(const sycl::sub_group& sg, const uint16_t* codes, const float* book, const float* const* xs, int n,
+                          int64_t K, int lane, float* s) {
+    float acc[kEntriesPass];
+    for (int j = 0; j < kEntriesPass; ++j) acc[j] = 0.0f;
+    const int64_t nc = K / D;
+    for (int64_t c = lane; c < nc; c += kWarp) {
+        const uint32_t code = codes[c];
+        const float* b1 = book + (size_t) (code >> 8) * D;
+        const float* b2 = book + 256 * D + (size_t) (code & 255u) * D;
+        float w[D];
+        for (int k = 0; k < D; ++k) w[k] = b1[k] + b2[k];
+        for (int j = 0; j < kEntriesPass; ++j) {
+            if (j >= n) break;
+            const float* xv = xs[j] + D * c;
+            float d = 0.0f;
+            for (int k = 0; k < D; ++k) d += w[k] * xv[k];
+            acc[j] += d;
+        }
+    }
+    for (int j = 0; j < kEntriesPass; ++j) s[j] = j < n ? sycl::reduce_over_group(sg, acc[j], sycl::plus<float>()) : 0.0f;
+}
+}  // namespace
+
+template <int D>
+static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                               const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
+                               void* scratch, float* out, void* stream, int64_t grid_groups) {
+    auto& q = queue_for(stream);
+    const ExpertAct lim = expert_act();
+    const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* gate = (float*) scratch;
+    float* up = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + fa);
+    float* h = reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + 2 * fa);
+    const size_t cg = (size_t) (grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
+    const int64_t N = L.n_embd, FF = L.n_ff;
+    const size_t tail = L.tail_off, book_off = L.tail_off + 2 * (size_t) (2 * FF + N);
+    constexpr int kRows = 8;
+    q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t row = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();
+        const int lane = (int) sg.get_local_linear_id();
+        if (row >= 2 * FF) return;
+        const bool is_up = row >= FF;
+        const int64_t r = is_up ? row - FF : row;
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const auto* cr = (const uint16_t*) (blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row);
+            const float gain = (float) ((const sycl::half*) (blob + tail))[(is_up ? FF : 0) + r];
+            const float* book = (const float*) (blob + book_off);
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; e += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - e);
+                const float* xs[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) xs[j] = x + (size_t) ent_tok[j < n ? e + j : e] * N;
+                float s[kEntriesPass];
+                rvq_dot_multi<D>(sg, cr, book, xs, n, N, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * FF + r] = s[j] * gain;
+            }
+        }
+    });
+    const int64_t nh = cap_entries * FF;
+    q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], e = i / FF;
+        if (e < grp_start[0] || e >= grp_start[*n_groups]) return;
+        float g = gate[i], u = up[i];
+        if (lim.cg > 0.0f) { h[i] = canon::situ_mul(g, u, lim.cg, lim.cu); return; }
+        swiglu_clamp(g, u, lim.lim);
+        h[i] = (g / (1.0f + sycl::exp(-g))) * u;
+    });
+    const sycl::event e = q.parallel_for(
+        sycl::nd_range<2>({cg, (size_t) ((N + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
+        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t r = (int64_t) it.get_group(1) * kRows + (int64_t) sg.get_group_linear_id();
+        const int lane = (int) sg.get_local_linear_id();
+        if (r >= N) return;
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const auto* cr = (const uint16_t*) (blob + L.down_off + (size_t) r * L.d_row);
+            const float gain = (float) ((const sycl::half*) (blob + tail))[2 * FF + r];
+            const float* book = (const float*) (blob + book_off);
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int en = e0; en < e1; en += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - en);
+                const float* xs[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) xs[j] = h + (size_t) (j < n ? en + j : en) * FF;
+                float s[kEntriesPass];
+                rvq_dot_multi<D>(sg, cr, book, xs, n, FF, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < n; ++j) out[(size_t) ent_dst[en + j] * N + r] = s[j] * gain;
+            }
+        }
+    });
+    sync_if_needed(stream, e, "native_expert_grouped_rvq");
+}
+
+void native_expert_grouped_rvq(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                               const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
+                               void* scratch, float* out, void* stream, int64_t grid_groups) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.gu_type != L.d_type || (L.gu_type != 150 && L.gu_type != 151) || L.tail_off == 0)
+        throw core::DeviceError("native_expert_grouped_rvq: not an RVQ2X8 / RVQ2X16 expert");
+    if (L.gu_type == 151) native_expert_grouped_rvq_d<16>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
+    else native_expert_grouped_rvq_d<8>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x, scratch, out, stream, grid_groups);
 }
 
 }  // namespace strata::kernels

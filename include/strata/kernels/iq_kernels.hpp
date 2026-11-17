@@ -112,4 +112,11 @@ void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long
                                 const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
                                 void* scratch, float* out, void* stream, int64_t grid_groups = 0);
 
+/// b70-local: RVQ 2x8 experts (type 150; codes, then the blob tail's f16 row gains and F32 books [2][256][8]), against
+/// the tokens' FP32 rows `x`; the same grouping and scratch as native_expert_grouped_bf16.
+void native_expert_grouped_rvq(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                               const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x,
+                               void* scratch, float* out, void* stream, int64_t grid_groups = 0);
+
 }  // namespace strata::kernels

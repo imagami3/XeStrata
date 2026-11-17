@@ -145,6 +145,26 @@ bool PlainModel::load_gblock(const GgufModel& m, int64_t l, GBlock& b, std::stri
     if (!dense && (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err) ||
                    !upload_f32(m, p + "exp_probs_b.bias", E, b.router_b, err)))
         return false;
+    if (!dense && std::getenv("STRATA_ROUTER_BF16") != nullptr && std::atoi(std::getenv("STRATA_ROUTER_BF16")) != 0) {
+        // b70-local: the decode router reads BF16 (half the bytes) when every F32 value is a BF16 value; else F32 stays
+        size_t at = 0;
+        const TensorInfo* t = m.find(p + "ffn_gate_inp.weight", &at);
+        if (t != nullptr && t->type == 0) {   // F32
+            const auto* f = reinterpret_cast<const uint32_t*>(m.shard(at).tensor_data(*t));
+            const uint64_t n = (uint64_t) N * E;
+            std::vector<uint16_t> h(n);
+            bool exact = true;
+            for (uint64_t i = 0; i < n && exact; ++i) { exact = (f[i] & 0xFFFFu) == 0; h[i] = (uint16_t) (f[i] >> 16); }
+            void* d = nullptr;
+            if (exact && strata::gpu::alloc_device(&d, n * 2)) {
+                allocs_.push_back(d);
+                if (!strata::gpu::copy(d, h.data(), n * 2)) { err = "plain model: uploading the BF16 router failed"; return false; }
+                b.router16 = (const uint16_t*) d;
+            } else if (!exact && l == 3) {
+                std::fprintf(stderr, "[strata] STRATA_ROUTER_BF16: %s is not exact in BF16, F32 kept\n", (p + "ffn_gate_inp.weight").c_str());
+            }
+        }
+    }
     b.clamp = (size_t) l < s.swiglu_clamp_shexp.size() ? (float) s.swiglu_clamp_shexp[(size_t) l] : 0.0f;
     // the native matrix-vector kernels only (no BF16 GLM file is taken yet)
     for (const W* w : {&b.hc_attn_fn, &b.hc_ffn_fn, &b.q, &b.k, &b.v, &b.f_a, &b.f_b, &b.beta, &b.g_a, &b.g_b, &b.q_a,
@@ -707,7 +727,8 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
                             strata::gpu::Stream cs, std::string& err, int64_t l) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, E = s.n_expert, K = s.n_expert_used;
-    k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
+    if (b.router16 != nullptr) k::bf16_gemv_fp32_mmvf_multi(hn_, N, b.router16, rlog_, E, N, E, T, cs);
+    else k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, s.expert_weights_norm, scale, ids_, w_, cs);
     ++ring;

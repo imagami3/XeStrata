@@ -356,6 +356,7 @@ bool PlainModel::load_stage(const PlainOptions& opt, PlainModel* root, int64_t l
 }
 
 bool PlainModel::load_arch(std::string& err) {
+    if (spec_.arch == ModelArch::Inkling2) return load_inkling2(err);   // b70-local
     return spec_.arch == ModelArch::Glm5Next ? load_glm5(err) : load_qwen(err);
 }
 
@@ -1415,6 +1416,16 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens) const
         parts.push_back({gdn_state_[g], state_bytes_});
         parts.push_back({gdn_conv_[g], conv_bytes_});
     }
+    if (ink_) {   // b70-local, Inkling 2: per layer its convolutions' histories and the K/V rows of the tokens
+        const size_t kvw = (size_t) (nkv_ * s.key_length) * 4;
+        for (int64_t l = lb_; l < le_; ++l) {
+            const IBlock& b = iblocks_[(size_t) l];
+            parts.push_back({b.conv, (size_t) i_conv_floats_ * 4});
+            parts.push_back({b.kc, (size_t) tokens * kvw});
+            parts.push_back({b.vc, (size_t) tokens * kvw});
+        }
+        return parts;
+    }
     if (glm_) {   // per DSA block: its latent and indexer rows a cell, the pools that the cells close
         const int64_t KVR = s.kv_lora_rank, ID = s.idx_key_length;
         const int64_t pools = std::min<int64_t>(g_max_blocks_, tokens / s.idx_kpool + 1);
@@ -1509,6 +1520,7 @@ bool PlainModel::reset(std::string& err) {
         if (!st->reset(err)) return false;
     }
     if (glm_) return reset_glm5(err);
+    if (ink_) return reset_inkling2(err);
     const ModelSpec& s = spec_;
     bool ok = true;
     for (float* p : gdn_state_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, state_bytes_));
@@ -1666,6 +1678,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
 
 bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     if (glm_) return record_window_glm5(T, cs, err);
+    if (ink_) return record_window_inkling2(T, cs, err);
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
@@ -2044,6 +2057,32 @@ int PlainModel::lk_propose(int32_t pending, int max_n, int32_t* out) const {
 }
 
 bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
+    // b70-local: STRATA_BENCH_T=<file of int32 ids> times forward() at T = 1..max_t once (the request's output is
+    // garbage after it: benchmark runs only)
+    if (static bool done = false; !done) {
+        done = true;
+        if (const char* bf = std::getenv("STRATA_BENCH_T")) {
+            std::vector<int32_t> ids;
+            if (FILE* f = std::fopen(bf, "rb")) {
+                int32_t v;
+                while (std::fread(&v, 4, 1, f) == 1) ids.push_back(v);
+                std::fclose(f);
+            }
+            std::vector<int32_t> out((size_t) opt_.max_t);
+            for (int T = 1; T <= opt_.max_t && (size_t) T <= ids.size(); ++T) {
+                std::vector<double> ms;
+                for (int r = 0; r < 24; ++r) {
+                    const size_t o = (size_t) (r * 7) % (ids.size() - (size_t) T + 1);
+                    const auto a0 = std::chrono::steady_clock::now();
+                    if (!forward(ids.data() + o, T, pos, out.data(), nullptr, err)) return false;
+                    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count());
+                }
+                std::sort(ms.begin() + 4, ms.end());
+                std::fprintf(stderr, "strata bench T=%d: median %.2f ms (min %.2f) over %zu\n", T, ms[4 + (ms.size() - 4) / 2],
+                             ms[4], ms.size() - 4);
+            }
+        }
+    }
     if (!next_.empty()) {   // the MTP layer is the last stage's
         const OnDevice on(tail().dev_);
         return tail().spec_start(first, pos, err);

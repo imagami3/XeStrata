@@ -28,7 +28,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Inkling2 };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -83,6 +83,18 @@ struct ModelSpec {
     int64_t q_lora_rank = 0, kv_lora_rank = 0, key_length_mla = 0, value_length_mla = 0;
     int64_t idx_n_head = 0, idx_key_length = 0, idx_top_k = 0, idx_kpool = 0;
     bool idx_kpool_select_tail = false;
+
+    // Inkling 2 (b70-local): sliding-window layers, attention residuals, short convolutions, relative bias, sinks
+    std::vector<bool> swa;                ///< per layer: a sliding-window layer (else full attention)
+    int64_t n_swa = 0;                    ///< the sliding window (keys a sliding layer sees, its own included)
+    int64_t n_shortconv = 0;              ///< the causal convolutions' taps
+    int64_t attn_res_block = 0;           ///< a block of the attention residuals starts every this many layers
+    int64_t n_rel = 0, rel_extent = 0;    ///< the relative bias's rank and the offsets a full layer's table covers
+    double qk_clip = 0, rel_clip = 0;     ///< the L2 clips of q and k, and of the relative-bias query
+    double log_scale_floor = 0, log_scale_alpha = 0;   ///< full layers: q, r x (1 + alpha log(max(1, (p + 1) / floor)))
+    double situ_gate = 0, situ_up = 0;    ///< the experts' softcaps: c tanh(x / c) on gate and up, x sigmoid(gate)
+    double final_softcap = 0;             ///< the logits' softcap
+    int64_t n_vocab_padded = 0, n_vocab_unpadded = 0;
 
     /// True when trunk layer `l` routes experts (the MTP layers are not counted here).
     bool layer_routes(int64_t l) const { return n_expert > 0 && l >= n_dense_lead && l < n_layer; }
@@ -139,7 +151,8 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen35moe") s.arch = ModelArch::Qwen35Moe;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
-    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next)"; return false; }
+    else if (A == "inkling2") s.arch = ModelArch::Inkling2;
+    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next, inkling2)"; return false; }
 
     // the keys every architecture here needs
     const char* required[] = {"block_count", "embedding_length", "attention.head_count", "expert_count",
@@ -160,6 +173,12 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.norm_eps = spec_num(g, A, "attention.layer_norm_epsilon");
 
     s.n_head = spec_int(g, A, "attention.head_count");
+    if (const MetaValue* v = spec_get(g, A, "attention.head_count"); v && v->type == MetaType::ARRAY && !v->items.empty()) {
+        // per layer (Inkling 2 writes one entry a layer): every layer the same here
+        s.n_head = (int64_t) v->items[0].u;
+        for (const MetaValue& e : v->items)
+            if ((int64_t) e.u != s.n_head) { err = A + ".attention.head_count differs between layers"; return false; }
+    }
     std::vector<double> kv;
     if (spec_get(g, A, "attention.head_count_kv") && !spec_per_layer(g, A, "attention.head_count_kv", n_all, kv)) {
         err = A + ".attention.head_count_kv is neither a number nor one per layer";
@@ -214,6 +233,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = s.n_head_kv[(size_t) i] == 0;
         break;
     case ModelArch::Qwen3Moe:
+    case ModelArch::Inkling2:
         break;
     }
 
@@ -225,13 +245,14 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.n_dense_lead = spec_int(g, A, "leading_dense_block_count");
     s.n_ff = spec_int(g, A, "feed_forward_length");
     s.gating = (ExpertGating) spec_int(g, A, "expert_gating_func");
-    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash sigmoid, the Qwens softmax
-        s.gating = s.arch == ModelArch::Glm5Next ? ExpertGating::Sigmoid : ExpertGating::Softmax;
+    if (s.gating == ExpertGating::None)   // llama.cpp's defaults: GLM-5.3-Flash and Inkling 2 sigmoid, the Qwens softmax
+        s.gating = s.arch == ModelArch::Glm5Next || s.arch == ModelArch::Inkling2 ? ExpertGating::Sigmoid : ExpertGating::Softmax;
+    if (s.arch == ModelArch::Inkling2) s.expert_weights_norm = true;   // inkling2.cpp: the weights over their sum
     if (s.gating != ExpertGating::Softmax && s.gating != ExpertGating::Sigmoid) {
         err = A + ".expert_gating_func " + std::to_string((uint32_t) s.gating) + " is not supported";
         return false;
     }
-    s.expert_weights_norm = spec_int(g, A, "expert_weights_norm") != 0;
+    s.expert_weights_norm = s.expert_weights_norm || spec_int(g, A, "expert_weights_norm") != 0;
     s.expert_weights_scale = spec_num(g, A, "expert_weights_scale");
     spec_per_layer(g, A, "swiglu_clamp_exp", n_all, s.swiglu_clamp_exp);
     spec_per_layer(g, A, "swiglu_clamp_shexp", n_all, s.swiglu_clamp_shexp);
@@ -272,6 +293,35 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         }
         if (s.kda_head_dim <= 0 || s.kv_lora_rank <= 0 || s.q_lora_rank <= 0) {
             err = A + ": needs kda.head_dim, attention.q_lora_rank and attention.kv_lora_rank";
+            return false;
+        }
+    }
+    if (s.arch == ModelArch::Inkling2) {
+        // inkling2.cpp's load_arch_hparams (llama.cpp PR #32217)
+        s.n_swa = spec_int(g, A, "attention.sliding_window");
+        s.n_shortconv = spec_int(g, A, "shortconv.l_cache");
+        s.attn_res_block = spec_int(g, A, "attn_res.block_size");
+        s.n_rel = spec_int(g, A, "attention.relative_length");
+        s.rel_extent = spec_int(g, A, "attention.relative_extent");
+        s.qk_clip = spec_num(g, A, "attention.qk_clip");
+        s.rel_clip = spec_num(g, A, "attention.relative_clip");
+        s.log_scale_floor = spec_num(g, A, "attention.log_scale_floor");
+        s.log_scale_alpha = spec_num(g, A, "attention.log_scale_alpha");
+        s.situ_gate = spec_num(g, A, "activation.situ_beta");
+        s.situ_up = spec_num(g, A, "activation.situ_linear_beta");
+        s.final_softcap = spec_num(g, A, "final_logit_softcapping");
+        s.n_vocab_padded = spec_int(g, A, "vocab_size");
+        s.n_vocab_unpadded = spec_int(g, A, "vocab_size_unpadded");
+        std::vector<double> pat;
+        const MetaValue* pv = spec_get(g, A, "attention.sliding_window_pattern");
+        if (pv && pv->type == MetaType::ARRAY && (int64_t) pv->items.size() == n_all)
+            for (const MetaValue& e : pv->items) s.swa.push_back(e.u != 0);
+        if ((int64_t) s.swa.size() != n_all || s.n_swa <= 0 || s.n_shortconv < 2 || s.attn_res_block <= 0 ||
+            s.n_rel <= 0 || s.rel_extent <= 0 || !(s.qk_clip > 0) || !(s.rel_clip > 0) || !(s.log_scale_floor > 0) ||
+            s.log_scale_alpha < 0 || !(s.situ_gate > 0) || !(s.situ_up > 0) || !(s.final_softcap > 0) ||
+            s.n_vocab_unpadded <= 0 || s.n_vocab_unpadded > s.n_vocab_padded) {
+            err = A + ": the sliding-window pattern, convolutions, attention residuals, relative bias, clips, softcaps "
+                      "or vocabulary sizes are missing or out of range";
             return false;
         }
     }

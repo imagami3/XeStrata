@@ -119,7 +119,7 @@ public:
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
     /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
-    bool recurrent() const { return !gdn_state_.empty(); }
+    bool recurrent() const { return !gdn_state_.empty() || ink_; }   // b70-local: Inkling 2 convolution histories
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
@@ -429,6 +429,7 @@ private:
         W o;                                  // either mixer's output projection
         W ffn_gate, ffn_up, ffn_down;         ///< a leading layer's dense FFN, else the shared expert
         const float *router = nullptr, *router_b = nullptr;   // F32 [n_embd, n_expert], [n_expert]
+        const uint16_t* router16 = nullptr;   ///< b70-local STRATA_ROUTER_BF16=1: the router as BF16 (exact values only), decode
         float clamp = 0.0f;                   ///< the dense FFN's / shared expert's SwiGLU limit
     };
     bool glm_ = false;
@@ -436,6 +437,35 @@ private:
     int64_t dsa_layer_ = -1;   // b70-local: the block record_dsa records (STRATA_DECODE_PROFILE)
     GBlock gmtp_;                             ///< GLM's MTP layer (has_mtp_): a DSA block of one stream
     bool load_glm5(std::string& err);
+    // Inkling 2 (b70-local, plain_inkling2.cpp): sliding / full attention with a relative bias and sinks, the causal
+    // short convolutions, the attention residuals over the block inputs, the sigmoid router and SITU experts
+    struct IBlock {
+        bool swa = false;
+        int64_t extent = 0;                   ///< the bias table's offsets (the window on a sliding layer)
+        int n_aq = 0;                         ///< the attention input's residual queries (0 on layer 0, 1 or 3)
+        W q, k, v, o, gate, rel, sink, kproj, vproj;
+        const float *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr, *ffn_norm = nullptr;
+        const float *q_clip = nullptr, *rel_clip = nullptr, *rel_table = nullptr;
+        const float *k_conv = nullptr, *v_conv = nullptr, *attn_post_conv = nullptr, *ffn_post_conv = nullptr;
+        const float *attn_rq = nullptr, *ffn_rq = nullptr, *router = nullptr, *router_b = nullptr;
+        float *kc = nullptr, *vc = nullptr, *conv = nullptr;   ///< the cache ([cells][nkv D] F32) and conv history
+    };
+    bool ink_ = false;
+    std::vector<IBlock> iblocks_;
+    int64_t i_nblocks_ = 0;                   ///< the attention residuals' blocks over the whole trunk
+    int64_t i_conv_floats_ = 0;               ///< a layer's convolution history (K, V, attention out, MoE out)
+    const float *i_tok_norm_ = nullptr, *i_out_rq_ = nullptr;
+    float *i_blocks_ = nullptr;               ///< [blocks][max_t][N]: the block inputs (handed on between stages)
+    float *i_in_ = nullptr;                   ///< [3][max_t][N]: the residual mixes
+    float *i_hk_ = nullptr, *i_hv_ = nullptr, *i_q_ = nullptr, *i_kr_ = nullptr, *i_vr_ = nullptr, *i_k_ = nullptr,
+          *i_v_ = nullptr, *i_r_ = nullptr, *i_sink_ = nullptr, *i_gate_ = nullptr, *i_kp_ = nullptr, *i_vp_ = nullptr,
+          *i_att_ = nullptr, *i_o_ = nullptr;
+    bool load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::string& err);
+    bool load_inkling2(std::string& err);
+    bool reset_inkling2(std::string& err);
+    bool record_window_inkling2(int T, strata::gpu::Stream cs, std::string& err);
+    bool record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
+                       strata::gpu::Stream cs, std::string& err);
     /// `mtp`: the MTP layer's block, without the mHC mixes
     bool load_gblock(const GgufModel& m, int64_t l, GBlock& b, std::string& err, bool mtp = false);
     bool reset_glm5(std::string& err);

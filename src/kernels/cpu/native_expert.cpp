@@ -82,6 +82,23 @@ size_t native_quantize_rows(int type, const float* src, void* dst, int64_t nrows
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
     if (up_type < 0) up_type = gu_type;
+    // b70-local: RVQ 2x8 experts (type 150, Inkling 2): GPU only (FP32 activations); the geometry is a uint16 code per 8
+    // weights; the per-row gains and the layer's books follow in the blob tail (expert_layout_from_gguf)
+    if (gu_type == 150 || d_type == 150 || up_type == 150 || gu_type == 151 || d_type == 151 || up_type == 151) {
+        const int dim = gu_type == 151 ? 16 : 8;
+        if (gu_type != d_type || up_type != gu_type || n_embd % dim || n_ff % dim) {
+            err = "native experts: RVQ2X8/RVQ2X16 needs all three roles in the same RVQ type and widths that are multiples of its vector size";
+            return false;
+        }
+        f = NativeFmt{};
+        f.gu_type = f.d_type = f.up_type = gu_type; f.gu_act = f.d_act = (int) GGML_TYPE_Q8_0;
+        f.n_embd = n_embd; f.n_ff = n_ff;
+        f.gu_row = f.up_row = (size_t) (n_embd / dim) * 2; f.d_row = (size_t) (n_ff / dim) * 2;
+        f.up_off = f.gu_row * (size_t) n_ff; f.down_off = f.up_off + f.up_row * (size_t) n_ff;
+        f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+        f.act_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_embd); f.h_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_ff);
+        return true;
+    }
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
     // are known here, and their rows run on tq_cpu.hpp.
@@ -274,7 +291,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         const int mt = native_gu_mt_min(f.gu_type);
         part_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1, mt);
         part_rows(f.up_type, blob + f.up_off, f.up_row, (int) f.n_embd, act, nt, up, r0, r1, mt);
-        const float lim = expert_swiglu_limit();
+        const ExpertAct lim = expert_act();
         for (int t = 0; t < nt; ++t)
             for (int r = r0; r < r1; ++r) ff[t][r] = swiglu_host(ff[t][r], up[t][r], lim);
         return;
@@ -331,14 +348,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         nvfp4_rows_mt(blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
         float sg = 1.f, su = 1.f;
         if (f.tail_off != 0) { std::memcpy(&sg, blob + f.tail_off, 4); std::memcpy(&su, blob + f.tail_off + 4, 4); }
-        const float lim = expert_swiglu_limit();
+        const ExpertAct lim = expert_act();
         for (int t = 0; t < nt; ++t)
             for (int r = r0; r < r1; ++r) ff[t][r] = swiglu_host(ff[t][r] * sg, up[t][r] * su, lim);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
-    const float lim = expert_swiglu_limit();
+    const ExpertAct lim = expert_act();
     // NVFP4 (tail_off): the expert's weight_scale_2 of gate and up on their outputs, before the clamp and the SiLU
     float sg = 1.f, su = 1.f;
     if (f.tail_off != 0 && f.gu_type == 40) { std::memcpy(&sg, blob + f.tail_off, 4); std::memcpy(&su, blob + f.tail_off + 4, 4); }

@@ -404,7 +404,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/q8_mma.cpp
-                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp)
+                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp src/kernels/xe/inkling2.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -416,7 +416,7 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
-                                   src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
+                                   src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/plain_inkling2.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)

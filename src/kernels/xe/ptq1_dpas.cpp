@@ -248,7 +248,7 @@ SYCL_ESIMD_FUNCTION inline esimd::simd<float, 128> tile_dot(const uint8_t* w0, u
     for (int g = g0; g < g1; ++g) {
         if (g + 1 < g1) load_blk(w0 + (size_t) (g + 1) * 28, roff, wn);
         // byte bb of the 16 rows -> its table entry (the 5 digits as 2-bit fields)
-#define PTQ1_BY(bb) ((wd[(bb) >> 2] >> (8 * ((bb) & 3))) & 0xFFu)
+#define PTQ1_BY(bb) (esimd::simd<uint32_t, 16>(wd[(bb) >> 2].template bit_cast_view<uint8_t>().template select<16, 4>((bb) & 3).read()))
 #define PTQ1_LK(bb) (glut ? esimd::gather<uint32_t, 16>(lut, PTQ1_BY(bb) << 2) : esimd::slm_gather<uint32_t, 16>(PTQ1_BY(bb) << 2))
         const esimd::simd<uint32_t, 16> h0 = PTQ1_LK(24), h1 = PTQ1_LK(25);
         esimd::simd<uint16_t, 16> dh = esimd::simd<uint16_t, 16>(wd[6] >> 16);
@@ -406,7 +406,7 @@ sycl::event ptq1_experts_dpas(sycl::queue& q, const NativeExpertLayout& L, const
     static const int skip = [] { const char* e = std::getenv("STRATA_PTQ1_DPAS_SKIP"); return e ? std::atoi(e) : 0; }();
     if (!(skip & 1)) ent_xq(q, static_cast<const uint8_t*>(x_q8_1), ent_tok, grp_start, n_groups, cap_entries, (int) L.n_embd, s->xa, s->xs);
     static const int ks_env = [] { const char* e = std::getenv("STRATA_PTQ1_DPAS_KS"); return e ? std::atoi(e) : 0; }();
-    const int ksg = ks_env > 0 ? ks_env : 4, ksd = ks_env > 0 ? ks_env : 2;
+    const int ksg = ks_env > 0 ? ks_env : 4, ksd = ks_env > 0 ? ks_env : 4;   // 11-09: down 4 (863 vs 880 us)
     if (skip & 2) {}
     else if (ksg >= 8) ex_rows<8, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, s->xa, s->xs, s->lut, L, gate, up);
     else if (ksg >= 4) ex_rows<4, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, s->xa, s->xs, s->lut, L, gate, up);

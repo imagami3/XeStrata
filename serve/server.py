@@ -65,7 +65,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
-from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser, InklingParser,  # noqa: E402
                             OutputParser, ToolCall, anthropic_to_messages, forced_call, images_of, literal_tags,
                             mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
@@ -4341,7 +4341,8 @@ class Service:
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         # the Harmony format writes its reasoning in a channel: the budget's and the loop recovery's closing text is
         # Qwen's <think> form, so neither applies to it
-        harmony = getattr(self.template, "harmony", False)
+        inkling = getattr(self.template, "inkling", False)   # b70-local: Inkling 2 (its reasoning is a message, not <think>)
+        harmony = getattr(self.template, "harmony", False) or inkling
         budget = self.reasoning_budget(sampling) if thinking and not harmony else None
         if thinking and not harmony and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45 (upstream d0e990ba): max_tokens counts the thinking too.  A client that caps the reply at 8192
@@ -4363,7 +4364,8 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
-        parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
+        parser = (InklingParser(thinking=thinking, tools=tools) if inkling else
+                  HarmonyParser(thinking=thinking, tools=tools) if harmony else
                   reader(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
                          declared_only=declared_only))
         detok, n, finish = Detokenizer(self.tok), 0, "length"

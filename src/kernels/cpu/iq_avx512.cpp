@@ -196,7 +196,7 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     const int nb = n / QK_K;
     float g[NT], u[NT];
-    const float lim = expert_swiglu_limit();
+    const ExpertAct lim = expert_act();
     for (int r = r0; r < r1; ++r) {
         row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
         row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);

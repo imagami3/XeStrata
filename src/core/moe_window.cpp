@@ -85,7 +85,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     bf16_ = false;
     for (int64_t l = 0; l < lay.n_layers; ++l) {
         max_ff = std::max<int64_t>(max_ff, lay.native ? lay.fmt[(size_t) l].n_ff : strata::kernels::cpu::FF);
-        bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
+        bf16_ = bf16_ || (lay.native && (lay.fmt[(size_t) l].gu_type == 30 || lay.fmt[(size_t) l].gu_type == 150 || lay.fmt[(size_t) l].gu_type == 151));   // FP32 x rows
     }
 
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
@@ -249,7 +249,10 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
                 L.tail_off = f.tail_off;   // NVFP4: the per-expert scales at the blob's end
                 if (f.tail_off != 0) L.bytes = f.bytes;
-                if (f.gu_type == 30)
+                if (f.gu_type == 150 || f.gu_type == 151)
+                    native_expert_grouped_rvq(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
+                                              hit_scratch_, hit_out, cs, grid_groups);
+                else if (f.gu_type == 30)
                     native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
                                                hit_scratch_, hit_out, cs, grid_groups);
                 else

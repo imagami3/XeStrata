@@ -63,6 +63,7 @@ class ChatTemplate:
         self.template = env.from_string(self.source)
         # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
         self.harmony = "<|channel|>" in self.source
+        self.inkling = "<|content_invoke_tool_json|>" in self.source   # b70-local: Inkling 2's format (InklingParser)
         # the tools as OpenAI sends them ({"type": "function", "function": {...}}) where the template unwraps them
         # itself; otherwise their inner objects, as Qwen's templates read them
         self.wrapped_tools = re.search(r"tool\.function\b|tool\[['\"]function['\"]\]", self.source) is not None
@@ -89,6 +90,19 @@ class ChatTemplate:
                     m = {**m, "thinking": m["reasoning_content"]}
                     if m.get("tool_calls"):
                         m.pop("content", None)
+                adjusted.append(m)
+            messages = adjusted
+        if self.inkling:   # its template takes a call's arguments as an object only (OpenAI clients send JSON text)
+            adjusted = []
+            for m in messages:
+                if isinstance(m, dict) and m.get("tool_calls"):
+                    calls = []
+                    for tc in m["tool_calls"]:
+                        fn = dict(tc.get("function") or {})
+                        if isinstance(fn.get("arguments"), str):
+                            fn["arguments"] = tool_arguments(fn["arguments"])
+                        calls.append({**tc, "function": fn})
+                    m = {**m, "tool_calls": calls}
                 adjusted.append(m)
             messages = adjusted
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
@@ -1087,6 +1101,115 @@ class HarmonyParser:
                 self.to, self.args = None, ""
         elif self.buf.strip() and HARMONY_MESSAGE not in self.buf:
             self.buf = ""            # an unfinished header carries no text
+        return out
+
+
+INK_MODEL, INK_END = "<|message_model|>", "<|end_message|>"
+INK_THINK, INK_TEXT, INK_CALL, INK_CALL_TEXT = "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>"
+INK_HEADS = (INK_THINK, INK_TEXT, INK_CALL, INK_CALL_TEXT)
+
+
+class InklingParser:
+    """b70-local: the output parser for Inkling 2's chat format, with OutputParser's interface (feed, finish, state).
+    After the last message the model writes messages `<|message_model|>[NAME]<|content_X|>BODY<|end_message|>` and ends
+    its turn with <|content_model_end_sampling|> (the EOS, not passed on): content_thinking = the reasoning,
+    content_text = the answer, NAME<|content_invoke_tool_json|>{"name": NAME, "args": {...}} = a tool call (the template
+    writes this form; a plain argument object is taken too)."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, **_):
+        self.thinking = thinking
+        self.names = {t.get("name") for t in tools or []}
+        self.head = True             # reading a message's header (up to its content marker)
+        self.buf = ""
+        self.kind = ""               # think | text | call
+        self.name = ""
+        self.args = ""
+        self.pending: list = []
+        self.rescued = self.refused = 0
+
+    @property
+    def state(self) -> str:
+        if self.head:
+            return "reasoning" if self.thinking and self.kind in ("", "think") else "content"
+        return {"think": "reasoning", "call": "call"}.get(self.kind, "content")
+
+    def _body_event(self, text: str) -> list[Event]:
+        if not text:
+            return []
+        if self.kind == "call":
+            self.args += text
+            return []
+        return [Event("reasoning" if self.kind == "think" else "content", text)]
+
+    def _end_message(self) -> list[Event]:
+        out: list[Event] = []
+        if self.kind == "call":
+            try:
+                obj = json.loads(self.args) if self.args.strip() else {}
+            except ValueError:
+                obj = None
+            name, args = self.name, None
+            if isinstance(obj, dict):
+                if isinstance(obj.get("args"), dict):
+                    name, args = obj.get("name") or name, obj["args"]
+                elif "name" not in obj:
+                    args = obj
+            if name and isinstance(args, dict):
+                out.append(Event("tool_call", call=ToolCall(name=name, arguments=args)))
+            else:
+                out.append(Event("content", self.args))
+        self.head, self.kind, self.name, self.args = True, "", "", ""
+        return out
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out: list[Event] = []
+        while self.buf:
+            if self.head:
+                hits = [(self.buf.find(h), h) for h in INK_HEADS if h in self.buf]
+                if not hits:
+                    if INK_END in self.buf:    # a message with no content marker: drop its header
+                        self.buf = self.buf[self.buf.find(INK_END) + len(INK_END):]
+                        continue
+                    return out
+                at, h = min(hits)
+                hdr = self.buf[:at].replace(INK_MODEL, "").strip()
+                self.kind = {INK_THINK: "think", INK_TEXT: "text"}.get(h, "call")
+                self.name = hdr if self.kind == "call" else ""
+                if h == INK_CALL_TEXT:         # text-form arguments: kept as the answer's text
+                    self.kind = "text"
+                self.buf = self.buf[at + len(h):]
+                self.head = False
+                continue
+            at = self.buf.find(INK_END)
+            if at >= 0:
+                out += self._body_event(self.buf[:at])
+                self.buf = self.buf[at + len(INK_END):]
+                out += self._end_message()
+                continue
+            keep = 0
+            for e in (INK_END, INK_MODEL):
+                for k in range(min(len(e) - 1, len(self.buf)), 0, -1):
+                    if self.buf.endswith(e[:k]):
+                        keep = max(keep, k)
+                        break
+            out += self._body_event(self.buf[:len(self.buf) - keep])
+            self.buf = self.buf[len(self.buf) - keep:]
+            return out
+        return out
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        out: list[Event] = []
+        if not self.head:
+            out += self._body_event(self.buf)
+            self.buf = ""
+            if self.kind == "call" and reason in (None, "stop"):
+                out += self._end_message()
+            elif self.kind == "call":
+                out.append(Event("content", self.args))
+                self.kind, self.args = "", ""
+        else:
+            self.buf = ""
         return out
 
 

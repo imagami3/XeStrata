@@ -87,6 +87,32 @@ inline float silu_mul(float g, float u) {
     return g * rcp(1.0f + exp(-g)) * u;
 }
 
+/// tanh(x) from the operations above (b70-local, Inkling 2's softcaps): an odd Taylor polynomial below |x| = 1/4
+/// (the next term is under 1e-8 of the value), else (1 - e) / (1 + e) with e = e^-2|x| (1 - e >= 0.39, no cancellation).
+inline float tanh(float x) {
+    STRATA_CANON_NO_CONTRACT
+    const float a = x < 0.0f ? -x : x;
+    float t;
+    if (a < 0.25f) {
+        const float x2 = a * a;
+        float p = 62.0f / 2835.0f;
+        p = fma(p, x2, -17.0f / 315.0f);
+        p = fma(p, x2, 2.0f / 15.0f);
+        p = fma(p, x2, -1.0f / 3.0f);
+        t = fma(p * x2, a, a);
+    } else {
+        const float e = exp(-2.0f * a);
+        t = (1.0f - e) * rcp(1.0f + e);
+    }
+    return x < 0.0f ? -t : t;
+}
+
+/// Inkling 2's expert activation (SITU): cg tanh(g / cg) / (1 + e^-g) * cu tanh(u / cu).
+inline float situ_mul(float g, float u, float cg, float cu) {
+    STRATA_CANON_NO_CONTRACT
+    return cg * tanh(g * rcp(cg)) * rcp(1.0f + exp(-g)) * (cu * tanh(u * rcp(cu)));
+}
+
 constexpr float kHalfMax = 65504.0f;
 
 /// A q8_1 block's scale for the largest |x| `amax` of its 32 values, kept finite as an fp16 (#606).

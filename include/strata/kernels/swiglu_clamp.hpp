@@ -11,6 +11,8 @@
 #include <atomic>
 #include <cmath>
 
+#include "strata/kernels/canon_math.hpp"
+
 namespace strata::kernels {
 
 inline std::atomic<float> g_expert_swiglu_limit{0.0f};
@@ -32,6 +34,35 @@ inline void swiglu_clamp(float& gate, float& up, float lim) {
 inline float swiglu_host(float gate, float up, float lim) {
     swiglu_clamp(gate, up, lim);
     return (gate / (1.f + std::exp(-gate))) * up;
+}
+
+/// b70-local: the routed experts' activation, a process setting like the limit above.  Inkling 2 (SITU): softcaps
+/// cg tanh(g / cg) and cu tanh(u / cu), times sigmoid(g) (canon::situ_mul); every other model: the clamped SwiGLU.
+struct ExpertAct {
+    float lim = 0.0f;   ///< the SwiGLU clamp (0: none)
+    float cg = 0.0f;    ///< SITU's gate softcap (0: SwiGLU)
+    float cu = 0.0f;    ///< ... and its up softcap
+};
+inline std::atomic<float> g_expert_situ_gate{0.0f};
+inline std::atomic<float> g_expert_situ_up{0.0f};
+inline void expert_situ_set(float cg, float cu) {
+    g_expert_situ_gate.store(cg > 0.0f && cu > 0.0f ? cg : 0.0f, std::memory_order_relaxed);
+    g_expert_situ_up.store(cg > 0.0f && cu > 0.0f ? cu : 0.0f, std::memory_order_relaxed);
+}
+inline ExpertAct expert_act() {
+    return {expert_swiglu_limit(), g_expert_situ_gate.load(std::memory_order_relaxed),
+            g_expert_situ_up.load(std::memory_order_relaxed)};
+}
+/// The activation with the canonical arithmetic (canon_math.hpp; host and device give the same bits).
+inline float expert_act_mul(float gate, float up, const ExpertAct& a) {
+    if (a.cg > 0.0f) return canon::situ_mul(gate, up, a.cg, a.cu);
+    swiglu_clamp(gate, up, a.lim);
+    return canon::silu_mul(gate, up);
+}
+/// The CPU kernels' form: SITU canonical, the SwiGLU as they always computed it.
+inline float swiglu_host(float gate, float up, const ExpertAct& a) {
+    if (a.cg > 0.0f) return canon::situ_mul(gate, up, a.cg, a.cu);
+    return swiglu_host(gate, up, a.lim);
 }
 
 }  // namespace strata::kernels
