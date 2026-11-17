@@ -29,8 +29,11 @@ void inkling2_attn_res(const float* blocks, int64_t block_stride, int n_blocks, 
 /// win_t = x_{t - n_taps + 1} .. x_t.  w [C][n_taps] (ggml's ssm_conv layout).  `dyn` (or null): per token
 /// [heads][n_taps] taps, tap lag j of head h multiplying x_{t - j} for the head's C / heads channels.  x and y may
 /// not alias.
+/// b70-local: `snap` (or null): the history after each of rows 0 .. n_snap - 1 as well, row t's at snap + t *
+/// snap_stride (state's layout), for speculative decoding to go back to an accepted row.
 void inkling2_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* y,
-                   int64_t n_channels, int n_taps, float scale, int n_tokens, void* stream);
+                   int64_t n_channels, int n_taps, float scale, int n_tokens, void* stream, float* snap = nullptr,
+                   int64_t snap_stride = 0, int n_snap = 0);
 
 /// Per head of `dim` values: x *= scale (per head and value, or null), then the L2 clip x *= min(1, thr / (|x| + 1e-6)),
 /// then (alpha > 0) x *= 1 + alpha log(max(1, (pos + 1) / floor)) with the token's position from `steps`.

@@ -969,6 +969,11 @@ int plain_main(int argc, char** argv) {
     const Clock::time_point t2 = Clock::now();
     // with drafts: a window checks them and emits the accepted ones and the token after them
     const bool spec = model.drafts() > 0 && sp.greedy;
+    if (spec) {   // b70-local: lookup drafts' context: the prompt and what came before the pending token
+        std::vector<int32_t> ctx_ids(prompt.begin(), prompt.end());
+        ctx_ids.insert(ctx_ids.end(), produced.begin(), produced.end() - (produced.empty() ? 0 : 1));
+        model.set_context(ctx_ids.data(), (int64_t) ctx_ids.size());
+    }
     if (spec && (int64_t) produced.size() < n_new && !at_eos(produced.back()) &&
         !model.spec_start(produced.back(), pos, err)) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());

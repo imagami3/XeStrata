@@ -10,8 +10,8 @@
 // the caches for each 2-byte code.  On the B70 (2026-11-18, Inkling 2 v3Fj 86 GB, 3 cards) the decode's experts went
 // from 1.0M to 0.56M clock ticks a layer and the decode from 23.9 to 29.6 tok/s; chunks of 8, 24 and 32 codes were
 // no faster (32: slower), and the lookups' bank conflicts are about 15% of the rest.
-// Gate and up: every entry is the same token (the caller's cap_entries <= 8: one token's top-8).  Down: each entry's
-// own h.  Widths (ff) must be multiples of 64 (8 codes) and n_embd of 128 (a chunk); a chunk past a narrower expert's
+// Gate and up: each entry's own token's table (a window of a few tokens: speculative decoding's verify windows).
+// Down: each entry's own h.  Widths (ff) must be multiples of 64 (8 codes) and n_embd of 128 (a chunk); a chunk past a narrower expert's
 // width is skipped.  Devices without 33 KiB of local memory or work-groups of 256 keep the old kernel.
 #include "strata/core/runtime.hpp"
 
@@ -122,7 +122,9 @@ float* partials(sycl::queue& q, size_t n, int slot) {
 bool rvq_lut_on(sycl::queue& q, int64_t cap_entries, int64_t N, int64_t FF, bool mixed, size_t up_off, size_t down_off,
                 size_t d_row) {
     static const bool on = [] { const char* v = std::getenv("STRATA_RVQ_LUT"); return v == nullptr || v[0] != '0'; }();
-    if (!on || cap_entries > 8 || N % CI != 0 || FF % 64 != 0) return false;
+    // up to STRATA_RVQ_LUT_MAX entries (default 32: a window of 4 tokens' top-8; the prompt's big windows take XMX)
+    static const int64_t most = [] { const char* v = std::getenv("STRATA_RVQ_LUT_MAX"); return v ? std::atoll(v) : 32; }();
+    if (!on || cap_entries > most || N % CI != 0 || FF % 64 != 0) return false;
     // the table and the inputs in local memory, and work-groups of 256, as the device reports
     const sycl::device d = q.get_device();
     if (d.get_info<sycl::info::device::local_mem_size>() < (CC * NE + CI) * sizeof(float) ||
@@ -132,14 +134,16 @@ bool rvq_lut_on(sycl::queue& q, int64_t cap_entries, int64_t N, int64_t FF, bool
     return true;
 }
 
-// gate and up: [entry][FF] for the entries' rows (gains on), from the token x (every entry's)
+// gate and up: [entry][FF] for the entries' rows (gains on), each from its own token's row of x (ent_tok).  A
+// work-group builds the table of one token at a time and covers the entries of that token: a window of T tokens
+// (speculative decoding's verify windows) builds T tables and reads each (expert, token) pair's codes once.
 sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                       const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_groups, const float* x, float* gate,
+                       const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
                        float* up, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t up_off, size_t tail) {
     const Geo G{N, FF, mixed, gu_row, up_off, 0, 0, tail};
     const int nch = (int) (N / CI);
     const int64_t rows = 2 * FF;
-    const size_t need = (size_t) nch * (size_t) cap_groups * (size_t) rows;
+    const size_t need = (size_t) nch * (size_t) cap_entries * (size_t) rows;
     float* part = partials(q, need, 0);
     if (part == nullptr) throw std::runtime_error("rvq_lut_gu: no partial buffer");
     const size_t nrb = (size_t) ((rows + WG * RPT_GU - 1) / (WG * RPT_GU));
@@ -149,55 +153,57 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
         h.parallel_for(sycl::nd_range<2>({(size_t) nch, nrb * WG}, {1, (size_t) WG}), [=](sycl::nd_item<2> it) {
             const int ng = *n_groups;
             if (ng <= 0) return;
+            const int e0 = grp_start[0], e1 = grp_start[ng];
             const int ch = (int) it.get_group(0), t = (int) it.get_local_id(1);
             const int64_t rb = (int64_t) it.get_group(1) * WG * RPT_GU;
-            const float* xt = x + (size_t) ent_tok[grp_start[0]] * N + (size_t) ch * CI;
-            if (t < CI) xs[t] = xt[t];
-            // the rows (group, k) in batches of BR, each batch's codes loaded before its lookups (the first batch's
-            // before the table is built), so that the loads of several rows are in flight at once
-            constexpr int BR = 4;
-            const int nr = ng * RPT_GU;
-            V4 w[BR][CC / 8];
-            size_t dst[BR];
-            auto load = [&](int j0) {
-                for (int b = 0; b < BR; ++b) {
-                    const int j = j0 + b, g = j / RPT_GU, k = j % RPT_GU;
-                    dst[b] = ~(size_t) 0;
-                    const int64_t r = rb + (int64_t) k * WG + t;
-                    if (j >= nr || r >= rows) continue;
-                    const View v = view(G, (const uint8_t*) grp_ptr[g]);
-                    const bool is_up = r >= FF;
-                    const int64_t rr = is_up ? r - FF : r;
-                    if (rr >= v.ff) continue;
-                    const uint8_t* codes = v.b + (is_up ? v.up_o : 0) + (size_t) rr * G.gu_row + (size_t) ch * CC * 2;
-                    for (int q8 = 0; q8 < CC / 8; ++q8) w[b][q8] = *(const V4*) (codes + (size_t) q8 * 16);
-                    dst[b] = ((size_t) ch * (size_t) cap_groups + (size_t) g) * (size_t) rows + (size_t) r;
-                }
-            };
-            load(0);
-            sycl::group_barrier(it.get_group());
             float* Tp = T.get_multi_ptr<sycl::access::decorated::no>().get();
-            const View v0 = view(G, (const uint8_t*) grp_ptr[0]);
-            build(v0.book, xs.get_multi_ptr<sycl::access::decorated::no>().get(), Tp, CC, t);
-            sycl::group_barrier(it.get_group());
-            for (int j0 = 0; j0 < nr; j0 += BR) {
-                if (j0 > 0) load(j0);
-                for (int b = 0; b < BR; ++b)
-                    if (dst[b] != ~(size_t) 0) part[dst[b]] = lookup_regs(w[b], CC / 8, Tp);
+            float* xp = xs.get_multi_ptr<sycl::access::decorated::no>().get();
+            const float* book = view(G, (const uint8_t*) grp_ptr[0]).book;   // the layer's (every blob's the same)
+            int tmax = 0;
+            for (int e = e0; e < e1; ++e) tmax = sycl::max(tmax, ent_tok[e] + 1);
+            for (int tok = 0; tok < tmax; ++tok) {
+                bool any = false;
+                for (int e = e0; e < e1 && !any; ++e) any = ent_tok[e] == tok;
+                if (!any) continue;   // the same answer in every work-item: the barriers stay uniform
+                sycl::group_barrier(it.get_group());   // the last token's lookups are done with the table
+                if (t < CI) xp[t] = x[(size_t) tok * N + (size_t) ch * CI + t];
+                sycl::group_barrier(it.get_group());
+                build(book, xp, Tp, CC, t);
+                sycl::group_barrier(it.get_group());
+                int g = 0;
+                for (int e = e0; e < e1; ++e) {
+                    while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
+                    if (ent_tok[e] != tok) continue;
+                    const View v = view(G, (const uint8_t*) grp_ptr[g]);
+                    for (int k = 0; k < RPT_GU; ++k) {
+                        const int64_t r = rb + (int64_t) k * WG + t;
+                        if (r >= rows) continue;
+                        const bool is_up = r >= FF;
+                        const int64_t rr = is_up ? r - FF : r;
+                        if (rr >= v.ff) continue;
+                        const uint8_t* codes = v.b + (is_up ? v.up_o : 0) + (size_t) rr * G.gu_row + (size_t) ch * CC * 2;
+                        V4 w[CC / 8];
+                        for (int q8 = 0; q8 < CC / 8; ++q8) w[q8] = *(const V4*) (codes + (size_t) q8 * 16);
+                        part[((size_t) ch * (size_t) cap_entries + (size_t) e) * (size_t) rows + (size_t) r] =
+                            lookup_regs(w, CC / 8, Tp);
+                    }
+                }
             }
         });
     });
-    return q.parallel_for(sycl::range<1>((size_t) cap_groups * (size_t) rows), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], g = i / rows, r = i % rows;
-        if (g >= *n_groups) return;
+    return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) rows), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], e = i / rows, r = i % rows;
+        const int ng = *n_groups;
+        if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
+        int g = 0;
+        while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
         const View v = view(G, (const uint8_t*) grp_ptr[g]);
         const bool is_up = r >= FF;
         const int64_t rr = is_up ? r - FF : r;
         if (rr >= v.ff) return;
         float s = 0.0f;
-        for (int c = 0; c < nch; ++c) s += part[((size_t) c * (size_t) cap_groups + (size_t) g) * (size_t) rows + (size_t) r];
-        s *= (float) v.gains[(is_up ? v.ff : 0) + rr];
-        for (int e = grp_start[g]; e < grp_start[g + 1]; ++e) (is_up ? up : gate)[(size_t) e * FF + rr] = s;
+        for (int c = 0; c < nch; ++c) s += part[((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) rows + (size_t) r];
+        (is_up ? up : gate)[(size_t) e * FF + rr] = s * (float) v.gains[(is_up ? v.ff : 0) + rr];
     });
 }
 

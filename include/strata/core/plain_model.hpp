@@ -165,7 +165,7 @@ public:
     bool prompt_int8() const;
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
-    int drafts() const { return tail().has_mtp_ ? tail().n_snap_ : 0; }
+    int drafts() const { return tail().has_mtp_ || tail().ink_spec_ ? tail().n_snap_ : 0; }
     /// After prompt() (or the windows of a prompt): `first`, the token picked after it, at position `pos`, the next
     /// window's first token; the MTP layer reads it and drafts the tokens after it.
     bool spec_start(int32_t first, int64_t pos, std::string& err);
@@ -454,7 +454,11 @@ private:
         const float *k_conv = nullptr, *v_conv = nullptr, *attn_post_conv = nullptr, *ffn_post_conv = nullptr;
         const float *attn_rq = nullptr, *ffn_rq = nullptr, *router = nullptr, *router_b = nullptr;
         float *kc = nullptr, *vc = nullptr, *conv = nullptr;   ///< the cache ([cells][nkv D] F32) and conv history
+        float* conv_snap = nullptr;   ///< b70-local: the history after each of a window's rows 0 .. n_snap_ - 1
     };
+    /// b70-local: STRATA_INK_SPEC=lookup - speculative decoding on Inkling 2 (the drafts: ink_draft)
+    bool ink_spec_ = false;
+    bool ink_draft(std::string& err);
     bool ink_ = false;
     std::vector<IBlock> iblocks_;
     int64_t i_nblocks_ = 0;                   ///< the attention residuals' blocks over the whole trunk

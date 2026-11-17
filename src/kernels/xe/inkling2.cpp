@@ -90,7 +90,8 @@ void inkling2_raw_rows(float* x, const float* src, const int32_t* raw, int64_t n
 }
 
 void inkling2_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* y,
-                   int64_t n_channels, int n_taps, float scale, int n_tokens, void* stream) {
+                   int64_t n_channels, int n_taps, float scale, int n_tokens, void* stream, float* snap,
+                   int64_t snap_stride, int n_snap) {
     if (n_tokens <= 0 || n_channels <= 0) return;
     if (n_taps < 2 || n_taps > kMaxTaps || (dyn != nullptr && (heads <= 0 || n_channels % heads != 0)))
         throw core::DeviceError("inkling2_conv: taps or heads");
@@ -113,6 +114,8 @@ void inkling2_conv(const float* x, float* state, const float* w, const float* dy
             }
             y[(int64_t) t * C + c] = (win[K - 1] + sum) * scale;
             for (int j = 0; j < K - 1; ++j) win[j] = win[j + 1];
+            if (t < n_snap)   // b70-local: the history after row t (speculative decoding's rollback)
+                for (int j = 0; j < K - 1; ++j) snap[(int64_t) t * snap_stride + c * (K - 1) + j] = win[j];
         }
         for (int j = 0; j < K - 1; ++j) state[c * (K - 1) + j] = win[j];
     });

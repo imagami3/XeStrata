@@ -164,7 +164,8 @@ bool PlainModel::load_inkling2(std::string& err) {
     model_mtp_ = false;
     has_mtp_ = false;
     opt_.prompt_chunk = 0;   // the prompt runs in windows (no batched path yet)
-    opt_.spec = 0;
+    if (const char* v = std::getenv("STRATA_INK_SPEC"); v == nullptr || v[0] == '\0' || v[0] == '0')
+        opt_.spec = 0;   // no MTP layer: speculative decoding only with STRATA_INK_SPEC (b70-local)
     cs_ = strata::gpu::stream_create();
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
     k::expert_situ_set((float) s.situ_gate, (float) s.situ_up);   // a process setting, before any graph
@@ -215,6 +216,20 @@ bool PlainModel::load_inkling2(std::string& err) {
         allocs_.push_back(b.kc);
         allocs_.push_back(b.vc);
         allocs_.push_back(b.conv);
+    }
+    // b70-local: speculative decoding (STRATA_INK_SPEC): the histories after a window's rows but its last, every stage's
+    if (const char* v = std::getenv("STRATA_INK_SPEC"); v != nullptr && v[0] != '\0' && v[0] != '0' && opt_.spec > 1) {
+        opt_.spec = std::min(opt_.spec, std::min(opt_.max_t, 8));
+        n_snap_ = opt_.spec - 1;
+        ink_spec_ = last();
+        for (int64_t l = lb_; l < le_; ++l) {
+            IBlock& b = iblocks_[(size_t) l];
+            if (!strata::gpu::alloc_device(&b.conv_snap, (size_t) (n_snap_ * i_conv_floats_) * 4)) {
+                err = "plain model: no VRAM for the convolutions' copies (STRATA_INK_SPEC)";
+                return false;
+            }
+            allocs_.push_back(b.conv_snap);
+        }
     }
 
     // the window's buffers
@@ -352,6 +367,13 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     float* conv_v = conv_k + KVW * (KT - 1);
     float* conv_a = conv_v + KVW * (KT - 1);
     float* conv_f = conv_a + N * (KT - 1);
+    // b70-local: the histories after rows 0 .. ns - 1 (speculative decoding), at the same offsets in each snapshot row
+    const int ns = b.conv_snap != nullptr ? std::min(T - 1, n_snap_) : 0;
+    const int64_t sst = i_conv_floats_;
+    float* snap_k = ns > 0 ? b.conv_snap : nullptr;
+    float* snap_v = ns > 0 ? b.conv_snap + (conv_v - b.conv) : nullptr;
+    float* snap_a = ns > 0 ? b.conv_snap + (conv_a - b.conv) : nullptr;
+    float* snap_f = ns > 0 ? b.conv_snap + (conv_f - b.conv) : nullptr;
 
     // ---- the attention inputs: the residual mixes of the blocks before this layer and the running row
     glm5_decode_stamp(this, l, 0, cs);
@@ -385,8 +407,8 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
 
     // ---- k and v through their convolutions, the clips, the cache, the attention
     const float sk = 1.0f / std::sqrt((float) ((b.swa ? 1 : 2) * KT + 1));
-    k::inkling2_conv(i_kr_, conv_k, b.k_conv, b.swa ? nullptr : i_kp_, (int) NKV, i_k_, KVW, (int) KT, sk, T, cs);
-    k::inkling2_conv(i_vr_, conv_v, b.v_conv, b.swa ? nullptr : i_vp_, (int) NKV, i_v_, KVW, (int) KT, sk, T, cs);
+    k::inkling2_conv(i_kr_, conv_k, b.k_conv, b.swa ? nullptr : i_kp_, (int) NKV, i_k_, KVW, (int) KT, sk, T, cs, snap_k, sst, ns);
+    k::inkling2_conv(i_vr_, conv_v, b.v_conv, b.swa ? nullptr : i_vp_, (int) NKV, i_v_, KVW, (int) KT, sk, T, cs, snap_v, sst, ns);
     const float alpha = b.swa ? 0.0f : (float) s.log_scale_alpha, fl = (float) s.log_scale_floor;
     k::inkling2_head_clip(i_q_, b.q_clip, (float) s.qk_clip, alpha, fl, step_, (int) H, (int) D, T, cs);
     k::inkling2_head_clip(i_k_, nullptr, (float) s.qk_clip, 0.0f, fl, step_, (int) NKV, (int) D, T, cs);
@@ -399,7 +421,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     glm5_decode_stamp(this, l, 2, cs);
     gproj(b.o, i_att_, i_o_, T, false, cs);
     const float s1 = 1.0f / std::sqrt((float) (KT + 1));
-    k::inkling2_conv(i_o_, conv_a, b.attn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs);
+    k::inkling2_conv(i_o_, conv_a, b.attn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs, snap_a, sst, ns);
     if (l % B == 0) {   // a block starts: the layer's input is kept, the attention's output is the running row
         k::copy_from_mapped(i_blocks_ + (l / B) * bstride, x_, (int64_t) T * N, cs);
         k::copy_from_mapped(x_, mix_, (int64_t) T * N, cs);
@@ -429,7 +451,7 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     }
     if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
     k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
-    k::inkling2_conv(moe_out_, conv_f, b.ffn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs);
+    k::inkling2_conv(moe_out_, conv_f, b.ffn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs, snap_f, sst, ns);
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
     glm5_decode_stamp(this, l, 5, cs);
     return true;

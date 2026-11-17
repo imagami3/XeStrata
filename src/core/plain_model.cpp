@@ -2165,6 +2165,16 @@ static bool spec_lookup_on() {
 static inline uint64_t tri_key(int32_t a, int32_t b, int32_t c) {
     return ((uint64_t) (uint32_t) a * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) (uint32_t) b << 21) ^ (uint64_t) (uint32_t) c;
 }
+// b70-local: Inkling 2's drafts after the pending token cur_ (STRATA_INK_SPEC=lookup: the lookup drafts alone)
+bool PlainModel::ink_draft(std::string& err) {
+    (void) err;
+    drafts_.clear();
+    int32_t lk[16];
+    const int k = lk_propose(cur_, std::min(n_snap_, 16), lk);
+    drafts_.assign(lk, lk + k);
+    return true;
+}
+
 void PlainModel::lk_push(int32_t t) {
     lk_hist_.push_back(t);
     const int64_t n = (int64_t) lk_hist_.size();
@@ -2224,6 +2234,7 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
     drafts_.clear();
     cur_ = first;
     cur_pos_ = pos;
+    if (ink_spec_) return ink_draft(err);   // b70-local: Inkling 2
     if (!has_mtp_ || n_snap_ < 1) return true;
     // the trunk's row before `first`: prompt() leaves it in mtp_h_, a window in hn_
     if (!mtp_h_set_ &&
@@ -2298,6 +2309,11 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     cur_pos_ = pos + n + 1;
     drafts_.clear();
     if (cur_pos_ >= opt_.max_cells) return true;
+    if (ink_spec_) {   // b70-local: Inkling 2's drafts
+        const bool ok = ink_draft(err);
+        spec_ms_draft_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        return ok;
+    }
     if (!strata::gpu::copy_async(mtp_h_, hn_, (size_t) (n + 1) * (size_t) spec_.n_embd * 4, cs_)) {
         err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();
         return false;
@@ -2339,6 +2355,16 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
 bool PlainModel::rollback(int n, std::string& err) {
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
+        if (st->ink_)   // b70-local: Inkling 2's convolution histories (the attention's cells are rewritten in turn)
+            for (int64_t l = st->lb_; l < st->le_; ++l) {
+                const IBlock& b = st->iblocks_[(size_t) l];
+                if (b.conv_snap != nullptr &&
+                    !strata::gpu::copy_async(b.conv, b.conv_snap + (size_t) n * (size_t) st->i_conv_floats_,
+                                             (size_t) st->i_conv_floats_ * 4, st->cs_)) {
+                    err = std::string("plain model: restoring the convolutions: ") + strata::gpu::last_error();
+                    return false;
+                }
+            }
         for (size_t g = 0; g < st->gdn_state_.size(); ++g)
             if (st->gdn_state_[g] != nullptr &&
                 (!strata::gpu::copy_async(st->gdn_state_[g], st->gdn_snap_[g][(size_t) n], st->state_bytes_, st->cs_) ||

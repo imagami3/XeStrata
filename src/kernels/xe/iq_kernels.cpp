@@ -2857,7 +2857,7 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     // b70-local: one token (the decode) by lookup tables of the layer's books against x (rvq_lut.cpp)
     const bool use_lut = D == 8 && !use_xmx && rvq_lut_on(q, cap_entries, N, FF, mixed, L.up_off, L.down_off, L.d_row);
     if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
-    else if (use_lut) rvq_lut_gu(q, grp_ptr, grp_start, n_groups, ent_tok, cap_groups, x, gate, up, N, FF, mixed, gu_row, L.up_off, tail);
+    else if (use_lut) rvq_lut_gu(q, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF, mixed, gu_row, L.up_off, tail);
     else
     q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
