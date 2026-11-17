@@ -46,6 +46,17 @@ struct ExpertLayout {
     /// re-packed into Q2_0 (42) as they are read (fmt says 42; a file slice is 28/36 of the blob's).  Empty: none.
     std::vector<char> ptq1_q2;
     bool from_ptq1(int64_t layer) const { return !ptq1_q2.empty() && ptq1_q2[(size_t) layer] != 0; }
+    /// b70-local RVQ2X8 groups (11-17, GB10's GGUF layout: blk.N.ffn_*_exps{,_g1,..}, the router cut to the kept experts in
+    /// group order): every expert has its own width and blob.  Per (layer, expert), n_expert a layer: e_ff (0 = absent,
+    /// the router never picks it), e_bytes (its blob), e_src (3 absolute file offsets of its gate / up / down codes),
+    /// e_gsrc (3 of its gains); per layer, book_src (the layer's books).  bytes[l] is the layer's largest blob.
+    bool mixed = false;
+    std::vector<int32_t> e_ff;
+    std::vector<uint64_t> e_bytes, e_src, e_gsrc, book_src;
+    std::vector<int32_t> n_kept;          ///< per layer: experts present (the router's columns in the file)
+    uint64_t expert_bytes(int64_t layer, int64_t expert) const {
+        return mixed ? e_bytes[(size_t) (layer * n_expert + expert)] : blob_bytes(layer);
+    }
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size

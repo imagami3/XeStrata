@@ -79,6 +79,7 @@ struct NativeExpertLayout {
     // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
     int had_block = 0;
     const float* d_signs = nullptr;
+    bool mixed = false;                 // b70-local: RVQ blobs with per-expert widths (NativeFmt::mixed): n_ff is the layer's widest
 };
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).

@@ -69,6 +69,41 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
         err = "plain model: block " + std::to_string(l) + "'s " + what + " have other shapes";
         return false;
     };
+    // b70-local (11-17): a router cut to the kept experts (GB10's RVQ group layout, [N, n_kept]): its columns padded back to
+    // E, the bias of the absent experts -1e30 so the choice never takes them (their order is the groups', as the experts')
+    auto upload_router_padded = [&](const GgufModel& mm, const std::string& pp, uint64_t NN, uint64_t EE, const float*& w,
+                                    const float*& bias, std::string& e2) {
+        size_t at = 0, atb = 0;
+        const TensorInfo* tw = mm.find(pp + "ffn_gate_inp.weight", &at);
+        const TensorInfo* tb = mm.find(pp + "exp_probs_b.bias", &atb);
+        if (tw == nullptr || tb == nullptr || tw->elements() == NN * EE)
+            return upload_f32(mm, pp + "ffn_gate_inp.weight", NN * EE, w, e2) &&
+                   upload_f32(mm, pp + "exp_probs_b.bias", EE, bias, e2);
+        const uint64_t k = tb->elements();
+        if (tw->type != 0 || tb->type != 0 || k == 0 || k > EE || tw->elements() != NN * k || !mm.in_bounds(*tw, at) ||
+            !mm.in_bounds(*tb, atb)) {
+            e2 = "plain model: " + pp + "ffn_gate_inp.weight / exp_probs_b.bias are not F32 [N, k] / [k] with k <= E";
+            return false;
+        }
+        std::vector<float> hw((size_t) (NN * EE), 0.0f), hb((size_t) EE, -1e30f);
+        std::memcpy(hw.data(), mm.shard(at).tensor_data(*tw), (size_t) (NN * k * 4));
+        std::memcpy(hb.data(), mm.shard(atb).tensor_data(*tb), (size_t) (k * 4));
+        void* dw = nullptr;
+        void* db = nullptr;
+        if (!strata::gpu::alloc_device(&dw, hw.size() * 4) || !strata::gpu::alloc_device(&db, hb.size() * 4)) {
+            e2 = "plain model: no VRAM for " + pp + "'s router";
+            return false;
+        }
+        allocs_.push_back(dw);
+        allocs_.push_back(db);
+        if (!strata::gpu::copy(dw, hw.data(), hw.size() * 4) || !strata::gpu::copy(db, hb.data(), hb.size() * 4)) {
+            e2 = "plain model: uploading " + pp + "'s router failed";
+            return false;
+        }
+        w = (const float*) dw;
+        bias = (const float*) db;
+        return true;
+    };
     b.swa = s.swa[(size_t) l];
     b.extent = b.swa ? s.n_swa : s.rel_extent;
     b.n_aq = l == 0 ? 0 : (b.swa ? 1 : 3);
@@ -85,8 +120,7 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
         !upload_f32(m, p + "ffn_post_conv.weight", N * (uint64_t) KT, b.ffn_post_conv, err) ||
         !upload_f32(m, p + "ffn_res_query.weight", N, b.ffn_rq, err) ||
         !upload_f32(m, p + "ffn_norm.weight", N, b.ffn_norm, err) ||
-        !upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err) ||
-        !upload_f32(m, p + "exp_probs_b.bias", E, b.router_b, err))
+        !upload_router_padded(m, p, N, E, b.router, b.router_b, err))
         return false;
     if (b.swa) {
         if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err)) return false;

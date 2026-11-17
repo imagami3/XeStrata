@@ -916,8 +916,9 @@ bool PlainModel::open_experts(std::string& err) {
     // 100 GiB of host memory registered and 14 GiB left, 2 GiB device allocations were refused or the device was lost;
     // with 85 GiB and 29 GiB left, 24 GiB of them ran (2026-10-19).  So the room there counts the VRAM as well (every
     // Level Zero GPU's, with a layer split).  The root opens the tier; the later stages read from it.
+    if (lay.mixed) opt_.adapt_every = 0;   // b70-local RVQ groups: every expert its own slot, nothing to swap
     if (root_ == this) {
-        in_ram_ = !opt_.mmap_experts;
+        in_ram_ = !opt_.mmap_experts && !lay.mixed;   // b70-local RVQ groups: read from the file into VRAM only
         if (in_ram_) {
             detail::HostMemory hm;
             const uint64_t need = lay.total + lay.max_blob;
@@ -1031,6 +1032,26 @@ bool PlainModel::open_experts(std::string& err) {
     for (int64_t l : moe_local_) per_layer_b += lay.bytes[(size_t) l];
     int64_t q = per_layer_b > 0 ? (int64_t) (room / per_layer_b) : 0;
     q = std::min<int64_t>(q, E);
+    // b70-local RVQ groups: one slot per present expert at its own size, all of them resident (no CPU path)
+    std::vector<std::pair<int64_t, int32_t>> mixed_who;
+    std::vector<int64_t> mixed_bytes;
+    uint64_t mixed_total = 0;
+    if (lay.mixed) {
+        for (int64_t l : moe_local_)
+            for (int32_t e = 0; e < (int32_t) E; ++e)
+                if (const uint64_t b = lay.e_bytes[(size_t) (l * E + e)]; lay.e_ff[(size_t) (l * E + e)] > 0) {
+                    mixed_who.emplace_back(l, e);
+                    mixed_bytes.push_back((int64_t) b);
+                    mixed_total += b;
+                }
+        if (mixed_total > room) {
+            err = "plain model: this stage's RVQ experts need " + std::to_string(mixed_total >> 20) + " MiB of VRAM, " +
+                  std::to_string(room >> 20) + " MiB is left: move the layer split";
+            return false;
+        }
+        q = E;
+        per_layer_b = LS > 0 ? (mixed_total + (uint64_t) E - 1) / (uint64_t) E : 0;   // the tier's bytes, as q x this
+    }
     if (opt_.expert_slots >= 0) q = std::min<int64_t>(q, opt_.expert_slots / std::max<int64_t>(L, 1));
     if (q < 1 && LS > 0) {
         err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) + " MiB free)";
@@ -1042,7 +1063,8 @@ bool PlainModel::open_experts(std::string& err) {
     if (level_zero_) strata::platform::make_free_ram(per_layer_b * (uint64_t) q + (2ull << 30));
     std::vector<int64_t> slot_bytes;
     free_.assign((size_t) L, {});
-    for (int64_t i = 0; i < q; ++i)   // the layers in turn: slot s is moe_local_[s % LS]'s (prompt_borrow takes the last)
+    if (lay.mixed) slot_bytes = mixed_bytes;
+    for (int64_t i = 0; i < q && !lay.mixed; ++i)   // the layers in turn: slot s is moe_local_[s % LS]'s (prompt_borrow takes the last)
         for (int64_t l : moe_local_) {
             free_[(size_t) l].push_back((int32_t) slot_bytes.size());
             slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
@@ -1058,7 +1080,8 @@ bool PlainModel::open_experts(std::string& err) {
         prompt_dev_T_ = opt_.prompt_chunk;
     }
     if (prompt_dev_ == nullptr && q == E && opt_.prompt_chunk > 0 && prompt_host_ != nullptr) {
-        const uint64_t left = room - per_layer_b * (uint64_t) q;
+        const uint64_t used = lay.mixed ? mixed_total : per_layer_b * (uint64_t) q;
+        const uint64_t left = room > used ? room - used : 0;
         for (int64_t T = opt_.prompt_chunk; T >= 16; T /= 2) {
             uint64_t db = 0, hb = 0;
             prompt_carve(T, pb_, nullptr, nullptr, db, hb);
@@ -1173,15 +1196,39 @@ bool PlainModel::open_experts(std::string& err) {
         std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
                      (long long) filled);
     }
+    if (lay.mixed) {   // b70-local RVQ groups: every present expert into its own slot, on several threads
+        std::atomic<size_t> next{0};
+        std::atomic<bool> bad{false};
+        auto work = [&]() {
+            const OnDevice on(dev_);
+            uint8_t* buf = nullptr;
+            if (!strata::gpu::alloc_host(&buf, (size_t) lay.max_blob)) { bad = true; return; }
+            for (size_t i; !bad && (i = next.fetch_add(1)) < mixed_who.size();)
+                if (!src_->copy_blob(mixed_who[i].first, mixed_who[i].second, buf) ||
+                    !strata::gpu::copy(cache_.device_slot((int32_t) i), buf, (size_t) mixed_bytes[i]))
+                    bad = true;
+            strata::gpu::free(buf);
+        };
+        std::vector<std::thread> pool;
+        for (int i = 1; i < 8; ++i) pool.emplace_back(work);
+        work();
+        for (auto& t : pool) t.join();
+        if (bad) { err = "plain model: an RVQ expert could not be read for the VRAM tier"; return false; }
+        for (size_t i = 0; i < mixed_who.size(); ++i) res_[(size_t) (mixed_who[i].first * E + mixed_who[i].second)] = (int32_t) i;
+        std::fprintf(stderr, "strata plain: RVQ groups: %zu experts resident, %.2f GiB\n", mixed_who.size(),
+                     (double) mixed_total / 1073741824.0);
+    }
     // without a profile each layer's tier takes its first experts (the adaptive tier moves them), so that the RAM copy
     // below leaves out what VRAM holds
-    if (!in_ram_ && !opt_.mmap_experts && opt_.profile.empty())
+    if (!in_ram_ && !opt_.mmap_experts && opt_.profile.empty() && !lay.mixed)
         for (int64_t l : moe_local_)
             for (int32_t e = 0; e < (int32_t) E && !free_[(size_t) l].empty(); ++e)
                 if (res_[(size_t) (l * E + e)] < 0 && !fill_slot(l, e, err)) return false;
     // the slots the prompt path lends for its longest chunk (prompt_borrow): their experts are kept in RAM too
     lend_from_ = -1;
-    if (opt_.prompt_chunk > 0 && prompt_dev_ == nullptr && n_slots_ > 1) {
+    if (lay.mixed && opt_.prompt_chunk > 0 && prompt_dev_ == nullptr)
+        std::fprintf(stderr, "strata plain: RVQ groups: no VRAM for the prompt's buffers beside the experts\n");
+    if (opt_.prompt_chunk > 0 && prompt_dev_ == nullptr && n_slots_ > 1 && !lay.mixed) {
         uint64_t db = 0, hb = 0;
         prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
         const uint64_t* off = cache_.slot_offsets();
@@ -1247,7 +1294,7 @@ void PlainModel::pinned_split() {
 // (2026-10-19).
 void PlainModel::finish_experts() {
     const int64_t E = spec_.n_expert;
-    if (!in_ram_ && !opt_.mmap_experts) {
+    if (!in_ram_ && !opt_.mmap_experts && !k::cpu::expert_layout().mixed) {   // RVQ groups: all resident, no RAM copy
         auto* file = static_cast<FileExpertSource*>(src_);
         std::vector<std::pair<int32_t, int32_t>> held, others;
         std::vector<int32_t> slots;

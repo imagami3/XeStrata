@@ -54,6 +54,10 @@ struct NativeFmt {
     bool had_gu = false, had_d = false;
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
+    /// b70-local RVQ2X8 with per-expert widths (11-17): each blob starts with a 256-byte header (int32 n_ff of that
+    /// expert), then its gate / up / down codes, gains and the layer's books at offsets derived from that width
+    /// (rvq_mixed_*); n_ff here is the layer's widest expert (the kernels' grid and scratch).
+    bool mixed = false;
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another

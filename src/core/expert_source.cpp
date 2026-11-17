@@ -880,7 +880,12 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             return false;
         }
         uint64_t at = 0;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
+        for (int64_t layer = 0; layer < n_layers && layout.mixed; ++layer) {   // b70-local RVQ groups: per-expert blobs
+            layer_offsets[(size_t) layer] = layout.offset[(size_t) layer];
+            layer_blob_bytes[(size_t) layer] = layout.bytes[(size_t) layer];
+        }
+        if (layout.mixed) at = want;
+        for (int64_t layer = 0; layer < n_layers && !layout.mixed; ++layer) {
             const size_t i = (size_t) layer;
             const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
@@ -1104,6 +1109,30 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
 bool FileExpertSource::open_gguf(std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if (lay.mixed) {   // b70-local RVQ groups: one file, each blob assembled by copy_from_files from the e_* tables
+        Map m;
+        const int fd = open_read_only(gguf_);
+        uint64_t size = 0;
+        if (fd < 0 || !file_bytes(fd, size) || size == 0) {
+            if (fd >= 0) close_file(fd);
+            err = "FileExpertSource: cannot open " + gguf_;
+            return false;
+        }
+        const uint8_t* view = map_read_only(fd, size);
+        if (view == nullptr) { close_file(fd); err = "FileExpertSource: cannot map " + gguf_; return false; }
+        m.fd = fd;
+        m.bytes = size;
+        m.base = view;
+        maps_.push_back(m);
+        paths_.push_back(gguf_);
+        role_ptr_.assign((size_t) (3 * n_layers_), view);
+        role_bytes_.assign((size_t) (3 * n_layers_), 0);
+        role_file_.assign((size_t) (3 * n_layers_), 0);
+        base_ = view;
+        warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+        for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+        return true;
+    }
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
@@ -1158,6 +1187,37 @@ bool FileExpertSource::open_gguf(std::string& err) {
 
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    if (const auto& lay = strata::kernels::cpu::expert_layout(); lay.mixed) {
+        // b70-local RVQ groups: [256-byte header: int32 ff][gate codes][up codes][down codes][f16 gains gate|up|down][books]
+        const size_t e = (size_t) (layer * n_expert_ + expert);
+        const int64_t ff = lay.e_ff[e];
+        if (ff <= 0) return false;   // absent: the router never picks it
+        const uint64_t N = (uint64_t) lay.fmt[(size_t) layer].n_embd, gu_row = N / 8 * 2;
+        const uint64_t len[3] = {(uint64_t) ff * gu_row, (uint64_t) ff * gu_row, N * ((uint64_t) ff / 8 * 2)};
+        const uint64_t glen[3] = {2 * (uint64_t) ff, 2 * (uint64_t) ff, 2 * N};
+        const Map& m = maps_.front();
+        auto rd = [&](uint8_t* to, uint64_t off, uint64_t n) {
+            if (off > m.bytes || n > m.bytes - off) return false;
+#if !defined(_WIN32)
+            uint64_t done = 0;
+            while (done < n) {
+                const ssize_t r = ::pread(m.fd, to + done, (size_t) (n - done), (off_t) (off + done));
+                if (r <= 0) break;
+                done += (uint64_t) r;
+            }
+            if (done == n) return true;
+#endif
+            std::memcpy(to, m.base + off, (size_t) n);
+            return true;
+        };
+        std::memset(dst, 0, 256);
+        const int32_t ff32 = (int32_t) ff;
+        std::memcpy(dst, &ff32, 4);
+        uint64_t at = 256;
+        for (int r = 0; r < 3; ++r) { if (!rd(dst + at, lay.e_src[3 * e + (size_t) r], len[r])) return false; at += len[r]; }
+        for (int r = 0; r < 3; ++r) { if (!rd(dst + at, lay.e_gsrc[3 * e + (size_t) r], glen[r])) return false; at += glen[r]; }
+        return rd(dst + at, lay.book_src[(size_t) layer], 2 * 256 * 8 * 4);
+    }
     if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
         if (read_direct(&f, 1)) return true;
@@ -3613,6 +3673,102 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
         L.max_blob = 0;
         uint64_t at = 0;
         for (int64_t l = 0; l < n_layers; ++l) {
+            // b70-local (11-17): RVQ2X8 groups in GB10's layout - blk.N.ffn_{gate,up,down}_exps{,_g1,_g2,..}.weight, one
+            // width and expert count a group, the router cut to the kept experts in group order: expert e of the layer is
+            // the e-th kept one (absent past the last group); every expert gets its own blob (header + codes + gains + books)
+            {
+                const std::string bb = "blk." + std::to_string(moe_blocks[(size_t) l]);
+                size_t s0 = 0, s1 = 0;
+                const strata::TensorInfo* g0 = model.find(bb + ".ffn_gate_exps.weight", &s0);
+                const strata::TensorInfo* g1 = model.find(bb + ".ffn_gate_exps_g1.weight", &s1);
+                if (g0 != nullptr && g0->type == 150 && g0->shape.size() == 3 &&
+                    (g1 != nullptr || g0->shape[2] != (uint64_t) n_expert)) {
+                    const size_t NLE = (size_t) (n_layers * n_expert);
+                    if (!L.mixed) {
+                        L.mixed = true;
+                        L.e_ff.assign(NLE, 0);
+                        L.e_bytes.assign(NLE, 0);
+                        L.e_src.assign(3 * NLE, 0);
+                        L.e_gsrc.assign(3 * NLE, 0);
+                        L.book_src.assign((size_t) n_layers, 0);
+                        L.n_kept.assign((size_t) n_layers, 0);
+                    }
+                    constexpr uint64_t D = 8;
+                    const uint64_t gu_row = (uint64_t) n_embd / D * 2, book_bytes = 2 * 256 * D * 4;
+                    int64_t idx = 0, ffmax = 0;
+                    uint64_t bmax = 0, lay_bytes = 0;
+                    for (int g = 0; g < 16; ++g) {
+                        const std::string sfx = g == 0 ? std::string() : "_g" + std::to_string(g);
+                        const strata::TensorInfo* tt[3] = {};
+                        const strata::TensorInfo* tg[3] = {};
+                        size_t sh[3] = {}, shg[3] = {};
+                        for (int r = 0; r < 3; ++r) {
+                            tt[r] = model.find(bb + ".ffn_" + roles[r] + "_exps" + sfx + ".weight", &sh[r]);
+                            tg[r] = model.find(bb + ".ffn_" + roles[r] + "_exps" + sfx + ".rvq_gain", &shg[r]);
+                        }
+                        if (tt[0] == nullptr) break;
+                        const uint64_t k = tt[0]->shape.size() == 3 ? tt[0]->shape[1] : 0, Eg = tt[0]->shape.size() == 3 ? tt[0]->shape[2] : 0;
+                        const uint64_t rows[3] = {k, k, (uint64_t) n_embd}, cols[3] = {(uint64_t) n_embd, (uint64_t) n_embd, k};
+                        for (int r = 0; r < 3; ++r) {
+                            if (tt[r] == nullptr || tt[r]->type != 150 || tt[r]->shape.size() != 3 || tt[r]->shape[0] != cols[r] ||
+                                tt[r]->shape[1] != rows[r] || tt[r]->shape[2] != Eg || !model.in_bounds(*tt[r], sh[r]) ||
+                                tg[r] == nullptr || tg[r]->type != 1 || tg[r]->shape.size() != 2 || tg[r]->shape[0] != rows[r] ||
+                                tg[r]->shape[1] != Eg || !model.in_bounds(*tg[r], shg[r]) || sh[r] != 0 || shg[r] != 0 || k % D != 0) {
+                                err = "experts from the GGUF: " + bb + " group " + std::to_string(g) + "'s " + roles[r] +
+                                      " tensors are not RVQ2X8 [" + std::to_string(cols[r]) + ", " + std::to_string(rows[r]) +
+                                      ", E] with F16 gains in the first shard";
+                                return false;
+                            }
+                        }
+                        if (idx + (int64_t) Eg > n_expert) { err = "experts from the GGUF: " + bb + " has more experts than " + std::to_string(n_expert); return false; }
+                        const uint64_t per[3] = {k * gu_row, k * gu_row, (uint64_t) n_embd * (k / D * 2)};
+                        const uint64_t blob = (256 + 2 * k * gu_row + (uint64_t) n_embd * (k / D * 2) + 2 * (2 * k + (uint64_t) n_embd) + book_bytes + 255) & ~(uint64_t) 255;
+                        const strata::GgufFile& file = model.shard(0);
+                        for (uint64_t i = 0; i < Eg; ++i) {
+                            const size_t e = (size_t) (l * n_expert + idx + (int64_t) i);
+                            L.e_ff[e] = (int32_t) k;
+                            L.e_bytes[e] = blob;
+                            for (int r = 0; r < 3; ++r) {
+                                L.e_src[3 * e + (size_t) r] = file.data_start() + tt[r]->offset + i * per[r];
+                                L.e_gsrc[3 * e + (size_t) r] = file.data_start() + tg[r]->offset + i * 2 * rows[r];
+                            }
+                        }
+                        idx += (int64_t) Eg;
+                        ffmax = std::max<int64_t>(ffmax, (int64_t) k);
+                        bmax = std::max(bmax, blob);
+                        lay_bytes += blob * Eg;
+                    }
+                    size_t sb = 0;
+                    const strata::TensorInfo* tbk = model.find(bb + ".ffn_exps.rvq_book", &sb);
+                    if (tbk == nullptr || tbk->type != 0 || tbk->shape.size() != 3 || tbk->shape[0] != D || tbk->shape[1] != 256 ||
+                        tbk->shape[2] != 2 || sb != 0 || !model.in_bounds(*tbk, sb)) {
+                        err = "experts from the GGUF: " + bb + ".ffn_exps.rvq_book is not F32 [8, 256, 2] in the first shard";
+                        return false;
+                    }
+                    if (idx < 8) { err = "experts from the GGUF: " + bb + " keeps fewer experts than the router picks"; return false; }
+                    L.book_src[(size_t) l] = model.shard(0).data_start() + tbk->offset;
+                    L.n_kept[(size_t) l] = (int32_t) idx;
+                    NativeFmt& f = L.fmt[(size_t) l];
+                    if (!native_fmt(150, 150, n_embd, ffmax, f, err, 150)) { err.insert(0, "experts from the GGUF: " + bb + ": "); return false; }
+                    f.mixed = true;
+                    f.tail_off = 256;   // nonzero: the RVQ kernel's check (the mixed kernel reads each blob's header instead)
+                    f.bytes = (size_t) bmax;
+                    L.tail.emplace_back();
+                    L.tail_raw.emplace_back();
+                    L.tail_raw_bytes.push_back(0);
+                    const std::string& path = model.shard(0).path();
+                    const size_t cut = path.find_last_of("/\\");
+                    for (int r = 0; r < 3; ++r) {
+                        L.gguf_off[(size_t) (3 * l + r)] = model.shard(0).data_start() + g0->offset;
+                        L.gguf_file[(size_t) (3 * l + r)] = cut == std::string::npos ? path : path.substr(cut + 1);
+                    }
+                    L.offset[(size_t) l] = at;
+                    L.bytes[(size_t) l] = bmax;
+                    L.max_blob = std::max<uint64_t>(L.max_blob, bmax);
+                    at += lay_bytes;
+                    continue;
+                }
+            }
             const strata::TensorInfo* t[3] = {};
             size_t shard[3] = {};
             // b70-local: an RVQ layer (types 150/151) may have pruned experts: its width is the gate tensor's rows
@@ -3749,6 +3905,7 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
     static const char* roles[3] = {"gate", "up", "down"};
+    if (lay.mixed) return true;   // b70-local RVQ groups: checked tensor by tensor in expert_layout_from_gguf
     if (lay.gguf_off.size() != (size_t) (3 * lay.n_layers)) {
         err = "native_experts.txt has no GGUF offsets (a pack older than v2): repack it with tools/iq_pack.py";
         return false;

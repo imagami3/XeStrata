@@ -2830,6 +2830,10 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     const int64_t N = L.n_embd, FF = L.n_ff;
     const size_t tail = L.tail_off, book_off = L.tail_off + 2 * (size_t) (2 * FF + N);
     constexpr int kRows = 8;
+    // b70-local, per-expert widths (L.mixed): a blob is [256-byte header: int32 ff][gate ff rows][up ff rows][down N rows of
+    // ff/D codes][f16 gains 2ff+N][books]; FF (the layer's widest) sizes the grid and the scratch, rows past ff are skipped
+    const bool mixed = L.mixed;
+    const size_t gu_row = L.gu_row;   // n_embd / D codes, the same for every width
     q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -2840,9 +2844,22 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         const int64_t r = is_up ? row - FF : row;
         for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-            const auto* cr = (const uint16_t*) (blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row);
-            const float gain = (float) ((const sycl::half*) (blob + tail))[(is_up ? FF : 0) + r];
-            const float* book = (const float*) (blob + book_off);
+            const uint16_t* cr;
+            float gain;
+            const float* book;
+            if (mixed) {
+                const int64_t ff = *(const int32_t*) blob;
+                if (r >= ff) continue;
+                const uint8_t* b = blob + 256;
+                const size_t up_o = gu_row * (size_t) ff, dn_o = 2 * up_o, d_row = (size_t) ff / D * 2, tl = dn_o + d_row * (size_t) N;
+                cr = (const uint16_t*) (b + (is_up ? up_o : 0) + (size_t) r * gu_row);
+                gain = (float) ((const sycl::half*) (b + tl))[(is_up ? ff : 0) + r];
+                book = (const float*) (b + tl + 2 * (size_t) (2 * ff + N));
+            } else {
+                cr = (const uint16_t*) (blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row);
+                gain = (float) ((const sycl::half*) (blob + tail))[(is_up ? FF : 0) + r];
+                book = (const float*) (blob + book_off);
+            }
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; e += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - e);
@@ -2873,16 +2890,30 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         if (r >= N) return;
         for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-            const auto* cr = (const uint16_t*) (blob + L.down_off + (size_t) r * L.d_row);
-            const float gain = (float) ((const sycl::half*) (blob + tail))[2 * FF + r];
-            const float* book = (const float*) (blob + book_off);
+            const uint16_t* cr;
+            float gain;
+            const float* book;
+            int64_t K = FF;
+            if (mixed) {
+                const int64_t ff = *(const int32_t*) blob;
+                const uint8_t* b = blob + 256;
+                const size_t dn_o = 2 * gu_row * (size_t) ff, d_row = (size_t) ff / D * 2, tl = dn_o + d_row * (size_t) N;
+                cr = (const uint16_t*) (b + dn_o + (size_t) r * d_row);
+                gain = (float) ((const sycl::half*) (b + tl))[2 * ff + r];
+                book = (const float*) (b + tl + 2 * (size_t) (2 * ff + N));
+                K = ff;
+            } else {
+                cr = (const uint16_t*) (blob + L.down_off + (size_t) r * L.d_row);
+                gain = (float) ((const sycl::half*) (blob + tail))[2 * FF + r];
+                book = (const float*) (blob + book_off);
+            }
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int en = e0; en < e1; en += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - en);
                 const float* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = h + (size_t) (j < n ? en + j : en) * FF;
                 float s[kEntriesPass];
-                rvq_dot_multi<D>(sg, cr, book, xs, n, FF, lane, s);
+                rvq_dot_multi<D>(sg, cr, book, xs, n, K, lane, s);
                 if (lane == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) ent_dst[en + j] * N + r] = s[j] * gain;
             }
