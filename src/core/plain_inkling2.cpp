@@ -222,7 +222,7 @@ bool PlainModel::load_inkling2(std::string& err) {
     const uint64_t K = (uint64_t) s.n_expert_used, NH = (uint64_t) s.n_head, HD = NH * (uint64_t) s.key_length;
     const uint64_t KV = (uint64_t) KVW, R = NH * (uint64_t) s.n_rel, TAPS = (uint64_t) (s.n_shortconv * nkv_);
     hand_w_ = (1 + i_nblocks_) * N;   // a stage hands on the running row and the blocks
-    if (!imapped(T * UN * 4, (void**) &h_emb_, (void**) &m_emb_) ||
+    if (!imapped(T * UN * 4, (void**) &h_emb_, (void**) &m_emb_) || !imapped(T * 4, (void**) &h_raw_, (void**) &m_raw_) ||
         !imapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !imapped(T * (NH + (uint64_t) nkv_) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
         !imapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||
@@ -431,6 +431,7 @@ bool PlainModel::record_window_inkling2(int T, strata::gpu::Stream cs, std::stri
     if (first()) {   // the embeddings, RMS-normed with token_embd_norm
         k::copy_from_mapped(mix_, m_emb_, (int64_t) T * N, cs);
         k::native_qsa_rms_norm_weighted(mix_, i_tok_norm_, x_, (int) N, T, eps, cs);
+        k::inkling2_raw_rows(x_, mix_, m_raw_, N, T, cs);   // b70-local: a picture's rows as they came (no norm)
     } else {         // the running row, then the blocks, as the stage before handed them on
         k::copy_from_mapped(x_, m_in_, (int64_t) T * N, cs);
         for (int64_t j = 0; j < i_nblocks_; ++j)

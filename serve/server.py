@@ -2466,6 +2466,10 @@ class Vision:
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
         self.label = vision_label(cfg)
+        # b70-local: the template's image token and the marker right before it, when they are not Qwen's
+        # (Inkling 2: "image_pad": "<|unused_200054|>", "image_start": "<|content_image|>")
+        self.image_pad = cfg.get("image_pad") or IMAGE_PAD
+        self.image_start = cfg.get("image_start") or VISION_START
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
         self.proc: subprocess.Popen | None = None
@@ -4120,8 +4124,9 @@ class Service:
                     raise ValueError("images are unavailable: " + self.vision_error)
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            pad_text = getattr(self.vision, "image_pad", IMAGE_PAD)
+            pad = self.tok.encode(pad_text, parse_special=True)[0]
+            start = self.tok.encode(getattr(self.vision, "image_start", VISION_START), parse_special=True)[0]
 
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
@@ -4145,7 +4150,7 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(pad_text, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:

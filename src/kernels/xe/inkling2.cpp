@@ -79,6 +79,16 @@ void inkling2_attn_res(const float* blocks, int64_t block_stride, int n_blocks, 
     sync_if_needed(stream, event, "inkling2_attn_res");
 }
 
+void inkling2_raw_rows(float* x, const float* src, const int32_t* raw, int64_t n_embd, int n_tokens, void* stream) {
+    if (n_tokens <= 0) return;
+    const int64_t N = n_embd;
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n_tokens * (size_t) N), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        if (raw[i / N] != 0) x[i] = src[i];
+    });
+    sync_if_needed(stream, event, "inkling2_raw_rows");
+}
+
 void inkling2_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* y,
                    int64_t n_channels, int n_taps, float scale, int n_tokens, void* stream) {
     if (n_tokens <= 0 || n_channels <= 0) return;

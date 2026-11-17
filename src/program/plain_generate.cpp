@@ -225,7 +225,7 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
 
 static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
                        const std::vector<int32_t>& eos, const std::string& profile_save, double save_min,
-                       ConversationCache& cache) {
+                       ConversationCache& cache, int32_t img_token) {
     // the reader thread outlives this function (it is detached and ends with the process), so what it shares is
     // owned by both
     struct StdinShared {
@@ -342,15 +342,25 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             continue;
         }
-        if (line.rfind("GEN ", 0) != 0) {
+        // b70-local: GENI <max_new> [keys] <embeddings file> <ids> (Inkling 2's vision, --vision): the file holds
+        // strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order, each
+        // picture's rows for its run of n image tokens
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (line.rfind("GEN ", 0) != 0 && !geni) {
             const std::string head = line.substr(0, line.find(' '));
-            std::printf("ERR %s is not available for %s (this engine takes GEN, STOP and QUIT)\n", head.c_str(),
+            std::printf("ERR %s is not available for %s (this engine takes GEN, GENI, STOP and QUIT)\n", head.c_str(),
                         arch.c_str());
             std::fflush(stdout);
             continue;
         }
+        if (geni && img_token < 0) {
+            std::printf("ERR this engine was started without --vision (or %s takes no pictures)\n", arch.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+        std::vector<uint64_t> img_keys;   // the server's key of each picture (img_keys=<hex>,..), for the cache
         strata::kernels::SamplerParams sp;   // greedy unless the request sets a temperature
         sp.greedy = true;
         sp.temperature = 0.0f;
@@ -369,6 +379,20 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (key == "top_k") sp.top_k = (int) std::strtol(val.c_str(), nullptr, 10);
             else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
             else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
+            else if (key == "img_keys")
+                for (const char* q = val.c_str(); *q != '\0';) {
+                    char* e2 = nullptr;
+                    img_keys.push_back(std::strtoull(q, &e2, 16));
+                    if (e2 == q) break;
+                    q = *e2 == ',' ? e2 + 1 : e2;
+                }
+        }
+        std::string emb_path;
+        if (geni && endp != nullptr) {   // the file's name: the first word without '='
+            while (*endp == ' ') ++endp;
+            const char* start = endp;
+            while (*endp != '\0' && *endp != ' ') ++endp;
+            emb_path.assign(start, (size_t) (endp - start));
         }
         sp.greedy = sp.temperature <= 0.0f;
         std::vector<int32_t> ids;
@@ -388,6 +412,70 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::printf("ERR a token id is outside the vocabulary\n");
             std::fflush(stdout);
             continue;
+        }
+        // b70-local: the pictures' rows; `feed` is what the model reads, `ids` from here on what the conversation
+        // cache compares: each image token becomes a negative id from its picture's key and its place in it, so a
+        // conversation with another picture at the same place is not taken for this one
+        const std::vector<int32_t> feed = ids;
+        std::vector<float> img_rows;
+        std::vector<const float*> row_ptr;
+        if (geni) {
+            const int64_t E = model.n_embd();
+            std::string ve;
+            struct Img { int64_t n; size_t off; };
+            std::vector<Img> imgs;
+            std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+            if (!f) ve = "cannot open " + emb_path;
+            while (f && ve.empty()) {
+                int32_t hdr[5];
+                const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                if (got == 0) break;
+                if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || (int64_t) hdr[2] * hdr[3] != hdr[1] ||
+                    hdr[4] != (int32_t) E) {
+                    ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) E) + ")";
+                    break;
+                }
+                const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                img_rows.resize(off + cnt);
+                if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+                imgs.push_back({hdr[1], off});
+            }
+            if (f) std::fclose(f);
+            row_ptr.assign((size_t) n, nullptr);
+            size_t k = 0;
+            for (int64_t i = 0; ve.empty() && i < n;) {
+                if (ids[(size_t) i] != img_token) { ++i; continue; }
+                if (k >= imgs.size()) { ve = "the prompt has more pictures than the embeddings file"; break; }
+                const Img& im = imgs[k];
+                uint64_t key = img_keys.size() == imgs.size() ? img_keys[k] : 0;
+                if (key == 0) {   // no key from the server: the rows themselves (FNV-1a)
+                    key = 1469598103934665603ull;
+                    for (size_t j = 0; j < (size_t) im.n * (size_t) E; ++j) {
+                        uint32_t b;
+                        std::memcpy(&b, &img_rows[im.off + j], 4);
+                        key = (key ^ b) * 1099511628211ull;
+                    }
+                }
+                ++k;
+                for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                    if (i + j >= n || ids[(size_t) (i + j)] != img_token) {
+                        ve = "picture " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                             " rows but fewer image tokens";
+                        break;
+                    }
+                    row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) E;
+                    const uint64_t h = (key ^ ((uint64_t) j * 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+                    ids[(size_t) (i + j)] = -1 - (int32_t) (h >> 34);
+                }
+                i += im.n;
+            }
+            if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more pictures than the prompt";
+            if (ve.empty() && ids.back() < 0) ve = "the prompt cannot end in a picture";
+            if (!ve.empty()) {
+                std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
         }
         // what of the conversation to keep: the common prefix, at least the last prompt token read again (its
         // logits pick the first token); with a recurrent state, all of it or nothing
@@ -462,17 +550,18 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const int64_t acc0 = model.spec_accepted(), off0 = model.spec_drafted();
         bool ok = true;
         int32_t next = -1;
-        bool windows = opt.prompt_chunk <= 0;
+        bool windows = opt.prompt_chunk <= 0 || geni;   // pictures: through the windows (forward reads the rows)
+        model.set_embd_rows(geni ? row_ptr.data() : nullptr, n);
         auto read = [&](int64_t from, int64_t to) {
             if (!windows) {
-                ok = model.prompt(ids.data() + from, to - from, from, out.data(), nullptr, err);
+                ok = model.prompt(feed.data() + from, to - from, from, out.data(), nullptr, err);
                 next = out[0];
                 if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
                 else return;
             }
             for (int64_t p = from; ok && p < to;) {
                 const int w = (int) std::min<int64_t>(opt.max_t, to - p);
-                ok = model.forward(ids.data() + p, w, p, out.data(), nullptr, err);
+                ok = model.forward(feed.data() + p, w, p, out.data(), nullptr, err);
                 p += w;
                 next = out[(size_t) w - 1];
             }
@@ -518,6 +607,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
         }
         if (ok) read(split, n);
+        model.set_embd_rows(nullptr, 0);
         if (!ok) {   // the state is the device's, half written: the next request starts over
             live.clear();
             std::printf("ERR %s\n", err.c_str());
@@ -632,6 +722,7 @@ static void plain_usage(const std::string& arch) {
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the picks and\n"
                  "                       accept the drafts that match it, so settings compare on the same text\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
+                 "  --vision             --serve takes pictures too (GENI; Inkling 2, embeddings from ink2_vision.py)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
@@ -654,7 +745,7 @@ int plain_main(int argc, char** argv) {
     int64_t n_new = 16;
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
-    bool stop_eos = false, serve = false;
+    bool stop_eos = false, serve = false, vision = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
@@ -678,6 +769,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
         else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
         else if (a == "--serve") serve = true;
+        else if (a == "--vision") vision = true;   // b70-local: GENI requests (Inkling 2's pictures)
         else if (a == "--greedy") sp.greedy = true;
         else if (a == "--seed") { sp.seed = std::strtoull(next("--seed"), nullptr, 10); sp.greedy = false; }
         else if (a == "--top-k") sp.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
@@ -820,8 +912,12 @@ int plain_main(int argc, char** argv) {
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
     }
-    if (serve)
-        return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache);
+    if (serve) {
+        // b70-local: Inkling 2's image token (<|unused_200054|>, transformers' Inkling2Config.image_token_id)
+        const int32_t img_token = vision && arch == "inkling2" ? 200054 : -1;
+        return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
+                           img_token);
+    }
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {

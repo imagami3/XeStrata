@@ -103,7 +103,7 @@ PlainModel::~PlainModel() {
     for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (void* p : allocs_) strata::gpu::free(p);
-    for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_, (void*) hand_host_})
+    for (void* p : {(void*) h_emb_, (void*) h_raw_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_, (void*) hand_host_})
         strata::gpu::free(p);
     if (swap_ev_ != nullptr) strata::gpu::event_destroy(swap_ev_);
     if (swap_cs_ != nullptr) strata::gpu::stream_destroy(swap_cs_);
@@ -706,7 +706,7 @@ bool PlainModel::load_qwen(std::string& err) {
     const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp;
     hand_w_ = s.n_embd;
-    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
+    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) || !mapped(T * 4, (void**) &h_raw_, (void**) &m_raw_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + NKV) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
         !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||
@@ -1919,7 +1919,10 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (int t = 0; t < T; ++t) {
         if (tokens[t] < 0 || tokens[t] >= n_vocab_) { err = "plain model: a token is out of the vocabulary"; return false; }
-        if (emb &&
+        const float* row = emb && embd_rows_ != nullptr && pos + t < embd_n_ ? embd_rows_[pos + t] : nullptr;
+        if (emb && h_raw_ != nullptr) h_raw_[t] = row != nullptr ? 1 : 0;
+        if (row != nullptr) std::memcpy(h_emb_ + (size_t) t * N, row, (size_t) N * 4);
+        else if (emb &&
             !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tokens[t] * emb_row_, h_emb_ + (size_t) t * N, N)) {
             err = "plain model: the embedding row could not be dequantized";
             return false;
@@ -1959,6 +1962,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     int si = 0;
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
+        if (st != this) { st->embd_rows_ = embd_rows_; st->embd_n_ = embd_n_; }
         const auto a = std::chrono::steady_clock::now();
         if (!st->stage_forward(tokens, T, pos, hand, err)) return false;
         if (stage_ms && si < 8) {

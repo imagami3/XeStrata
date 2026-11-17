@@ -337,7 +337,7 @@ bool PlainModel::load_glm5(std::string& err) {
     const uint64_t QLR = (uint64_t) s.q_lora_rank, QK = (uint64_t) s.key_length_mla, VD = (uint64_t) s.value_length_mla;
     const uint64_t IH = (uint64_t) s.idx_n_head, FW = (uint64_t) std::max<int64_t>(s.n_ff, s.n_ff_shexp);
     hand_w_ = kHC * s.n_embd;   // a stage hands the four streams on
-    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
+    if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) || !mapped(T * 4, (void**) &h_raw_, (void**) &m_raw_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + 1) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
         !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||

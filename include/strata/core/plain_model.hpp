@@ -118,6 +118,7 @@ public:
     bool load(const PlainOptions& opt, std::string& err);
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
+    int64_t n_embd() const { return spec_.n_embd; }   ///< b70-local: an embedding row's width
     /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
     bool recurrent() const { return !gdn_state_.empty() || ink_; }   // b70-local: Inkling 2 convolution histories
     int64_t max_cells() const { return opt_.max_cells; }
@@ -153,6 +154,10 @@ public:
     void set_sampler(const strata::kernels::SamplerParams& sp);
     /// b70-local: the request's tokens so far (the prompt), for --spec lookup drafts (STRATA_SPEC_LOOKUP)
     void set_context(const int32_t* ids, int64_t n);
+    /// b70-local: a picture's rows (Inkling 2's vision): rows[p] non-null puts that row (n_embd floats, already the
+    /// model's input: no embedding lookup, no embedding norm) at position p < n in place of the token's embedding;
+    /// null rows, or set_embd_rows(nullptr, 0), the tokens' own.  Read by the windows (forward), not by prompt().
+    void set_embd_rows(const float* const* rows, int64_t n) { embd_rows_ = rows; embd_n_ = rows ? n : 0; }
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
@@ -611,6 +616,9 @@ private:
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
     std::vector<std::vector<strata::gpu::Graph*>> msegs_;
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
+    int32_t *h_raw_ = nullptr, *m_raw_ = nullptr;                ///< mapped: T flags, 1: the row is a picture's
+    const float* const* embd_rows_ = nullptr;                    ///< set_embd_rows
+    int64_t embd_n_ = 0;
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens

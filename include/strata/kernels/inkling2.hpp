@@ -17,6 +17,10 @@ namespace strata::kernels {
 /// n_blocks block rows `blocks + b * block_stride` (each [T][N]) and `cur` [T][N], each RMS-normed without a weight
 /// (eps 1e-6); out[q][t] = sum_s softmax_s(normed_s . query_q / sqrt(N)) normed_s.  queries [nq][N] F32;
 /// out [nq][T][N].
+// b70-local: rows t with raw[t] != 0 (a picture's, Inkling 2's vision) are copied from `src` into `x`: they enter the
+// model as the encoder made them, without the token embedding's norm.  raw: mapped, read when the kernel runs.
+void inkling2_raw_rows(float* x, const float* src, const int32_t* raw, int64_t n_embd, int n_tokens, void* stream);
+
 void inkling2_attn_res(const float* blocks, int64_t block_stride, int n_blocks, const float* cur, const float* queries,
                        int nq, float* out, int64_t n_embd, int n_tokens, void* stream);
 
