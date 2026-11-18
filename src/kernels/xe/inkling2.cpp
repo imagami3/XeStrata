@@ -80,35 +80,42 @@ static void inkling2_attn_res_small(const float* blocks, int64_t block_stride, i
                 }
             }
             for (int k = 0; k < PW; ++k) {
+                const int sk = k / (1 + kResQ), jk = k % (1 + kResQ);
+                if (sk >= S || (jk > 0 && jk - 1 >= nq)) continue;   // only the sums the mix reads
                 const float r = sycl::reduce_over_group(sg, acc[k], sycl::plus<float>());
                 if (sg.get_local_linear_id() == 0 && nsg <= WG / 8) red[(size_t) sgi * PW + k] = r;
             }
             sycl::group_barrier(it.get_group());
-            if (lid < PW) {
+            if (lid < PW && lid / (1 + kResQ) < S && (lid % (1 + kResQ) == 0 || lid % (1 + kResQ) - 1 < nq)) {
                 float v = 0.0f;
                 for (int j = 0; j < nsg && j < WG / 8; ++j) v += red[(size_t) j * PW + lid];
                 part[((size_t) t * NC + ch) * PW + lid] = v;
             }
         });
     });
-    const auto ev = qu.parallel_for(sycl::nd_range<1>((size_t) T * nq * NC * WG, WG), [=](sycl::nd_item<1> it) {
+    // the token's partials (NC x S x (1 + nq)) into local memory with one load a work-item, then every sum from there:
+    // read from global memory one after another they cost a load's latency each (~160 a work-item, ~25 us)
+    const auto ev = qu.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lp(sycl::range<1>((size_t) NC * PW), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) T * nq * NC * WG, WG), [=](sycl::nd_item<1> it) {
         const int g = (int) it.get_group(0), ch = g % NC, tq = g / NC, t = tq / nq, qi = tq % nq;
         const int lid = (int) it.get_local_id(0);
+        for (int j = lid; j < NC * PW; j += WG) lp[j] = part[(size_t) t * NC * PW + j];
+        sycl::group_barrier(it.get_group());
         float w[kMaxStates];
         float mx = -INFINITY;
+        float inv_s[kMaxStates];
         for (int s = 0; s < kMaxStates; ++s) {
             if (s >= S) break;
             float ss = 0.0f, dq = 0.0f;
             for (int c = 0; c < NC; ++c) {
-                const float* pp = part + ((size_t) t * NC + c) * PW + s * (1 + kResQ);
-                ss += pp[0];
-                dq += pp[1 + qi];
+                ss += lp[c * PW + s * (1 + kResQ)];
+                dq += lp[c * PW + s * (1 + kResQ) + 1 + qi];
             }
-            const float inv = sycl::rsqrt(ss / (float) N + 1e-6f);
-            w[s] = inv;
-            const float sc = dq * inv * sycl::rsqrt((float) N);
+            inv_s[s] = sycl::rsqrt(ss / (float) N + 1e-6f);
+            const float sc = dq * inv_s[s] * sycl::rsqrt((float) N);
             mx = sycl::fmax(mx, sc);
-            w[s] = sc;   // the score for now; the inverse norm again below
+            w[s] = sc;
         }
         float sum = 0.0f, e[kMaxStates];
         for (int s = 0; s < kMaxStates; ++s) {
@@ -118,9 +125,7 @@ static void inkling2_attn_res_small(const float* blocks, int64_t block_stride, i
         }
         for (int s = 0; s < kMaxStates; ++s) {
             if (s >= S) break;
-            float ss = 0.0f;
-            for (int c = 0; c < NC; ++c) ss += part[((size_t) t * NC + c) * PW + s * (1 + kResQ)];
-            e[s] = e[s] / sum * sycl::rsqrt(ss / (float) N + 1e-6f);
+            e[s] = e[s] / sum * inv_s[s];
         }
         float* o = out + ((int64_t) qi * T + t) * N;
         const int64_t i0 = (int64_t) ch * kResCh;
@@ -132,6 +137,7 @@ static void inkling2_attn_res_small(const float* blocks, int64_t block_stride, i
             }
             o[i] = a;
         }
+        });
     });
     sync_if_needed(stream, ev, "inkling2_attn_res (small)");
 }
