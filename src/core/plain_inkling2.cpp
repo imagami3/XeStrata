@@ -444,9 +444,11 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     glm5_decode_stamp(this, l, 3, cs);
     // ---- the MoE: its residual mix, the norm, the router, the experts, the convolution
     k::inkling2_attn_res(i_blocks_, bstride, (int) (l / B + 1), x_, b.ffn_rq, 1, i_in_, N, T, cs);
+    glm5_decode_stamp(this, l, 6, cs);   // b70-local profile: the MoE input's residual mix done
     k::native_qsa_rms_norm_weighted_q8_1(i_in_, b.ffn_norm, hn_, g_xq_, (int) N, T, eps, cs);
     for (int t0 = 0; t0 < T; t0 += 8)
         k::f32_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
+    glm5_decode_stamp(this, l, 7, cs);   // b70-local profile: the norm and the router's product done
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
     glm5_decode_stamp(this, l, 4, cs);

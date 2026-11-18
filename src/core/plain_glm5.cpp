@@ -531,8 +531,15 @@ void ink_decode_prof_read(const void* model, const std::vector<char>& is_swa, in
         const int kk = l < (int64_t) is_swa.size() && is_swa[(size_t) l] ? 0 : 1;
         for (int i = 0; i < 5; ++i) d.sum[kk][i] += (double) (st[i + 1] - st[i]);
         d.sum[kk][5] += (double) (st[5] - st[0]);
+        if (st[6] > st[3] && st[7] > st[6] && st[4] > st[7]) {   // the router part: residual mix, norm + product, top-k
+            d.dsa[0] += (double) (st[6] - st[3]); d.dsa[1] += (double) (st[7] - st[6]); d.dsa[2] += (double) (st[4] - st[7]);
+            d.dsa_vb += 1;
+        }
         ++d.n[kk];
     }
+    if (d.windows % 64 == 63 && d.dsa_vb > 0)
+        std::fprintf(stderr, "strata decode profile %p router part: residual mix %.0f, norm+product %.0f, top-k+publish %.0f\n",
+                     model, d.dsa[0] / d.dsa_vb, d.dsa[1] / d.dsa_vb, d.dsa[2] / d.dsa_vb);
     if (++d.windows % 64 == 0)
         for (int kk = 0; kk < 2; ++kk)
             if (d.n[kk] > 0)

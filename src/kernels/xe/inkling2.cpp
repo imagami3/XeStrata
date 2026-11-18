@@ -36,10 +36,116 @@ void sync_if_needed(void* stream, const sycl::event& event, const char* what) {
 
 }  // namespace
 
+// b70-local: up to 8 tokens - the residual mix in parallel over the row: a work-group a (token, chunk of 512) sums each
+// state's squares and its dot with each query (one pass over the states, every sum in registers: the state and query
+// loops run to the compile-time bounds), a second kernel a (token, query, chunk) turns the sums into the softmax and
+// writes its chunk of the mix.  One work-group a (token, query) with 2S reductions in turn took up to 183K clock ticks
+// a call on the B70 (11-18, 8 blocks, one token) for 166 KB of reads.
+namespace {
+constexpr int kResCh = 512, kResQ = 3;
+std::mutex res_mu;
+std::vector<std::pair<sycl::queue*, std::pair<float*, size_t>>> res_bufs;
+float* res_scratch(sycl::queue& q, size_t n) {   // kept for the graphs that use it, as att_scratch
+    std::lock_guard<std::mutex> lk(res_mu);
+    for (auto& b : res_bufs)
+        if (b.first == &q && b.second.second >= n) return b.second.first;
+    float* p = sycl::malloc_device<float>(n, q);
+    res_bufs.push_back({&q, {p, n}});
+    return p;
+}
+}  // namespace
+
+static void inkling2_attn_res_small(const float* blocks, int64_t block_stride, int n_blocks, const float* cur,
+                                    const float* queries, int nq, float* out, int64_t N, int T, void* stream) {
+    const int S = n_blocks + 1, NC = (int) ((N + kResCh - 1) / kResCh), PW = kMaxStates * (1 + kResQ);
+    sycl::queue& qu = queue_for(stream);
+    float* part = res_scratch(qu, (size_t) T * NC * PW + 64);
+    qu.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) WG / 8 * PW), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) T * NC * WG, WG), [=](sycl::nd_item<1> it) {
+            const int g = (int) it.get_group(0), t = g / NC, ch = g % NC, lid = (int) it.get_local_id(0);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int sgi = (int) sg.get_group_linear_id(), nsg = (int) sg.get_group_linear_range();
+            float acc[PW];
+            for (int k = 0; k < PW; ++k) acc[k] = 0.0f;
+            const int64_t i0 = (int64_t) ch * kResCh;
+            for (int64_t i = i0 + lid; i < sycl::min(N, i0 + kResCh); i += WG) {
+                float qv[kResQ];
+                for (int qi = 0; qi < kResQ; ++qi) qv[qi] = qi < nq ? queries[(int64_t) qi * N + i] : 0.0f;
+                for (int s = 0; s < kMaxStates; ++s) {
+                    if (s >= S) break;
+                    const float v = s < n_blocks ? blocks[s * block_stride + (int64_t) t * N + i] : cur[(int64_t) t * N + i];
+                    acc[s * (1 + kResQ)] += v * v;
+                    for (int qi = 0; qi < kResQ; ++qi) acc[s * (1 + kResQ) + 1 + qi] += v * qv[qi];
+                }
+            }
+            for (int k = 0; k < PW; ++k) {
+                const float r = sycl::reduce_over_group(sg, acc[k], sycl::plus<float>());
+                if (sg.get_local_linear_id() == 0 && nsg <= WG / 8) red[(size_t) sgi * PW + k] = r;
+            }
+            sycl::group_barrier(it.get_group());
+            if (lid < PW) {
+                float v = 0.0f;
+                for (int j = 0; j < nsg && j < WG / 8; ++j) v += red[(size_t) j * PW + lid];
+                part[((size_t) t * NC + ch) * PW + lid] = v;
+            }
+        });
+    });
+    const auto ev = qu.parallel_for(sycl::nd_range<1>((size_t) T * nq * NC * WG, WG), [=](sycl::nd_item<1> it) {
+        const int g = (int) it.get_group(0), ch = g % NC, tq = g / NC, t = tq / nq, qi = tq % nq;
+        const int lid = (int) it.get_local_id(0);
+        float w[kMaxStates];
+        float mx = -INFINITY;
+        for (int s = 0; s < kMaxStates; ++s) {
+            if (s >= S) break;
+            float ss = 0.0f, dq = 0.0f;
+            for (int c = 0; c < NC; ++c) {
+                const float* pp = part + ((size_t) t * NC + c) * PW + s * (1 + kResQ);
+                ss += pp[0];
+                dq += pp[1 + qi];
+            }
+            const float inv = sycl::rsqrt(ss / (float) N + 1e-6f);
+            w[s] = inv;
+            const float sc = dq * inv * sycl::rsqrt((float) N);
+            mx = sycl::fmax(mx, sc);
+            w[s] = sc;   // the score for now; the inverse norm again below
+        }
+        float sum = 0.0f, e[kMaxStates];
+        for (int s = 0; s < kMaxStates; ++s) {
+            if (s >= S) break;
+            e[s] = sycl::exp(w[s] - mx);
+            sum += e[s];
+        }
+        for (int s = 0; s < kMaxStates; ++s) {
+            if (s >= S) break;
+            float ss = 0.0f;
+            for (int c = 0; c < NC; ++c) ss += part[((size_t) t * NC + c) * PW + s * (1 + kResQ)];
+            e[s] = e[s] / sum * sycl::rsqrt(ss / (float) N + 1e-6f);
+        }
+        float* o = out + ((int64_t) qi * T + t) * N;
+        const int64_t i0 = (int64_t) ch * kResCh;
+        for (int64_t i = i0 + lid; i < sycl::min(N, i0 + kResCh); i += WG) {
+            float a = 0.0f;
+            for (int s = 0; s < kMaxStates; ++s) {
+                if (s >= S) break;
+                a += e[s] * (s < n_blocks ? blocks[s * block_stride + (int64_t) t * N + i] : cur[(int64_t) t * N + i]);
+            }
+            o[i] = a;
+        }
+    });
+    sync_if_needed(stream, ev, "inkling2_attn_res (small)");
+}
+
 void inkling2_attn_res(const float* blocks, int64_t block_stride, int n_blocks, const float* cur, const float* queries,
                        int nq, float* out, int64_t n_embd, int n_tokens, void* stream) {
     if (n_tokens <= 0 || nq <= 0) return;
     if (n_blocks < 0 || n_blocks + 1 > kMaxStates) throw core::DeviceError("inkling2_attn_res: too many blocks");
+    // b70-local: STRATA_INK_RES_SMALL=0 - the one work-group a (token, query) kernel for every window
+    static const bool small_on = [] { const char* v = std::getenv("STRATA_INK_RES_SMALL"); return v == nullptr || v[0] != '0'; }();
+    if (small_on && n_tokens <= 8 && nq <= kResQ) {
+        inkling2_attn_res_small(blocks, block_stride, n_blocks, cur, queries, nq, out, n_embd, n_tokens, stream);
+        return;
+    }
     const int64_t N = n_embd;
     const int S = n_blocks + 1;
     const auto event = queue_for(stream).submit([&](sycl::handler& h) {
