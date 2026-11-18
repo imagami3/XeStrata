@@ -107,6 +107,29 @@ inline float lookup_regs(const V4* w, int nv, const float* T) {
     return acc;
 }
 
+// p[0] + p[stride] + ... + p[(n - 1) * stride] in that order, the loads 8 at a time ahead of their adds: the sums of
+// the partials ran a load's latency an addend (a few work-items an EU to hide it: 60 us for 36 partials of 4.6K rows)
+// b70-local: each entry's blob facts for the sums' kernels, written by the gate/up kernel (one work-item an entry, beside
+// its lookups): the gains and the width, so a sum's work-item reads them at once instead of finding its entry's group
+// and blob one dependent load after another (n_groups, grp_start..., grp_ptr, the header: ~40 us a kernel on the B70)
+struct EntMeta { unsigned long long gains; int32_t ff, pad; };
+// a flat kernel of n work-items in work-groups of 256 (the runtime's own choice for a sycl::range was slower)
+inline size_t flat_n(size_t n) { return (n + WG - 1) / WG * WG; }
+inline float sum_strided(const float* p, size_t stride, int n) {
+    constexpr int U = 8;
+    float s = 0.0f;
+    int c = 0;
+    for (; c + U <= n; c += U) {
+        float v[U];
+        #pragma unroll
+        for (int j = 0; j < U; ++j) v[j] = p[(size_t) (c + j) * stride];
+        #pragma unroll
+        for (int j = 0; j < U; ++j) s += v[j];
+    }
+    for (; c < n; ++c) s += p[(size_t) c * stride];
+    return s;
+}
+
 struct Buf { float* p = nullptr; size_t n = 0; };
 std::mutex buf_mu;
 std::unordered_map<size_t, Buf>& bufs() { static std::unordered_map<size_t, Buf> m; return m; }
@@ -115,7 +138,7 @@ std::unordered_map<size_t, Buf>& bufs() { static std::unordered_map<size_t, Buf>
 // graphs recorded with it
 float* partials(sycl::queue& q, size_t n, int slot) {
     std::lock_guard<std::mutex> lk(buf_mu);
-    Buf& b = bufs()[std::hash<sycl::device>{}(q.get_device()) * 2 + (size_t) slot];
+    Buf& b = bufs()[std::hash<sycl::device>{}(q.get_device()) * 4 + (size_t) slot];
     if (b.n < n) {
         b.p = sycl::malloc_device<float>(n, q);   // an older, smaller one stays allocated for the graphs that use it
         b.n = b.p ? n : 0;
@@ -156,6 +179,9 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
     float* part = partials(q, need, 0);
     if (part == nullptr) throw std::runtime_error("rvq_lut_gu: no partial buffer");
     const size_t nrb = (size_t) ((rows + WG * RPT_GU - 1) / (WG * RPT_GU));
+    EntMeta* meta = reinterpret_cast<EntMeta*>(partials(q, (size_t) cap_entries * 4, 2));
+    if (meta == nullptr) throw std::runtime_error("rvq_lut_gu: no entry buffer");
+    const bool use_meta = cpw == 1 && cap_entries <= WG;
     if (cpw > 1) q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> T(sycl::range<1>(CC * NE), h);
         sycl::local_accessor<float, 1> xs(sycl::range<1>(CI), h);
@@ -222,6 +248,17 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
             const int e0 = grp_start[0], e1 = grp_start[ng];
             const int ch = (int) it.get_group(0), t = (int) it.get_local_id(1);
             const int64_t rb = (int64_t) it.get_group(1) * WG * RPT_GU;
+            if (use_meta && ch == 0 && rb == 0 && t < cap_entries) {
+                EntMeta m{0, 0, 0};
+                if (t >= e0 && t < e1) {
+                    int g = 0;
+                    while (g + 1 < ng && grp_start[g + 1] <= t) ++g;
+                    const View v = view(G, (const uint8_t*) grp_ptr[g]);
+                    m.gains = (unsigned long long) (uintptr_t) v.gains;
+                    m.ff = (int32_t) v.ff;
+                }
+                meta[t] = m;
+            }
             float* Tp = T.get_multi_ptr<sycl::access::decorated::no>().get();
             float* xp = xs.get_multi_ptr<sycl::access::decorated::no>().get();
             const float* book = view(G, (const uint8_t*) grp_ptr[0]).book;   // the layer's (every blob's the same)
@@ -259,28 +296,40 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
     });
     if (h_out != nullptr) {   // b70-local: the sums, their gains and the activation in one kernel, into h [entry][FF]
         const ExpertAct lim = expert_act();
-        return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) FF), [=](sycl::id<1> id) {
-            const int64_t i = (int64_t) id[0], e = i / FF, rr = i % FF;
-            const int ng = *n_groups;
-            if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
-            int g = 0;
-            while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
-            const View v = view(G, (const uint8_t*) grp_ptr[g]);
-            if (rr >= v.ff) return;
-            float sg = 0.0f, su = 0.0f;
-            for (int c = 0; c < nch; ++c) {
-                const float* pc = part + ((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) rows;
-                sg += pc[rr];
-                su += pc[FF + rr];
+        const size_t nt = (size_t) cap_entries * (size_t) FF;
+        return q.parallel_for(sycl::nd_range<1>(flat_n(nt), WG), [=](sycl::nd_item<1> id) {
+            if (id.get_global_id(0) >= nt) return;
+            const int64_t i = (int64_t) id.get_global_id(0), e = i / FF, rr = i % FF;
+            const sycl::half* gains;
+            int64_t ff;
+            if (use_meta) {
+                const EntMeta m = meta[e];
+                ff = m.ff;
+                gains = (const sycl::half*) (uintptr_t) m.gains;
+                if (rr >= ff) return;   // ff 0: not an entry of this window
+            } else {
+                const int ng = *n_groups;
+                if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
+                int g = 0;
+                while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
+                const View v = view(G, (const uint8_t*) grp_ptr[g]);
+                ff = v.ff;
+                gains = v.gains;
+                if (rr >= ff) return;
             }
-            float gg = sg * (float) v.gains[rr], uu = su * (float) v.gains[v.ff + rr];
+            const size_t stride = (size_t) cap_entries * (size_t) rows;
+            const float* p0 = part + (size_t) e * (size_t) rows + (size_t) rr;
+            const float sg = sum_strided(p0, stride, nch), su = sum_strided(p0 + FF, stride, nch);
+            float gg = sg * (float) gains[rr], uu = su * (float) gains[ff + rr];
             if (lim.cg > 0.0f) { h_out[e * FF + rr] = canon::situ_mul(gg, uu, lim.cg, lim.cu); return; }
             swiglu_clamp(gg, uu, lim.lim);
             h_out[e * FF + rr] = (gg / (1.0f + sycl::exp(-gg))) * uu;
         });
     }
-    return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) rows), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], e = i / rows, r = i % rows;
+    const size_t nt = (size_t) cap_entries * (size_t) rows;
+    return q.parallel_for(sycl::nd_range<1>(flat_n(nt), WG), [=](sycl::nd_item<1> id) {
+        if (id.get_global_id(0) >= nt) return;
+        const int64_t i = (int64_t) id.get_global_id(0), e = i / rows, r = i % rows;
         const int ng = *n_groups;
         if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
         int g = 0;
@@ -289,8 +338,7 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
         const bool is_up = r >= FF;
         const int64_t rr = is_up ? r - FF : r;
         if (rr >= v.ff) return;
-        float s = 0.0f;
-        for (int c = 0; c < nch; ++c) s += part[((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) rows + (size_t) r];
+        const float s = sum_strided(part + (size_t) e * (size_t) rows + (size_t) r, (size_t) cap_entries * (size_t) rows, nch);
         (is_up ? up : gate)[(size_t) e * FF + rr] = s * (float) v.gains[(is_up ? v.ff : 0) + rr];
     });
 }
@@ -305,6 +353,9 @@ sycl::event rvq_lut_down(sycl::queue& q, const unsigned long long* grp_ptr, cons
     const size_t need = (size_t) nchg * (size_t) cap_entries * (size_t) N;
     float* part = partials(q, need, 1);
     if (part == nullptr) throw std::runtime_error("rvq_lut_down: no partial buffer");
+    // the entries' facts the gate/up kernel wrote (rvq_lut_gu, on the same terms)
+    const EntMeta* meta = reinterpret_cast<const EntMeta*>(partials(q, (size_t) cap_entries * 4, 2));
+    const bool use_meta = meta != nullptr && lut_cpw() == 1 && cap_entries <= WG;
     const size_t nrb = (size_t) ((N + WG * RPT_D - 1) / (WG * RPT_D));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> T(sycl::range<1>(CC * NE), h);
@@ -348,17 +399,29 @@ sycl::event rvq_lut_down(sycl::queue& q, const unsigned long long* grp_ptr, cons
             }
         });
     });
-    return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) N), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], e = i / N, r = i % N;
+    const size_t nt = (size_t) cap_entries * (size_t) N;
+    return q.parallel_for(sycl::nd_range<1>(flat_n(nt), WG), [=](sycl::nd_item<1> id) {
+        if (id.get_global_id(0) >= nt) return;
+        const int64_t i = (int64_t) id.get_global_id(0), e = i / N, r = i % N;
         const int ng = *n_groups;
-        if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
-        int g = 0;
-        while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
-        const View v = view(G, (const uint8_t*) grp_ptr[g]);
-        const int nc_e = (int) ((v.ff / 8 + CC - 1) / CC), ng_e = (nc_e + cpw - 1) / cpw;
-        float s = 0.0f;
-        for (int c = 0; c < ng_e; ++c) s += part[((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) N + (size_t) r];
-        out[(size_t) ent_dst[e] * N + r] = s * (float) v.gains[2 * v.ff + r];
+        int64_t ff;
+        const sycl::half* gains;
+        if (use_meta) {   // the gate/up kernel's facts of the entry (rvq_lut_gu)
+            const EntMeta m = meta[e];
+            ff = m.ff;
+            gains = (const sycl::half*) (uintptr_t) m.gains;
+            if (ff <= 0) return;
+        } else {
+            if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
+            int g = 0;
+            while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
+            const View v = view(G, (const uint8_t*) grp_ptr[g]);
+            ff = v.ff;
+            gains = v.gains;
+        }
+        const int nc_e = (int) ((ff / 8 + CC - 1) / CC), ng_e = (nc_e + cpw - 1) / cpw;
+        const float s = sum_strided(part + (size_t) e * (size_t) N + (size_t) r, (size_t) cap_entries * (size_t) N, ng_e);
+        out[(size_t) ent_dst[e] * N + r] = s * (float) gains[2 * ff + r];
     });
 }
 
