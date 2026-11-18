@@ -30,6 +30,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/inkling2.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -275,6 +276,16 @@ bool PlainModel::load_inkling2(std::string& err) {
         err = "plain model: mapped staging allocation failed";
         return false;
     }
+    // b70-local EP: the relay's rows (an owner's: the other GPUs' sums; a helper's: the owner's rows in, its sum out)
+    if (ep_ && (!imapped((uint64_t) (ep_n_ - 1) * T * UN * 4, (void**) &h_rem_, (void**) &m_rem_) ||
+                !imapped(T * UN * 4, (void**) &h_ax_, (void**) &m_ax_) ||
+                !imapped(T * K * 4, (void**) &h_aids_, (void**) &m_aids_) ||
+                !imapped(T * K * 4, (void**) &h_aw_, (void**) &m_aw_) ||
+                !imapped(T * UN * 4, (void**) &h_ay_, (void**) &m_ay_) ||
+                !imapped(64, (void**) &h_ain_, (void**) &m_ain_) || !imapped(64, (void**) &h_aout_, (void**) &m_aout_))) {
+        err = "plain model: the expert relay's mapped buffers";
+        return false;
+    }
     // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 256)
     const size_t xq = std::max(k::native_q8_1_bytes((int) UN, 1), k::native_q8_1_bytes((int) HD, 1)) * (size_t) T;
     auto dev = [&](auto** p, uint64_t bytes) {
@@ -509,9 +520,46 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     }
     if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
     k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
+    if (win_.ep()) {   // b70-local EP: the other GPUs' sums of their experts, in GPU order (the relay's rows)
+        k::wait_flag_ge(win_.dev_flag(), ring, cs);
+        for (int j = 0; j + 1 < ep_n_; ++j) {
+            k::copy_from_mapped(i_o_, m_rem_ + (size_t) j * T * N, (int64_t) T * N, cs);
+            k::add_inplace(moe_out_, i_o_, (int64_t) T * N, cs);
+        }
+    }
     k::inkling2_conv(moe_out_, conv_f, b.ffn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs, snap_f, sst, ns);
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
     glm5_decode_stamp(this, l, 5, cs);
+    return true;
+}
+
+bool PlainModel::record_assist(const PlainModel& own, int T, strata::gpu::Graph** g, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, K = s.n_expert_used;
+    if (!setup_device_plan(err)) return false;
+    if (!win_.device_plan() || !win_.ep()) {
+        err = "plain model: the expert relay needs the device plan on every GPU";
+        return false;
+    }
+    strata::gpu::Stream cs = cs_;
+    if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
+    uint32_t r = 0;
+    for (int64_t l = own.lb_; l < own.le_; ++l) {
+        if (!s.layer_routes(l)) continue;
+        ++r;
+        k::wait_flag_ge(m_ain_, r, cs);
+        k::copy_from_mapped(hn_, m_ax_, (int64_t) T * N, cs);
+        k::copy_i32_from_mapped(ids_, m_aids_, (int64_t) T * K, cs);
+        k::copy_from_mapped(w_, m_aw_, (int64_t) T * K, cs);
+        win_.publish(r, 0, 0, T, hn_, ids_, w_, cs, false);
+        if (!win_.experts(s.moe_index(l), r, 0, 0, T, cs, err)) return false;
+        k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
+        k::doorbell_publish(moe_out_, ids_, w_, (int64_t) T * N, 0, m_ay_, m_aids_, m_aw_, m_aout_, cs);
+    }
+    if (!strata::gpu::end_capture(cs, g)) {
+        err = std::string("plain model: the relay's capture: ") + strata::gpu::last_error();
+        return false;
+    }
     return true;
 }
 

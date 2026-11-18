@@ -65,7 +65,7 @@ public:
     /// Ring `ring` (1-based, the window's publish count): tokens [tb, tb + n) of the token group `grp`.  `x` is the
     /// layer's normed input (n rows of n_embd), `ids` / `w` the router's (n rows of k).
     void publish(uint32_t ring, int grp, int tb, int n, const float* x, const int32_t* ids, const float* w,
-                 strata::gpu::Stream cs);
+                 strata::gpu::Stream cs, bool relay = true);
     /// The experts of MoE layer `layer` for the same ring: parts() rows [tb * k, (tb + n) * k).
     bool experts(int64_t layer, uint32_t ring, int grp, int tb, int n, strata::gpu::Stream cs, std::string& err);
     /// Device (max_t * k, n_embd): the experts' outputs, row t * k + j for token t's j-th routed expert.
@@ -85,6 +85,17 @@ public:
     /// device residency table (n_layers * n_expert slots), `d_slot_off` the slots' byte offsets (or null).
     bool set_device_plan(const int32_t* d_res, const unsigned long long* d_slot_off, std::string& err);
     bool device_plan() const { return d_res_ != nullptr; }
+    /// b70-local expert parallelism (STRATA_INK_EP): the device plan leaves out the experts this GPU does not hold,
+    /// and publish (relay) also hands x, ids and w to the host through the doorbell, for the GPUs that hold them
+    void set_ep(bool on);
+    bool ep() const { return ep_; }
+    // the relay's view (EP): the published rows and the flag the window's graph waits on for the other GPUs' sums
+    const float* host_x() const { return h_x_; }
+    const int32_t* host_ids() const { return h_ids_; }
+    const float* host_w() const { return h_w_; }
+    const volatile uint32_t* host_seq() const { return h_seq_; }
+    volatile uint32_t* host_flag() const { return h_flag_; }
+    const uint32_t* dev_flag() const { return m_flag_; }
 
 private:
     static void publish_plan(void* ctx);
@@ -98,6 +109,7 @@ private:
     MoeWindowShape sh_;
     MoeWindowTier tier_;
     bool segmented_ = false;
+    bool ep_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
     strata::gpu::Stream copy_ = nullptr;
     uint32_t cur_ring_ = 0;

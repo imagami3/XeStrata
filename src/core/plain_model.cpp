@@ -310,12 +310,39 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     lb_ = 0;
     le_ = at.empty() ? nl : at[0];
     dev_ = at.empty() ? -1 : split_devs_[0];
+    ep_stage_ = 0;
+    ep_n_ = (int) at.size() + 1;
+    ep_ = ep_n_ > 1 && [] { const char* v = std::getenv("STRATA_INK_EP"); return v != nullptr && v[0] == '1'; }();
+    {   // the stages' cumulative shares of each layer's experts
+        std::vector<double> sh((size_t) ep_n_, 1.0);
+        if (const char* v = std::getenv("STRATA_INK_EP_SHARE")) {
+            std::string str(v);
+            size_t i = 0, at = 0;
+            while (at <= str.size() && i < sh.size()) {
+                const size_t c = str.find(',', at);
+                const double x = std::atof(str.substr(at, c == std::string::npos ? std::string::npos : c - at).c_str());
+                if (x > 0) sh[i] = x;
+                ++i;
+                if (c == std::string::npos) break;
+                at = c + 1;
+            }
+        }
+        double tot = 0;
+        for (double x : sh) tot += x;
+        ep_cum_.clear();
+        double run = 0;
+        for (double x : sh) { run += x / tot; ep_cum_.push_back(run); }
+    }
     {
         const OnDevice on(dev_);
         if (!load_arch(err)) return false;
     }
     for (size_t i = 0; i < at.size(); ++i) {
         auto st = std::make_unique<PlainModel>();
+        st->ep_stage_ = (int) i + 1;
+        st->ep_n_ = ep_n_;
+        st->ep_ = ep_;
+        st->ep_cum_ = ep_cum_;
         const int64_t lb = at[i], le = i + 1 < at.size() ? at[i + 1] : nl;
         if (!st->load_stage(opt_, this, lb, le, split_devs_[i + 1], err)) return false;
         next_.push_back(std::move(st));
@@ -1043,9 +1070,16 @@ bool PlainModel::open_experts(std::string& err) {
     std::vector<int64_t> mixed_bytes;
     uint64_t mixed_total = 0;
     if (lay.mixed) {
-        for (int64_t l : moe_local_)
+        // b70-local STRATA_INK_EP: every MoE layer's experts this stage owns (ep_owner), its own layers' and the others'
+        std::vector<int64_t> ls = moe_local_;
+        if (ep_) {
+            ls.clear();
+            for (int64_t l = 0; l < lay.n_layers; ++l) ls.push_back(l);
+        }
+        for (int64_t l : ls)
             for (int32_t e = 0; e < (int32_t) E; ++e)
-                if (const uint64_t b = lay.e_bytes[(size_t) (l * E + e)]; lay.e_ff[(size_t) (l * E + e)] > 0) {
+                if (const uint64_t b = lay.e_bytes[(size_t) (l * E + e)]; lay.e_ff[(size_t) (l * E + e)] > 0 &&
+                                                                          (!ep_ || ep_owner(l, e) == ep_stage_)) {
                     mixed_who.emplace_back(l, e);
                     mixed_bytes.push_back((int64_t) b);
                     mixed_total += b;
@@ -1115,6 +1149,11 @@ bool PlainModel::open_experts(std::string& err) {
     tier.cache_base = n_slots_ > 0 ? cache_.device_slot(0) : nullptr;
     tier.blob = (int64_t) lay.max_blob;
     if (!win_.init(ws, tier, err)) return false;
+    if (ep_ && !(ink_ && lay.mixed)) {
+        std::fprintf(stderr, "strata plain: STRATA_INK_EP is for Inkling 2's RVQ groups: off\n");
+        ep_ = false;
+    }
+    win_.set_ep(ep_);
     win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
 
     disp_.pool = pool_;
@@ -1222,8 +1261,8 @@ bool PlainModel::open_experts(std::string& err) {
         for (auto& t : pool) t.join();
         if (bad) { err = "plain model: an RVQ expert could not be read for the VRAM tier"; return false; }
         for (size_t i = 0; i < mixed_who.size(); ++i) res_[(size_t) (mixed_who[i].first * E + mixed_who[i].second)] = (int32_t) i;
-        std::fprintf(stderr, "strata plain: RVQ groups: %zu experts resident, %.2f GiB\n", mixed_who.size(),
-                     (double) mixed_total / 1073741824.0);
+        std::fprintf(stderr, "strata plain: RVQ groups: %zu experts resident, %.2f GiB (%.2f GiB was free for them)\n",
+                     mixed_who.size(), (double) mixed_total / 1073741824.0, (double) room / 1073741824.0);
     }
     // without a profile each layer's tier takes its first experts (the adaptive tier moves them), so that the RAM copy
     // below leaves out what VRAM holds
@@ -1849,7 +1888,8 @@ bool PlainModel::setup_device_plan(std::string& err) {
     const auto& lay = k::cpu::expert_layout();
     for (int64_t l : moe_local_)
         for (int64_t x = 0; x < E; ++x)   // b70-local RVQ groups: an absent expert (the router never picks it) needs no slot
-            if (res_[(size_t) (l * E + x)] < 0 && !(lay.mixed && lay.e_ff[(size_t) (l * E + x)] == 0)) {
+            if (res_[(size_t) (l * E + x)] < 0 && !(lay.mixed && lay.e_ff[(size_t) (l * E + x)] == 0) &&
+                !(ep_ && ep_owner(l, (int32_t) x) != ep_stage_)) {   // EP: another stage's expert
                 std::fprintf(stderr, "strata plain: device plan off (MoE layer %lld expert %lld has no VRAM slot)\n",
                              (long long) l, (long long) x);
                 return true;
@@ -1935,8 +1975,83 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     return true;
 }
 
+// b70-local EP: one launch of this stage's graph with the other GPUs' shares: their graphs for this stage's layers
+// (record_assist, made once a window size) go first, then this one; for each MoE layer the host copies the published
+// rows to every helper, waits for their sums and hands them to this GPU (flag), which adds them in GPU order
+bool PlainModel::ep_relay(strata::gpu::Graph* g, int T, std::string& err) {
+    std::vector<PlainModel*> hs;
+    for (PlainModel* st : root_->chain())
+        if (st != this) hs.push_back(st);
+    const int key = ep_stage_ << 16 | T;
+    for (PlainModel* h : hs)
+        if (h->assist_.find(key) == h->assist_.end()) {
+            const OnDevice on(h->dev_);
+            strata::gpu::Graph* ag = nullptr;
+            if (!h->record_assist(*this, T, &ag, err)) return false;
+            h->assist_[key] = ag;
+        }
+    const int64_t N = spec_.n_embd, K = spec_.n_expert_used;
+    win_.reset();
+    for (PlainModel* h : hs) {
+        *(volatile uint32_t*) h->h_ain_ = 0;
+        *(volatile uint32_t*) h->h_aout_ = 0;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for (PlainModel* h : hs) {
+        const OnDevice on(h->dev_);
+        if (!strata::gpu::graph_launch(h->assist_[key], h->cs_)) {
+            err = std::string("plain model: the relay's launch: ") + strata::gpu::last_error();
+            return false;
+        }
+        (void) strata::gpu::stream_idle(h->cs_);
+    }
+    if (!strata::gpu::graph_launch(g, cs_)) {
+        err = std::string("plain model: launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    (void) strata::gpu::stream_idle(cs_);
+    int64_t rings = 0;
+    for (int64_t l = lb_; l < le_; ++l) rings += spec_.layer_routes(l) ? 1 : 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto spin = [&](const volatile uint32_t* f, uint32_t v, const char* what) {
+        for (uint32_t n = 0; *f < v; ++n)
+            if ((n & 0xfffff) == 0xfffff && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+                err = std::string("plain model: the expert relay waited 30 s for ") + what;
+                return false;
+            }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return true;
+    };
+    const size_t xb = (size_t) T * (size_t) N * 4, kb = (size_t) T * (size_t) K * 4;
+    for (uint32_t r = 1; r <= (uint32_t) rings; ++r) {
+        if (!spin(win_.host_seq(), r, "this GPU's rows")) return false;
+        for (PlainModel* h : hs) {
+            std::memcpy(h->h_ax_, win_.host_x(), xb);
+            std::memcpy(h->h_aids_, win_.host_ids(), kb);
+            std::memcpy(h->h_aw_, win_.host_w(), kb);
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile uint32_t*) h->h_ain_ = r;
+        }
+        for (size_t j = 0; j < hs.size(); ++j) {
+            if (!spin(hs[j]->h_aout_, r, "a helper GPU's sum")) return false;
+            std::memcpy(h_rem_ + j * (size_t) T * (size_t) N, hs[j]->h_ay_, xb);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        *win_.host_flag() = r;
+    }
+    for (PlainModel* h : hs) {
+        const OnDevice on(h->dev_);
+        if (!strata::gpu::stream_sync(h->cs_)) {
+            err = std::string("plain model: a helper GPU: ") + strata::gpu::last_error();
+            return false;
+        }
+    }
+    return true;
+}
+
 bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
                               const int64_t* layers, int T, std::string& err) {
+    if (win_.ep()) return ep_relay(g, T, err);
     win_.reset();
     const bool seg = win_.segmented();
     if (!strata::gpu::graph_launch(seg ? segs[0] : g, cs_)) {

@@ -203,14 +203,20 @@ bool MoeWindow::set_device_plan(const int32_t* d_res, const unsigned long long* 
     return true;
 }
 
+void MoeWindow::set_ep(bool on) {
+    ep_ = on;
+    if (on && h_ymiss_ != nullptr)   // the rows no GPU of this window's plan computes read as zero (copy_rows_from_mapped)
+        std::memset(h_ymiss_, 0, (size_t) sh_.max_t * (size_t) sh_.k * (size_t) sh_.n_embd * 4);
+}
+
 void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, const int32_t* ids, const float* w,
-                        strata::gpu::Stream cs) {
+                        strata::gpu::Stream cs, bool relay) {
     (void) ring;
     (void) grp;
     using namespace strata::kernels;
     const int64_t N = sh_.n_embd, K = sh_.k;
     last_ids_ = ids + (size_t) tb * K;
-    if (d_res_ == nullptr)   // device_plan: the host is not asked
+    if (d_res_ == nullptr || (ep_ && relay))   // device_plan: the host is not asked (EP: it relays)
         doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
                          m_w_ + (size_t) tb * K, m_seq_, cs);
     if (cpu::expert_layout().native) quantize_q8_1_rows(x, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
@@ -228,11 +234,11 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     if (d_res_ != nullptr && n * K > 128) {   // b70-local: a big window (an Inkling prompt window)
         resident_plan_big(last_ids_, (int) (n * K), (int) K, d_res_ + (size_t) layer * (size_t) sh_.n_expert,
                           (int) sh_.n_expert, tier_.cache_base, d_slot_off_, (long long) tier_.blob, pl, (long long) capx,
-                          d_skip_, ring, cs);
+                          d_skip_, ring, cs, ep_);
     } else if (d_res_ != nullptr) {   // device_plan: every expert resident, the plan from the router's ids on the device
         resident_plan(last_ids_, (int) (n * K), (int) K, d_res_ + (size_t) layer * (size_t) sh_.n_expert,
                       (int) sh_.n_expert, tier_.cache_base, d_slot_off_, (long long) tier_.blob, pl, (long long) capx,
-                      d_skip_, ring, cs);
+                      d_skip_, ring, cs, ep_);
     } else {
         if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);   // the pool published this group's GPU plan
         copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);

@@ -204,6 +204,23 @@ private:
     // streams.
     int64_t lb_ = 0, le_ = 0;
     int dev_ = -1;
+    /// b70-local STRATA_INK_EP=1 (Inkling 2's RVQ groups over a layer split): every layer's experts spread over the
+    /// stages' GPUs, expert e of MoE layer l on stage (e + l) % ep_n_; this stage's index among them
+    int ep_stage_ = 0, ep_n_ = 1;
+    bool ep_ = false;
+    /// the stage of expert e of MoE layer l: a hash of (l, e) against the stages' shares (STRATA_INK_EP_SHARE=a,b,c:
+    /// relative, default equal; a stage that also holds the head and the drafter takes a smaller share)
+    std::vector<double> ep_cum_;
+    int ep_owner(int64_t l, int32_t e) const {
+        uint32_t h = (uint32_t) e * 2654435761u ^ (uint32_t) (l + 1) * 2246822519u;
+        h ^= h >> 15;
+        h *= 2654435761u;
+        h ^= h >> 13;
+        const double u = (double) h / 4294967296.0;
+        for (int s = 0; s + 1 < ep_n_ && s < (int) ep_cum_.size(); ++s)
+            if (u < ep_cum_[(size_t) s]) return s;
+        return ep_n_ - 1;
+    }
     std::vector<int> split_devs_;   ///< the root's: the engine's GPUs the stages take, in order
     PlainModel* root_ = this;
     std::vector<std::unique_ptr<PlainModel>> next_;
@@ -510,6 +527,19 @@ private:
     bool load_inkling2(std::string& err);
     bool reset_inkling2(std::string& err);
     bool record_window_inkling2(int T, strata::gpu::Stream cs, std::string& err);
+    /// b70-local EP: this GPU's share of stage `own`'s MoE layers for a window of T rows, as a graph on this GPU:
+    /// each layer waits for the relay's rows (m_ax_ ..., flag m_ain_), computes the experts it holds and their
+    /// weighted sum, and hands it back (m_ay_, flag m_aout_)
+    bool record_assist(const PlainModel& own, int T, strata::gpu::Graph** g, std::string& err);
+    /// EP: the relay of one launch of this stage's graph (the host between this GPU and the others)
+    bool ep_relay(strata::gpu::Graph* g, int T, std::string& err);
+    float *h_rem_ = nullptr, *m_rem_ = nullptr;     ///< EP owner: the other GPUs' sums [ep_n_ - 1][T][N]
+    float *h_ax_ = nullptr, *m_ax_ = nullptr;       ///< EP helper: the owner's rows, ids, weights; the sum back
+    int32_t *h_aids_ = nullptr, *m_aids_ = nullptr;
+    float *h_aw_ = nullptr, *m_aw_ = nullptr;
+    float *h_ay_ = nullptr, *m_ay_ = nullptr;
+    uint32_t *h_ain_ = nullptr, *m_ain_ = nullptr, *h_aout_ = nullptr, *m_aout_ = nullptr;
+    std::unordered_map<int, strata::gpu::Graph*> assist_;   ///< EP helper: (owner stage << 16 | T) -> its graph
     bool record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
                        strata::gpu::Stream cs, std::string& err);
     /// `mtp`: the MTP layer's block, without the mHC mixes

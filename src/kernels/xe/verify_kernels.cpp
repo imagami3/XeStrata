@@ -808,7 +808,7 @@ bool doorbell_visible(void* stream) {
 
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream) {
+                   uint32_t ring, void* stream, bool absent_ok) {
     // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
     // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
     // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
@@ -821,20 +821,22 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
-            bool bad = false;
+            bool bad = false, valid = false;
             if (t < n) {
                 const int32_t ex = ids[t];
-                s_ids[t] = ex;
-                bad = ex < 0 || ex >= n_expert || res[ex] < 0;
+                valid = ex >= 0 && ex < n_expert && res[ex] >= 0;
+                bad = !valid && !(absent_ok && ex >= 0 && ex < n_expert);
+                s_ids[t] = valid ? ex : -2 - t;   // an absent entry matches no other (absent_ok)
             }
             if (sycl::any_of_group(grp, bad)) {
                 if (t == 0) *skip = 0;
                 return;
             }
+            sycl::group_barrier(grp);
             // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
             // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
             int L = t, cnt = 0, pos = 0;
-            if (t < n) {
+            if (valid) {
                 for (int j = 0; j < t; ++j)
                     if (s_ids[j] == s_ids[t]) { L = j; break; }
                 for (int j = 0; j < n; ++j) {
@@ -843,7 +845,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
                     if (j < t) ++pos;
                 }
             }
-            const int pack = L == t && t < n ? (cnt << 16) | 1 : 0;
+            const int pack = L == t && valid ? (cnt << 16) | 1 : 0;
             const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
             s_excl[t] = excl;
             const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
@@ -855,7 +857,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
             unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
             int32_t* start2 = pl + ptr_off + 4 * capx;
-            if (t < n) {
+            if (valid) {
                 const int le = s_excl[L];
                 const int g = le & 0xffff, gstart = le >> 16;
                 dst[gstart + pos] = t;
@@ -868,11 +870,11 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             }
             sycl::group_barrier(grp);
             if (t != 0) return;
-            const int groups = total & 0xffff;
-            start[groups] = n;
-            start2[0] = n;
+            const int groups = total & 0xffff, planned = total >> 16;   // planned == n unless absent_ok left some out
+            start[groups] = planned;
+            start2[0] = planned;
             counts[0] = groups;
-            counts[1] = n;
+            counts[1] = planned;
             counts[2] = 0;
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
             *skip = ring;
@@ -886,8 +888,11 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
 // row goes to dst[] = its own index, so the sums do not depend on it).  The plan layout is resident_plan's.
 void resident_plan_big(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                        const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                       uint32_t ring, void* stream) {
+                       uint32_t ring, void* stream, bool absent_ok) {
     constexpr int WG = 1024, EMAX = 1024;
+    // b70-local: a non-resident expert's entries are left out (its slot -1 indexed slot_off before; absent_ok only
+    // names it: resident_plan_big never had a skip)
+    (void) absent_ok;
     if (n_expert > EMAX || n > capx) throw std::invalid_argument("resident_plan_big: too many experts or entries");
     const auto e = Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(EMAX), h);
@@ -898,7 +903,7 @@ void resident_plan_big(const int32_t* ids, int n, int k, const int32_t* res, int
             sycl::group_barrier(it.get_group());
             for (int i = t; i < n; i += WG) {
                 const int32_t ex = ids[i];
-                if (ex >= 0 && ex < n_expert) {
+                if (ex >= 0 && ex < n_expert && res[ex] >= 0) {
                     sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                                      sycl::access::address_space::local_space> a(cnt[ex]);
                     a.fetch_add(1);
@@ -933,7 +938,7 @@ void resident_plan_big(const int32_t* ids, int n, int k, const int32_t* res, int
             sycl::group_barrier(it.get_group());
             for (int i = t; i < n; i += WG) {
                 const int32_t ex = ids[i];
-                if (ex < 0 || ex >= n_expert) continue;
+                if (ex < 0 || ex >= n_expert || res[ex] < 0) continue;
                 sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                                  sycl::access::address_space::local_space> a(fill[ex]);
                 const int p = a.fetch_add(1);

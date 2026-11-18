@@ -216,7 +216,8 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 // the routing payload and its ring in one kernel: copy, fence, then the increment the host polls
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) throw core::DeviceError("doorbell_publish: k too large");
+    // b70-local: the work-items stride over x and the k entries, so any k (EP relays a prompt window's 256 x 8)
+    if (k > (int64_t) 1 << 24) throw core::DeviceError("doorbell_publish: k too large");
     const int ni = (int) n, ki = (int) k;
     auto& q = queue_for(stream);
     const int wg = xe::work_group_upto_1024(q);

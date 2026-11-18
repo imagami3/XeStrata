@@ -78,11 +78,13 @@ bool gpu_stamp_available();
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, bool absent_ok = false);
 /// b70-local: resident_plan for many entries (a counting sort by expert, groups in expert order).
 void resident_plan_big(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, bool absent_ok = false);
+/// b70-local `absent_ok` (expert parallelism, STRATA_INK_EP): entries whose expert is not resident are left out of
+/// the plan (another GPU computes them; counts[1] is the planned entries) instead of the plan being skipped.
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
