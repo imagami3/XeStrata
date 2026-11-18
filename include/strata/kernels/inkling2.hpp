@@ -76,5 +76,8 @@ void inkling2_attention_gated(const float* q, const float* r, const float* sinks
 
 /// x = cap tanh(x / cap) over `cols` of each of `rows` rows `ld` apart.
 void inkling2_softcap(float* x, int64_t rows, int64_t cols, int64_t ld, float cap, void* stream);
+/// b70-local (tensor-parallel slices): dst[t * dst_ld + col0 + i] = src[t * w + i] for t < rows, i < w; src may be
+/// mapped host memory
+void inkling2_put_cols(float* dst, int64_t dst_ld, int64_t col0, const float* src, int64_t w, int64_t rows, void* stream);
 
 }  // namespace strata::kernels

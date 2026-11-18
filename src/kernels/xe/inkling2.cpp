@@ -582,6 +582,15 @@ void inkling2_sigmoid_mul(float* x, const float* g, int64_t n, void* stream) {
     sync_if_needed(stream, event, "inkling2_sigmoid_mul");
 }
 
+void inkling2_put_cols(float* dst, int64_t dst_ld, int64_t col0, const float* src, int64_t w, int64_t rows, void* stream) {
+    if (rows <= 0 || w <= 0) return;
+    const auto ev = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * w)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / w, c = i % w;
+        dst[t * dst_ld + col0 + c] = src[i];
+    });
+    sync_if_needed(stream, ev, "inkling2_put_cols");
+}
+
 void inkling2_softcap(float* x, int64_t rows, int64_t cols, int64_t ld, float cap, void* stream) {
     if (rows <= 0 || cols <= 0) return;
     const float ic = 1.0f / cap;

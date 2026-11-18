@@ -110,7 +110,8 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
-bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32) {
+bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32, int64_t row0,
+                        int64_t n_rows) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
     if (t == nullptr || t->shape.size() < 2 || !m.in_bounds(*t, at)) {
@@ -122,18 +123,29 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     uint64_t rows = 1;
     for (size_t i = 1; i < t->shape.size(); ++i) rows *= t->shape[i];
     w.n_out = (int) rows;
+    // b70-local: rows [row0, row0 + n_rows) only (the tensor-parallel slices)
+    const uint64_t all_bytes = tensor_payload_bytes(*t);
+    uint64_t skip = 0, bytes = all_bytes;
+    if (n_rows >= 0) {
+        if (row0 < 0 || row0 + n_rows > (int64_t) rows || all_bytes % rows != 0) {
+            err = "plain model: " + name + "'s rows " + std::to_string(row0) + ".. are out of range";
+            return false;
+        }
+        skip = all_bytes / rows * (uint64_t) row0;
+        bytes = all_bytes / rows * (uint64_t) n_rows;
+        w.n_out = (int) n_rows;
+    }
     if (!k::native_mmvq_supported(w.type) && !((w.type == kBF16 || (f32 && w.type == kF32)) && w.n_in % 2 == 0)) {
         err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
         return false;
     }
-    const uint64_t bytes = tensor_payload_bytes(*t);
     void* d = nullptr;
     if (!strata::gpu::alloc_device(&d, bytes)) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
     allocs_.push_back(d);
-    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), bytes)) {
+    if (!strata::gpu::copy(d, static_cast<const uint8_t*>(m.shard(at).tensor_data(*t)) + skip, bytes)) {
         err = "plain model: uploading " + name + " failed";
         return false;
     }
@@ -313,6 +325,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     ep_stage_ = 0;
     ep_n_ = (int) at.size() + 1;
     ep_ = ep_n_ > 1 && [] { const char* v = std::getenv("STRATA_INK_EP"); return v != nullptr && v[0] == '1'; }();
+    tp_ = ep_ && [] { const char* v = std::getenv("STRATA_INK_TP"); return v != nullptr && v[0] == '1'; }();
     {   // the stages' cumulative shares of each layer's experts
         std::vector<double> sh((size_t) ep_n_, 1.0);
         if (const char* v = std::getenv("STRATA_INK_EP_SHARE")) {
@@ -343,6 +356,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         st->ep_n_ = ep_n_;
         st->ep_ = ep_;
         st->ep_cum_ = ep_cum_;
+        st->tp_ = tp_;
         const int64_t lb = at[i], le = i + 1 < at.size() ? at[i + 1] : nl;
         if (!st->load_stage(opt_, this, lb, le, split_devs_[i + 1], err)) return false;
         next_.push_back(std::move(st));
@@ -1996,6 +2010,10 @@ bool PlainModel::ep_relay(strata::gpu::Graph* g, int T, std::string& err) {
         *(volatile uint32_t*) h->h_ain_ = 0;
         *(volatile uint32_t*) h->h_aout_ = 0;
     }
+    if (tp_) {
+        *(volatile uint32_t*) h_tseq_ = 0;
+        *(volatile uint32_t*) h_tflag_ = 0;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     for (PlainModel* h : hs) {
         const OnDevice on(h->dev_);
@@ -2023,17 +2041,41 @@ bool PlainModel::ep_relay(strata::gpu::Graph* g, int T, std::string& err) {
         return true;
     };
     const size_t xb = (size_t) T * (size_t) N * 4, kb = (size_t) T * (size_t) K * 4;
+    const size_t HD = (size_t) (spec_.n_head * spec_.key_length), tqs = tp_ ? HD / (size_t) ep_n_ : 0;
+    uint32_t P = 0, tp = 0;   // the helpers' phases; this GPU's TP phases
+    // b70-local TP: a phase of the layer's q / gate (or o) rows: the published input to every helper, their slices back
+    auto tp_phase = [&](size_t in_bytes, size_t out_bytes) {
+        ++tp;
+        ++P;
+        if (!spin(h_tseq_, tp, "this GPU's TP rows")) return false;
+        for (PlainModel* h : hs) {
+            std::memcpy(h->h_ax_, h_tx_, in_bytes);
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile uint32_t*) h->h_ain_ = P;
+        }
+        for (size_t j = 0; j < hs.size(); ++j) {
+            if (!spin(hs[j]->h_aout_, P, "a helper GPU's TP rows")) return false;
+            std::memcpy(h_trem_ + j * (size_t) T * 2 * tqs, hs[j]->h_ay_, out_bytes);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile uint32_t*) h_tflag_ = tp;
+        return true;
+    };
     for (uint32_t r = 1; r <= (uint32_t) rings; ++r) {
+        if (tp_ && (!tp_phase(xb, (size_t) T * 2 * tqs * 4) ||
+                    !tp_phase((size_t) T * HD * 4, (size_t) T * (size_t) (N / ep_n_) * 4)))
+            return false;
+        ++P;
         if (!spin(win_.host_seq(), r, "this GPU's rows")) return false;
         for (PlainModel* h : hs) {
             std::memcpy(h->h_ax_, win_.host_x(), xb);
             std::memcpy(h->h_aids_, win_.host_ids(), kb);
             std::memcpy(h->h_aw_, win_.host_w(), kb);
             std::atomic_thread_fence(std::memory_order_release);
-            *(volatile uint32_t*) h->h_ain_ = r;
+            *(volatile uint32_t*) h->h_ain_ = P;
         }
         for (size_t j = 0; j < hs.size(); ++j) {
-            if (!spin(hs[j]->h_aout_, r, "a helper GPU's sum")) return false;
+            if (!spin(hs[j]->h_aout_, P, "a helper GPU's sum")) return false;
             std::memcpy(h_rem_ + j * (size_t) T * (size_t) N, hs[j]->h_ay_, xb);
         }
         std::atomic_thread_fence(std::memory_order_release);

@@ -293,7 +293,8 @@ private:
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is
     /// (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
-    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
+    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false,
+                int64_t row0 = 0, int64_t n_rows = -1);
     /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
     bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
     /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
@@ -534,6 +535,17 @@ private:
     /// EP: the relay of one launch of this stage's graph (the host between this GPU and the others)
     bool ep_relay(strata::gpu::Graph* g, int T, std::string& err);
     float *h_rem_ = nullptr, *m_rem_ = nullptr;     ///< EP owner: the other GPUs' sums [ep_n_ - 1][T][N]
+    /// b70-local STRATA_INK_TP=1 (with EP): q, gate and o split by their rows over the split's GPUs, each GPU holding
+    /// its slice (ep_stage_) of every layer's; the owner publishes the input, computes its slice, and places the others'
+    /// (relayed as EP's sums) in their columns
+    bool tp_ = false;
+    struct TPW { W q, gate, o; };
+    std::vector<TPW> tpw_;                          ///< every layer's slices this GPU holds (its own layers' too)
+    float *h_tx_ = nullptr, *m_tx_ = nullptr;       ///< TP owner: the published rows (the q / gate input, then o's)
+    uint32_t *h_tseq_ = nullptr, *m_tseq_ = nullptr, *h_tflag_ = nullptr, *m_tflag_ = nullptr;
+    float *h_trem_ = nullptr, *m_trem_ = nullptr;   ///< TP owner: the other GPUs' slices [ep_n_ - 1][T][2 x q slice]
+    float* i_tps_ = nullptr;                        ///< TP: a GPU's own slice rows [T][2 x q slice]
+    uint32_t tp_ring_ = 0;                          ///< TP owner: the phases recorded so far in this window
     float *h_ax_ = nullptr, *m_ax_ = nullptr;       ///< EP helper: the owner's rows, ids, weights; the sum back
     int32_t *h_aids_ = nullptr, *m_aids_ = nullptr;
     float *h_aw_ = nullptr, *m_aw_ = nullptr;
@@ -558,6 +570,8 @@ private:
     bool record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err);
     /// x [T][n_in] through w into y [T][n_out] (q8_1 of x into g_xq_ first unless `quantized`)
     void gproj(const W& w, const float* x, float* y, int T, bool quantized, strata::gpu::Stream cs);
+    /// b70-local: gproj for any window (record_iblock: a prompt window in slices of 8 or on the matrix engines)
+    void gproj_win(const W& w, const float* x, float* y, int T, bool quantized, strata::gpu::Stream cs);
     // GLM's per-sequence state: per KDA block its recurrence (H S S) and its three convolutions' last inputs (3 C 3);
     // per DSA block the indexer's key | gate per cell, its pooled keys, the MLA latent per cell (FP16)
     std::vector<float*> g_idx_cache_, g_pooled_;

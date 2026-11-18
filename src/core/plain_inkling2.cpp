@@ -110,9 +110,13 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
     b.swa = s.swa[(size_t) l];
     b.extent = b.swa ? s.n_swa : s.rel_extent;
     b.n_aq = l == 0 ? 0 : (b.swa ? 1 : 3);
-    if (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
-        !upload(m, p + "attn_v.weight", b.v, err) || !upload(m, p + "attn_output.weight", b.o, err) ||
-        !upload(m, p + "attn_gate.weight", b.gate, err) || !upload(m, p + "attn_rel.weight", b.rel, err) ||
+    // b70-local TP: q, gate and o as this GPU's slice of their rows
+    const int64_t tn = tp_ ? ep_n_ : 1, ts = tp_ ? ep_stage_ : 0, qs = H * D / tn, os = (int64_t) N / tn;
+    if (!upload(m, p + "attn_q.weight", b.q, err, false, ts * qs, tp_ ? qs : -1) || !upload(m, p + "attn_k.weight", b.k, err) ||
+        !upload(m, p + "attn_v.weight", b.v, err) ||
+        !upload(m, p + "attn_output.weight", b.o, err, false, ts * os, tp_ ? os : -1) ||
+        !upload(m, p + "attn_gate.weight", b.gate, err, false, ts * qs, tp_ ? qs : -1) ||
+        !upload(m, p + "attn_rel.weight", b.rel, err) ||
         !upload(m, p + "attn_sink_proj.weight", b.sink, err) ||
         !upload_f32(m, p + "attn_q_clip.weight", (uint64_t) (H * D), b.q_clip, err) ||
         !upload_f32(m, p + "attn_rel_clip.weight", (uint64_t) (H * R), b.rel_clip, err) ||
@@ -163,9 +167,10 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
         return false;
     }
     if (b.n_aq > 0 && !upload_f32(m, p + "attn_res_query.weight", N * (uint64_t) b.n_aq, b.attn_rq, err)) return false;
-    if ((uint64_t) b.q.n_in != N || b.q.n_out != H * D || (uint64_t) b.k.n_in != N || b.k.n_out != NKV * D ||
-        (uint64_t) b.v.n_in != N || b.v.n_out != NKV * D || b.o.n_in != H * D || (uint64_t) b.o.n_out != N ||
-        (uint64_t) b.gate.n_in != N || b.gate.n_out != H * D || (uint64_t) b.rel.n_in != N || b.rel.n_out != H * R ||
+    if ((H * D) % tn != 0 || (int64_t) N % tn != 0) return bad("attention projections (the TP slices)");
+    if ((uint64_t) b.q.n_in != N || b.q.n_out * tn != H * D || (uint64_t) b.k.n_in != N || b.k.n_out != NKV * D ||
+        (uint64_t) b.v.n_in != N || b.v.n_out != NKV * D || b.o.n_in != H * D || (uint64_t) b.o.n_out * tn != N ||
+        (uint64_t) b.gate.n_in != N || b.gate.n_out * tn != H * D || (uint64_t) b.rel.n_in != N || b.rel.n_out != H * R ||
         (uint64_t) b.sink.n_in != N || b.sink.n_out != H)
         return bad("attention projections");
     if (!b.swa && (b.kproj.n_out != KT * NKV || b.vproj.n_out != KT * NKV)) return bad("dynamic convolution taps");
@@ -230,6 +235,25 @@ bool PlainModel::load_inkling2(std::string& err) {
     iblocks_.resize((size_t) s.n_layer);
     for (int64_t l = lb_; l < le_; ++l)
         if (!load_iblock(m, l, iblocks_[(size_t) l], err)) return false;
+    if (tp_) {   // b70-local TP: this GPU's slices of the other stages' layers too
+        const int64_t qs = s.n_head * s.key_length / ep_n_, os = s.n_embd / ep_n_;
+        tpw_.resize((size_t) s.n_layer);
+        for (int64_t l = 0; l < s.n_layer; ++l) {
+            TPW& t = tpw_[(size_t) l];
+            if (l >= lb_ && l < le_) {
+                const IBlock& b = iblocks_[(size_t) l];
+                t.q = b.q;
+                t.gate = b.gate;
+                t.o = b.o;
+                continue;
+            }
+            const std::string p = "blk." + std::to_string(l) + ".";
+            if (!upload(m, p + "attn_q.weight", t.q, err, false, ep_stage_ * qs, qs) ||
+                !upload(m, p + "attn_gate.weight", t.gate, err, false, ep_stage_ * qs, qs) ||
+                !upload(m, p + "attn_output.weight", t.o, err, false, ep_stage_ * os, os))
+                return false;
+        }
+    }
     i_nblocks_ = (s.n_layer + s.attn_res_block - 1) / s.attn_res_block;
 
     // per-sequence state: per layer the K/V cache (a cell a position) and the four convolutions' histories
@@ -277,13 +301,21 @@ bool PlainModel::load_inkling2(std::string& err) {
         return false;
     }
     // b70-local EP: the relay's rows (an owner's: the other GPUs' sums; a helper's: the owner's rows in, its sum out)
+    const uint64_t TQS = tp_ ? 2 * HD / (uint64_t) ep_n_ : 0, AXW = tp_ ? std::max(UN, HD) : UN,
+                   AYW = std::max(UN, TQS);   // TP: a helper's input (o's: H x D) and its two q / gate slices out
     if (ep_ && (!imapped((uint64_t) (ep_n_ - 1) * T * UN * 4, (void**) &h_rem_, (void**) &m_rem_) ||
-                !imapped(T * UN * 4, (void**) &h_ax_, (void**) &m_ax_) ||
+                !imapped(T * AXW * 4, (void**) &h_ax_, (void**) &m_ax_) ||
                 !imapped(T * K * 4, (void**) &h_aids_, (void**) &m_aids_) ||
                 !imapped(T * K * 4, (void**) &h_aw_, (void**) &m_aw_) ||
-                !imapped(T * UN * 4, (void**) &h_ay_, (void**) &m_ay_) ||
+                !imapped(T * AYW * 4, (void**) &h_ay_, (void**) &m_ay_) ||
                 !imapped(64, (void**) &h_ain_, (void**) &m_ain_) || !imapped(64, (void**) &h_aout_, (void**) &m_aout_))) {
         err = "plain model: the expert relay's mapped buffers";
+        return false;
+    }
+    if (tp_ && (!imapped(T * AXW * 4, (void**) &h_tx_, (void**) &m_tx_) ||
+                !imapped(64, (void**) &h_tseq_, (void**) &m_tseq_) || !imapped(64, (void**) &h_tflag_, (void**) &m_tflag_) ||
+                !imapped((uint64_t) (ep_n_ - 1) * T * TQS * 4, (void**) &h_trem_, (void**) &m_trem_))) {
+        err = "plain model: the TP relay's mapped buffers";
         return false;
     }
     // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 256)
@@ -302,7 +334,7 @@ bool PlainModel::load_inkling2(std::string& err) {
         !dev(&i_v_, T * KV * 4) || !dev(&i_r_, T * R * 4) || !dev(&i_sink_, T * NH * 4) ||
         !dev(&i_gate_, T * HD * 4) || !dev(&i_kp_, T * TAPS * 4) || !dev(&i_vp_, T * TAPS * 4) ||
         !dev(&i_att_, T * HD * 4) || !dev(&i_o_, T * UN * 4) || !dev(&rlog_, T * E * 4) || !dev(&ids_, T * K * 4) ||
-        !dev(&w_, T * K * 4) || !dev(&moe_out_, T * UN * 4) ||
+        !dev(&w_, T * K * 4) || !dev(&moe_out_, T * UN * 4) || (tp_ && !dev(&i_tps_, T * TQS * 4)) ||
         !dev(&logits_, (last() ? std::min<uint64_t>(T, 8) : 1) * (uint64_t) n_vocab_ * 4)) {   // a big window's head: one row
         err = "plain model: no VRAM for the window's buffers";
         return false;
@@ -361,17 +393,11 @@ bool PlainModel::reset_inkling2(std::string& err) {
 
 void glm5_decode_stamp(const void* model, int64_t l, int i, strata::gpu::Stream cs);
 
-bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring,
-                               std::vector<strata::gpu::Graph*>& segs, strata::gpu::Stream cs, std::string& err) {
-    const ModelSpec& s = spec_;
-    const int64_t N = s.n_embd, H = s.n_head, NKV = nkv_, D = s.key_length, KVW = NKV * D, R = s.n_rel;
-    const int64_t E = s.n_expert, K = s.n_expert_used, KT = s.n_shortconv, B = s.attn_res_block;
-    const float eps = (float) s.rms_eps;
-    const int64_t bstride = (int64_t) opt_.max_t * N;
-    // b70-local: a window past 8 tokens (an Inkling prompt window) runs the 8-row kernels (the projections' MMVQ, the
-    // router's GEMV) in slices of 8 rows; g_xq_ (the rows' q8_1) is pointed at each slice while it is recorded
+// b70-local: a window's projection through w: MMVQ up to 8 rows, a prompt window's rows on the matrix engines or in
+// slices of 8 (g_xq_ holds the rows' q8_1 when `quantized`)
+void PlainModel::gproj_win(const W& w, const float* x, float* y, int TT, bool quantized, strata::gpu::Stream c) {
     static const bool q8x_on = [] { const char* v = std::getenv("STRATA_INK_Q8_XMX"); return v == nullptr || v[0] != '0'; }();
-    auto gproj = [&](const W& w, const float* x, float* y, int TT, bool quantized, strata::gpu::Stream c) {
+    {
         if (TT <= 8) { this->gproj(w, x, y, TT, quantized, c); return; }
         // Q6_K rows on the matrix engines (q6k_xmx.cpp: 8 tokens a launch at about one token's cost), the tokens in
         // FP16: i_xh_ holds the window's rows and 8 zero rows past them
@@ -405,6 +431,20 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
             this->gproj(w, x + (size_t) t0 * (size_t) w.n_in, y + (size_t) t0 * (size_t) w.n_out, tn, quantized, c);
         }
         g_xq_ = (decltype(g_xq_)) xq0;
+    }
+}
+
+bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring,
+                               std::vector<strata::gpu::Graph*>& segs, strata::gpu::Stream cs, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, H = s.n_head, NKV = nkv_, D = s.key_length, KVW = NKV * D, R = s.n_rel;
+    const int64_t E = s.n_expert, K = s.n_expert_used, KT = s.n_shortconv, B = s.attn_res_block;
+    const float eps = (float) s.rms_eps;
+    const int64_t bstride = (int64_t) opt_.max_t * N;
+    // b70-local: a window past 8 tokens (an Inkling prompt window) runs the 8-row kernels (the projections' MMVQ, the
+    // router's GEMV) in slices of 8 rows; g_xq_ (the rows' q8_1) is pointed at each slice while it is recorded
+    auto gproj = [&](const W& w, const float* x, float* y, int TT, bool quantized, strata::gpu::Stream c) {
+        gproj_win(w, x, y, TT, quantized, c);
     };
     float* conv_k = b.conv;
     float* conv_v = conv_k + KVW * (KT - 1);
@@ -445,17 +485,59 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
         }
         for (const auto& [w, y] : ps) gproj(*w, x, y, T, true, cs);
     };
+    // b70-local TP: this GPU's rows of q and gate (or o) and the other GPUs', relayed, each in its columns
+    const int64_t tqs = tp_ ? H * D / ep_n_ : 0, tos = tp_ ? (int64_t) N / ep_n_ : 0;
+    auto tp_others = [&](float* dst, int64_t ld, int64_t w, int64_t off) {   // the relay's slices of every other GPU
+        int j = 0;
+        for (int st = 0; st < ep_n_; ++st) {
+            if (st == ep_stage_) continue;
+            k::inkling2_put_cols(dst, ld, st * w, m_trem_ + (size_t) j * T * 2 * tqs + (size_t) off, w, T, cs);
+            ++j;
+        }
+    };
+    // published first (the other GPUs start while this one runs its other projections), finished after them
+    auto tp_pub = [&](const float* xin) {
+        k::doorbell_publish(xin, ids_, w_, (int64_t) T * N, 0, m_tx_, nullptr, nullptr, m_tseq_, cs);
+    };
+    auto tp_qg = [&](const float* xin, bool quantized) {
+        gproj(b.q, xin, i_tps_, T, quantized, cs);
+        gproj(b.gate, xin, i_tps_ + (size_t) T * tqs, T, true, cs);
+        k::inkling2_put_cols(i_q_, H * D, ep_stage_ * tqs, i_tps_, tqs, T, cs);
+        k::inkling2_put_cols(i_gate_, H * D, ep_stage_ * tqs, i_tps_ + (size_t) T * tqs, tqs, T, cs);
+        k::wait_flag_ge(m_tflag_, ++tp_ring_, cs);
+        tp_others(i_q_, H * D, tqs, 0);
+        tp_others(i_gate_, H * D, tqs, (int64_t) T * tqs);
+    };
     if (b.swa) {
         k::native_qsa_rms_norm_weighted_q8_1(in[0], b.attn_norm, hn_, g_xq_, (int) N, T, eps, cs);
+        if (tp_) {
+            tp_pub(hn_);
+            gmulti({{&b.k, i_kr_}, {&b.v, i_vr_}, {&b.rel, i_r_}, {&b.sink, i_sink_}}, hn_);
+            tp_qg(hn_, true);
+        } else
         gmulti({{&b.k, i_kr_}, {&b.v, i_vr_}, {&b.q, i_q_}, {&b.rel, i_r_}, {&b.sink, i_sink_}, {&b.gate, i_gate_}}, hn_);
     } else {
-        // k and v (and their dynamic taps) from their own norms first, then q's (its q8_1 stays in g_xq_)
+        // k and v (and their dynamic taps) from their own norms first, then q's (its q8_1 stays in g_xq_); TP: q's norm
+        // first and published, its q8_1 made again after k's and v's
+        if (tp_) {
+            k::native_qsa_rms_norm_weighted_q8_1(in[0], b.q_norm, hn_, g_xq_, (int) N, T, eps, cs);
+            tp_pub(hn_);
+        }
         k::native_qsa_rms_norm_weighted_q8_1(in[1], b.k_norm, i_hk_, g_xq_, (int) N, T, eps, cs);
         gmulti({{&b.k, i_kr_}, {&b.kproj, i_kp_}}, i_hk_);
         k::native_qsa_rms_norm_weighted_q8_1(in[2], b.v_norm, i_hv_, g_xq_, (int) N, T, eps, cs);
         gmulti({{&b.v, i_vr_}, {&b.vproj, i_vp_}}, i_hv_);
-        k::native_qsa_rms_norm_weighted_q8_1(in[0], b.q_norm, hn_, g_xq_, (int) N, T, eps, cs);
+        if (tp_) {
+            const size_t qrow = k::native_q8_1_bytes((int) N, 1);   // the q8_1 of q's rows again, 8 rows a launch
+            for (int t0 = 0; t0 < T; t0 += 8)
+                k::native_quantize_q8_1(hn_ + (size_t) t0 * N, (uint8_t*) g_xq_ + (size_t) t0 * qrow, (int) N,
+                                        std::min(8, T - t0), cs);
+            gmulti({{&b.rel, i_r_}, {&b.sink, i_sink_}}, hn_);
+            tp_qg(hn_, true);
+        } else {
+            k::native_qsa_rms_norm_weighted_q8_1(in[0], b.q_norm, hn_, g_xq_, (int) N, T, eps, cs);
         gmulti({{&b.q, i_q_}, {&b.rel, i_r_}, {&b.sink, i_sink_}, {&b.gate, i_gate_}}, hn_);
+        }
     }
     glm5_decode_stamp(this, l, 1, cs);
 
@@ -482,6 +564,13 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::inkling2_attention_gated(i_q_, i_r_, i_sink_, b.kc, b.vc, b.rel_table, step_, (int) H, (int) NKV, (int) D, (int) R,
                                 (int) b.extent, b.swa ? (int) s.n_swa : 0, i_att_, i_gate_, T, cs);
     glm5_decode_stamp(this, l, 2, cs);
+    if (tp_) {   // b70-local TP: o's rows, this GPU's and the others'
+        k::doorbell_publish(i_att_, ids_, w_, (int64_t) T * H * D, 0, m_tx_, nullptr, nullptr, m_tseq_, cs);
+        gproj(b.o, i_att_, i_tps_, T, false, cs);
+        k::inkling2_put_cols(i_o_, N, ep_stage_ * tos, i_tps_, tos, T, cs);
+        k::wait_flag_ge(m_tflag_, ++tp_ring_, cs);
+        tp_others(i_o_, N, tos, 0);
+    } else
     gproj(b.o, i_att_, i_o_, T, false, cs);
     const float s1 = 1.0f / std::sqrt((float) (KT + 1));
     k::inkling2_conv(i_o_, conv_a, b.attn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs, snap_a, sst, ns);
@@ -543,11 +632,24 @@ bool PlainModel::record_assist(const PlainModel& own, int T, strata::gpu::Graph*
     }
     strata::gpu::Stream cs = cs_;
     if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
-    uint32_t r = 0;
+    uint32_t r = 0, P = 0;
+    const int64_t HD = s.n_head * s.key_length, tqs = tp_ ? HD / ep_n_ : 0, tos = tp_ ? N / ep_n_ : 0;
     for (int64_t l = own.lb_; l < own.le_; ++l) {
         if (!s.layer_routes(l)) continue;
         ++r;
-        k::wait_flag_ge(m_ain_, r, cs);
+        if (tp_) {   // TP: this GPU's rows of the layer's q and gate, then of o
+            const TPW& t = tpw_[(size_t) l];
+            k::wait_flag_ge(m_ain_, ++P, cs);
+            k::copy_from_mapped(hn_, m_ax_, (int64_t) T * N, cs);
+            gproj_win(t.q, hn_, i_tps_, T, false, cs);
+            gproj_win(t.gate, hn_, i_tps_ + (size_t) T * tqs, T, false, cs);
+            k::doorbell_publish(i_tps_, ids_, w_, (int64_t) T * 2 * tqs, 0, m_ay_, nullptr, nullptr, m_aout_, cs);
+            k::wait_flag_ge(m_ain_, ++P, cs);
+            k::copy_from_mapped(i_att_, m_ax_, (int64_t) T * HD, cs);
+            gproj_win(t.o, i_att_, i_tps_, T, false, cs);
+            k::doorbell_publish(i_tps_, ids_, w_, (int64_t) T * tos, 0, m_ay_, nullptr, nullptr, m_aout_, cs);
+        }
+        k::wait_flag_ge(m_ain_, ++P, cs);
         k::copy_from_mapped(hn_, m_ax_, (int64_t) T * N, cs);
         k::copy_i32_from_mapped(ids_, m_aids_, (int64_t) T * K, cs);
         k::copy_from_mapped(w_, m_aw_, (int64_t) T * K, cs);
@@ -579,6 +681,7 @@ bool PlainModel::record_window_inkling2(int T, strata::gpu::Stream cs, std::stri
             k::copy_from_mapped(i_blocks_ + j * bstride, m_in_ + (1 + j) * (int64_t) T * N, (int64_t) T * N, cs);
     }
     uint32_t ring = 0;
+    tp_ring_ = 0;
     for (int64_t l = lb_; l < le_; ++l)
         if (!record_iblock(iblocks_[(size_t) l], l, T, ring, segs_[(size_t) T], cs, err)) return false;
     if (!last()) {
