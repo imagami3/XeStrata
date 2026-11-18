@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <type_traits>
 
@@ -388,24 +389,35 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
         k::inkling2_attn_res(i_blocks_, bstride, nb, x_, b.attn_rq, b.n_aq, i_in_, N, T, cs);
         for (int j = 0; j < 3; ++j) in[j] = i_in_ + (b.swa ? 0 : j) * (int64_t) T * N;
     }
+    // b70-local: a few tokens' projections that read the same q8_1 rows (g_xq_) in one launch (native_mmvq_multi,
+    // each row's arithmetic native_mmvq's; STRATA_MMVQ_MULTI=0: one by one)
+    auto gmulti = [&](std::initializer_list<std::pair<const W*, float*>> ps, const float* x) {
+        if (T <= 8 && ps.size() <= 8) {
+            const void* ws[8];
+            float* ys[8];
+            int no[8], c = 0;
+            const W& w0 = *ps.begin()->first;
+            bool same = true;
+            for (const auto& [w, y] : ps) {
+                same = same && w->type == w0.type && w->n_in == w0.n_in && w->data != nullptr;
+                ws[c] = w->data; ys[c] = y; no[c++] = (int) w->n_out;
+            }
+            if (same && k::native_mmvq_multi(w0.type, c, ws, ys, no, g_xq_, (int) w0.n_in, T, cs)) return;
+        }
+        for (const auto& [w, y] : ps) gproj(*w, x, y, T, true, cs);
+    };
     if (b.swa) {
         k::native_qsa_rms_norm_weighted_q8_1(in[0], b.attn_norm, hn_, g_xq_, (int) N, T, eps, cs);
-        gproj(b.k, hn_, i_kr_, T, true, cs);
-        gproj(b.v, hn_, i_vr_, T, true, cs);
+        gmulti({{&b.k, i_kr_}, {&b.v, i_vr_}, {&b.q, i_q_}, {&b.rel, i_r_}, {&b.sink, i_sink_}, {&b.gate, i_gate_}}, hn_);
     } else {
         // k and v (and their dynamic taps) from their own norms first, then q's (its q8_1 stays in g_xq_)
         k::native_qsa_rms_norm_weighted_q8_1(in[1], b.k_norm, i_hk_, g_xq_, (int) N, T, eps, cs);
-        gproj(b.k, i_hk_, i_kr_, T, true, cs);
-        gproj(b.kproj, i_hk_, i_kp_, T, true, cs);
+        gmulti({{&b.k, i_kr_}, {&b.kproj, i_kp_}}, i_hk_);
         k::native_qsa_rms_norm_weighted_q8_1(in[2], b.v_norm, i_hv_, g_xq_, (int) N, T, eps, cs);
-        gproj(b.v, i_hv_, i_vr_, T, true, cs);
-        gproj(b.vproj, i_hv_, i_vp_, T, true, cs);
+        gmulti({{&b.v, i_vr_}, {&b.vproj, i_vp_}}, i_hv_);
         k::native_qsa_rms_norm_weighted_q8_1(in[0], b.q_norm, hn_, g_xq_, (int) N, T, eps, cs);
+        gmulti({{&b.q, i_q_}, {&b.rel, i_r_}, {&b.sink, i_sink_}, {&b.gate, i_gate_}}, hn_);
     }
-    gproj(b.q, hn_, i_q_, T, true, cs);
-    gproj(b.rel, hn_, i_r_, T, true, cs);
-    gproj(b.sink, hn_, i_sink_, T, true, cs);
-    gproj(b.gate, hn_, i_gate_, T, true, cs);
     glm5_decode_stamp(this, l, 1, cs);
 
     // ---- k and v through their convolutions, the clips, the cache, the attention

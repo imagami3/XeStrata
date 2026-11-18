@@ -14,9 +14,12 @@
 // Down: each entry's own h.  Widths (ff) must be multiples of 64 (8 codes) and n_embd of 128 (a chunk); a chunk past a narrower expert's
 // width is skipped.  Devices without 33 KiB of local memory or work-groups of 256 keep the old kernel.
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/swiglu_clamp.hpp"
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -31,6 +34,9 @@ constexpr int CI = CC * 8;      // inputs a chunk
 constexpr int NE = 512;         // table entries a code (book1's 256, book2's 256)
 constexpr int WG = 256;         // work-items a work-group
 constexpr int RPT_GU = 2, RPT_D = 6;   // rows a work-item
+// b70-local: chunks a work-group takes one after another, its rows' sums kept in registers across them: the partial
+// sums written and read back were about 45% of the weights' bytes with a chunk a work-group (STRATA_RVQ_LUT_CPW)
+int lut_cpw() { static const int v = [] { const char* e = std::getenv("STRATA_RVQ_LUT_CPW"); return e ? std::max(1, std::atoi(e)) : 1; }(); return v; }
 
 // where a blob's parts are (iq_kernels.cpp native_expert_grouped_rvq: the mixed layout or the fixed one)
 struct Geo {
@@ -139,15 +145,75 @@ bool rvq_lut_on(sycl::queue& q, int64_t cap_entries, int64_t N, int64_t FF, bool
 // (speculative decoding's verify windows) builds T tables and reads each (expert, token) pair's codes once.
 sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const int32_t* grp_start,
                        const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
-                       float* up, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t up_off, size_t tail) {
+                       float* up, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t up_off, size_t tail, float* h_out) {
     const Geo G{N, FF, mixed, gu_row, up_off, 0, 0, tail};
-    const int nch = (int) (N / CI);
+    const int nch0 = (int) (N / CI);
     const int64_t rows = 2 * FF;
+    // up to 8 entries (a token's top-8): chunk groups, each entry's row sums in registers across a group's chunks
+    constexpr int ME = 8;
+    const int cpw = cap_entries <= ME ? lut_cpw() : 1, nch = (nch0 + cpw - 1) / cpw;   // nch: the partial sets
     const size_t need = (size_t) nch * (size_t) cap_entries * (size_t) rows;
     float* part = partials(q, need, 0);
     if (part == nullptr) throw std::runtime_error("rvq_lut_gu: no partial buffer");
     const size_t nrb = (size_t) ((rows + WG * RPT_GU - 1) / (WG * RPT_GU));
-    q.submit([&](sycl::handler& h) {
+    if (cpw > 1) q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> T(sycl::range<1>(CC * NE), h);
+        sycl::local_accessor<float, 1> xs(sycl::range<1>(CI), h);
+        h.parallel_for(sycl::nd_range<2>({(size_t) nch, nrb * WG}, {1, (size_t) WG}), [=](sycl::nd_item<2> it) {
+            const int ng = *n_groups;
+            if (ng <= 0) return;
+            const int e0 = grp_start[0], e1 = grp_start[ng];
+            const int cg = (int) it.get_group(0), t = (int) it.get_local_id(1);
+            const int64_t rb = (int64_t) it.get_group(1) * WG * RPT_GU;
+            float* Tp = T.get_multi_ptr<sycl::access::decorated::no>().get();
+            float* xp = xs.get_multi_ptr<sycl::access::decorated::no>().get();
+            const float* book = view(G, (const uint8_t*) grp_ptr[0]).book;
+            float acc[ME][RPT_GU];
+            for (int j = 0; j < ME; ++j)
+                for (int k = 0; k < RPT_GU; ++k) acc[j][k] = 0.0f;
+            int tmax = 0;
+            for (int e = e0; e < e1; ++e) tmax = sycl::max(tmax, ent_tok[e] + 1);
+            for (int ch = cg * cpw; ch < sycl::min(nch0, (cg + 1) * cpw); ++ch)
+                for (int tok = 0; tok < tmax; ++tok) {
+                    bool any = false;
+                    for (int e = e0; e < e1 && !any; ++e) any = ent_tok[e] == tok;
+                    if (!any) continue;
+                    sycl::group_barrier(it.get_group());
+                    if (t < CI) xp[t] = x[(size_t) tok * N + (size_t) ch * CI + t];
+                    sycl::group_barrier(it.get_group());
+                    build(book, xp, Tp, CC, t);
+                    sycl::group_barrier(it.get_group());
+                    int g = 0;
+                    for (int j = 0; j < ME; ++j) {
+                        const int e = e0 + j;
+                        if (e >= e1) break;
+                        while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
+                        if (ent_tok[e] != tok) continue;
+                        const View v = view(G, (const uint8_t*) grp_ptr[g]);
+                        for (int k = 0; k < RPT_GU; ++k) {
+                            const int64_t r = rb + (int64_t) k * WG + t;
+                            if (r >= rows) continue;
+                            const bool is_up = r >= FF;
+                            const int64_t rr = is_up ? r - FF : r;
+                            if (rr >= v.ff) continue;
+                            const uint8_t* codes = v.b + (is_up ? v.up_o : 0) + (size_t) rr * G.gu_row + (size_t) ch * CC * 2;
+                            V4 w[CC / 8];
+                            for (int q8 = 0; q8 < CC / 8; ++q8) w[q8] = *(const V4*) (codes + (size_t) q8 * 16);
+                            acc[j][k] += lookup_regs(w, CC / 8, Tp);
+                        }
+                    }
+                }
+            for (int j = 0; j < ME; ++j) {
+                const int e = e0 + j;
+                if (e >= e1) break;
+                for (int k = 0; k < RPT_GU; ++k) {
+                    const int64_t r = rb + (int64_t) k * WG + t;
+                    if (r < rows) part[((size_t) cg * (size_t) cap_entries + (size_t) e) * (size_t) rows + (size_t) r] = acc[j][k];
+                }
+            }
+        });
+    });
+    else q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> T(sycl::range<1>(CC * NE), h);
         sycl::local_accessor<float, 1> xs(sycl::range<1>(CI), h);
         h.parallel_for(sycl::nd_range<2>({(size_t) nch, nrb * WG}, {1, (size_t) WG}), [=](sycl::nd_item<2> it) {
@@ -191,6 +257,28 @@ sycl::event rvq_lut_gu(sycl::queue& q, const unsigned long long* grp_ptr, const 
             }
         });
     });
+    if (h_out != nullptr) {   // b70-local: the sums, their gains and the activation in one kernel, into h [entry][FF]
+        const ExpertAct lim = expert_act();
+        return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) FF), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0], e = i / FF, rr = i % FF;
+            const int ng = *n_groups;
+            if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
+            int g = 0;
+            while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
+            const View v = view(G, (const uint8_t*) grp_ptr[g]);
+            if (rr >= v.ff) return;
+            float sg = 0.0f, su = 0.0f;
+            for (int c = 0; c < nch; ++c) {
+                const float* pc = part + ((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) rows;
+                sg += pc[rr];
+                su += pc[FF + rr];
+            }
+            float gg = sg * (float) v.gains[rr], uu = su * (float) v.gains[v.ff + rr];
+            if (lim.cg > 0.0f) { h_out[e * FF + rr] = canon::situ_mul(gg, uu, lim.cg, lim.cu); return; }
+            swiglu_clamp(gg, uu, lim.lim);
+            h_out[e * FF + rr] = (gg / (1.0f + sycl::exp(-gg))) * uu;
+        });
+    }
     return q.parallel_for(sycl::range<1>((size_t) cap_entries * (size_t) rows), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], e = i / rows, r = i % rows;
         const int ng = *n_groups;
@@ -213,44 +301,50 @@ sycl::event rvq_lut_down(sycl::queue& q, const unsigned long long* grp_ptr, cons
                          float* out, int64_t N, int64_t FF, bool mixed, size_t gu_row, size_t down_off, size_t d_row,
                          size_t tail) {
     const Geo G{N, FF, mixed, gu_row, 0, down_off, d_row, tail};
-    const int nch = (int) ((FF / 8 + CC - 1) / CC);
-    const size_t need = (size_t) nch * (size_t) cap_entries * (size_t) N;
+    const int nch = (int) ((FF / 8 + CC - 1) / CC), cpw = lut_cpw(), nchg = (nch + cpw - 1) / cpw;
+    const size_t need = (size_t) nchg * (size_t) cap_entries * (size_t) N;
     float* part = partials(q, need, 1);
     if (part == nullptr) throw std::runtime_error("rvq_lut_down: no partial buffer");
     const size_t nrb = (size_t) ((N + WG * RPT_D - 1) / (WG * RPT_D));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> T(sycl::range<1>(CC * NE), h);
         sycl::local_accessor<float, 1> xs(sycl::range<1>(CI), h);
-        h.parallel_for(sycl::nd_range<2>({(size_t) cap_entries * (size_t) nch, nrb * WG}, {1, (size_t) WG}),
+        h.parallel_for(sycl::nd_range<2>({(size_t) cap_entries * (size_t) nchg, nrb * WG}, {1, (size_t) WG}),
                        [=](sycl::nd_item<2> it) {
             const int ng = *n_groups;
-            const int e = (int) it.get_group(0) / nch, ch = (int) it.get_group(0) % nch, t = (int) it.get_local_id(1);
+            const int e = (int) it.get_group(0) / nchg, cg = (int) it.get_group(0) % nchg, t = (int) it.get_local_id(1);
             if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;
             int g = 0;
             while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
             const View v = view(G, (const uint8_t*) grp_ptr[g]);
-            const int ncode = (int) (v.ff / 8), nc = sycl::min(CC, ncode - ch * CC);
-            if (nc <= 0) return;
-            if (t < nc * 8) xs[t] = hh[(size_t) e * FF + (size_t) ch * CI + t];
-            // every row's codes loaded before the table is built (their loads in flight meanwhile)
+            const int ncode = (int) (v.ff / 8), nch_e = (ncode + CC - 1) / CC;
+            const int c0 = cg * cpw, c1 = sycl::min(nch_e, c0 + cpw);
+            if (c0 >= c1) return;
             const int64_t rb = (int64_t) it.get_group(1) * WG * RPT_D;
-            const int nv = nc / 8;
-            V4 w[RPT_D][CC / 8];
-            for (int k = 0; k < RPT_D; ++k) {
-                const int64_t r = rb + (int64_t) k * WG + t;
-                if (r >= N) continue;
-                const uint8_t* codes = v.b + v.dn_o + (size_t) r * v.d_row + (size_t) ch * CC * 2;
-                for (int q8 = 0; q8 < CC / 8; ++q8)
-                    if (q8 < nv) w[k][q8] = *(const V4*) (codes + (size_t) q8 * 16);
-            }
-            sycl::group_barrier(it.get_group());
+            float acc[RPT_D];
+            for (int k = 0; k < RPT_D; ++k) acc[k] = 0.0f;
             float* Tp = T.get_multi_ptr<sycl::access::decorated::no>().get();
-            build(v.book, xs.get_multi_ptr<sycl::access::decorated::no>().get(), Tp, nc, t);
-            sycl::group_barrier(it.get_group());
+            for (int ch = c0; ch < c1; ++ch) {
+                const int nc = sycl::min(CC, ncode - ch * CC), nv = nc / 8;
+                sycl::group_barrier(it.get_group());   // the last chunk's lookups are done with the table
+                if (t < nc * 8) xs[t] = hh[(size_t) e * FF + (size_t) ch * CI + t];
+                // every row's codes loaded before the table is built (their loads in flight meanwhile)
+                V4 w[RPT_D][CC / 8];
+                for (int k = 0; k < RPT_D; ++k) {
+                    const int64_t r = rb + (int64_t) k * WG + t;
+                    if (r >= N) continue;
+                    const uint8_t* codes = v.b + v.dn_o + (size_t) r * v.d_row + (size_t) ch * CC * 2;
+                    for (int q8 = 0; q8 < CC / 8; ++q8)
+                        if (q8 < nv) w[k][q8] = *(const V4*) (codes + (size_t) q8 * 16);
+                }
+                sycl::group_barrier(it.get_group());
+                build(v.book, xs.get_multi_ptr<sycl::access::decorated::no>().get(), Tp, nc, t);
+                sycl::group_barrier(it.get_group());
+                for (int k = 0; k < RPT_D; ++k) acc[k] += lookup_regs(w[k], nv, Tp);
+            }
             for (int k = 0; k < RPT_D; ++k) {
                 const int64_t r = rb + (int64_t) k * WG + t;
-                if (r >= N) continue;
-                part[((size_t) ch * (size_t) cap_entries + (size_t) e) * (size_t) N + (size_t) r] = lookup_regs(w[k], nv, Tp);
+                if (r < N) part[((size_t) cg * (size_t) cap_entries + (size_t) e) * (size_t) N + (size_t) r] = acc[k];
             }
         });
     });
@@ -261,9 +355,9 @@ sycl::event rvq_lut_down(sycl::queue& q, const unsigned long long* grp_ptr, cons
         int g = 0;
         while (g + 1 < ng && grp_start[g + 1] <= e) ++g;
         const View v = view(G, (const uint8_t*) grp_ptr[g]);
-        const int nc_e = (int) ((v.ff / 8 + CC - 1) / CC);
+        const int nc_e = (int) ((v.ff / 8 + CC - 1) / CC), ng_e = (nc_e + cpw - 1) / cpw;
         float s = 0.0f;
-        for (int c = 0; c < nc_e; ++c) s += part[((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) N + (size_t) r];
+        for (int c = 0; c < ng_e; ++c) s += part[((size_t) c * (size_t) cap_entries + (size_t) e) * (size_t) N + (size_t) r];
         out[(size_t) ent_dst[e] * N + r] = s * (float) v.gains[2 * v.ff + r];
     });
 }
