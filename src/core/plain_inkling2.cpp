@@ -140,6 +140,14 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
             allocs_.push_back(d);
             if (!strata::gpu::copy(d, h.data(), n * 2)) { err = "plain model: uploading the BF16 router failed"; return false; }
             b.router16 = (const uint16_t*) d;
+            // the F32 copy freed: every window reads the BF16 one (7 MB a layer, the drafter's head's room)
+            void* f32 = const_cast<float*>(b.router);
+            const auto it = std::find(allocs_.begin(), allocs_.end(), f32);
+            if (it != allocs_.end()) {
+                allocs_.erase(it);
+                strata::gpu::free(f32);
+                b.router = nullptr;
+            }
         } else if (!exact && l == 0) {
             std::fprintf(stderr, "[strata] %sffn_gate_inp.weight is not exact in BF16: the router stays F32\n", p.c_str());
         }
