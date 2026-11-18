@@ -13,6 +13,10 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <mutex>
+#include <utility>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -87,6 +91,96 @@ void inkling2_raw_rows(float* x, const float* src, const int32_t* raw, int64_t n
         if (raw[i / N] != 0) x[i] = src[i];
     });
     sync_if_needed(stream, event, "inkling2_raw_rows");
+}
+
+static void inkling2_attention_split(const float* q, const float* r, const float* sinks, const float* kc,
+                                     const float* vc, const float* table, const int32_t* steps, int n_head,
+                                     int n_head_kv, int rel, int extent, int window, float* out, int n_tokens,
+                                     int splits, const float* gate, void* stream);
+
+void inkling2_attention_gated(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
+                              const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
+                              int extent, int window, float* out, const float* gate, int n_tokens, void* stream) {
+    static const int split_env = [] { const char* v = std::getenv("STRATA_INK_ATT_SPLIT"); return v ? std::atoi(v) : -1; }();
+    if (n_tokens > 0 && n_tokens <= 8 && split_env != 0 && dim == 128 && rel <= 32 && n_head % n_head_kv == 0) {
+        const int splits = split_env > 0 ? split_env : (window > 0 ? 32 : 64);
+        inkling2_attention_split(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, rel, extent, window, out,
+                                 n_tokens, splits, gate, stream);
+        return;
+    }
+    inkling2_attention(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, dim, rel, extent, window, out, n_tokens,
+                       stream);
+    if (gate != nullptr) inkling2_sigmoid_mul(out, gate, (int64_t) n_tokens * n_head * dim, stream);
+}
+
+void inkling2_attn_prep(const float* kr, const float* vr, float* conv_k, float* conv_v, const float* k_w,
+                        const float* v_w, const float* kdyn, const float* vdyn, int n_taps, float conv_scale, float* q,
+                        float* r, const float* q_clip, const float* r_clip, float qk_thr, float r_thr, float alpha,
+                        float floor_, float eps, const int32_t* steps, float* kc, float* vc, int n_head, int n_head_kv,
+                        int dim, int rel, int n_tokens, float* snap_k, float* snap_v, int64_t snap_stride, int n_snap,
+                        void* stream) {
+    if (n_tokens <= 0) return;
+    constexpr int D = 128;
+    if (dim != D || rel > D || n_taps > kMaxTaps || n_tokens > 8) throw core::DeviceError("inkling2_attn_prep: shapes");
+    const int K = n_taps, T = n_tokens, NKV = n_head_kv, H = n_head;
+    const int64_t KVW = (int64_t) NKV * D;
+    // work-groups of 128: [0, NKV) k's heads, [NKV, 2 NKV) v's, then H of q, then H of r; each over the T tokens
+    const auto ev = queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) (2 * NKV + 2 * H) * D, D),
+                                                   [=](sycl::nd_item<1> it) {
+        const int g = (int) it.get_group(0), lid = (int) it.get_local_id(0);
+        auto clip_factor = [&](float ss, float thr, int t, bool with_alpha) {
+            float f = sycl::fmin(sycl::fmax(thr / (sycl::sqrt(ss) + 1e-6f), 0.0f), 1.0f);
+            if (with_alpha && alpha > 0.0f) {
+                const float p = (float) steps[(int64_t) t * kStepCount + kStepPos] + 1.0f;
+                f *= 1.0f + alpha * sycl::log(sycl::fmax(p / floor_, 1.0f));
+            }
+            return f;
+        };
+        if (g < 2 * NKV) {   // k or v: the head's channels, a work-item a channel, the tokens in order
+            const bool is_v = g >= NKV;
+            const int hd = is_v ? g - NKV : g;
+            const int64_t c = (int64_t) hd * D + lid;
+            const float* x = is_v ? vr : kr;
+            float* state = is_v ? conv_v : conv_k;
+            const float* w = (is_v ? v_w : k_w) + c * K;
+            const float* dyn = is_v ? vdyn : kdyn;
+            float* snap = is_v ? snap_v : snap_k;
+            float win[kMaxTaps];
+            for (int j = 0; j < K - 1; ++j) win[j] = state[c * (K - 1) + j];
+            for (int t = 0; t < T; ++t) {
+                win[K - 1] = x[(int64_t) t * KVW + c];
+                float sum = 0.0f;
+                for (int j = 0; j < K; ++j) sum += win[j] * w[j];
+                if (dyn != nullptr) {
+                    const float* tap = dyn + ((int64_t) t * NKV + hd) * K;
+                    for (int j = 0; j < K; ++j) sum += tap[j] * win[K - 1 - j];
+                }
+                float y = (win[K - 1] + sum) * conv_scale;
+                for (int j = 0; j < K - 1; ++j) win[j] = win[j + 1];
+                if (snap != nullptr && t < n_snap)
+                    for (int j = 0; j < K - 1; ++j) snap[(int64_t) t * snap_stride + c * (K - 1) + j] = win[j];
+                const float ss = sycl::reduce_over_group(it.get_group(), y * y, sycl::plus<float>());
+                y *= is_v ? sycl::rsqrt(ss / (float) D + eps) : clip_factor(ss, qk_thr, t, false);
+                const int64_t cell = steps[(int64_t) t * kStepCount + kStepPos];
+                (is_v ? vc : kc)[cell * KVW + c] = y;
+            }
+            for (int j = 0; j < K - 1; ++j) state[c * (K - 1) + j] = win[j];
+            return;
+        }
+        const bool is_r = g >= 2 * NKV + H;
+        const int hh = is_r ? g - 2 * NKV - H : g - 2 * NKV;
+        const int w = is_r ? rel : D;
+        const float* sc = is_r ? r_clip : q_clip;
+        for (int t = 0; t < T; ++t) {
+            float* v = (is_r ? r + ((int64_t) t * H + hh) * rel : q + ((int64_t) t * H + hh) * D);
+            float a = lid < w ? v[lid] : 0.0f;
+            if (sc != nullptr && lid < w) a *= sc[(int64_t) hh * w + lid];
+            const float ss = sycl::reduce_over_group(it.get_group(), a * a, sycl::plus<float>());
+            const float f = clip_factor(ss, is_r ? r_thr : qk_thr, t, true);
+            if (lid < w) v[lid] = a * f;
+        }
+    });
+    sync_if_needed(stream, ev, "inkling2_attn_prep");
 }
 
 void inkling2_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* y,
@@ -186,10 +280,126 @@ void inkling2_kv_store(const float* k, const float* v, const int32_t* steps, flo
     sync_if_needed(stream, event, "inkling2_kv_store");
 }
 
+// b70-local: a few tokens (the decode, speculative decoding's verify windows) - the attention split over the keys
+// (flash-decoding): a work-group a (token, head, split) takes its split's keys, a sub-group a key's dot product (the
+// key's row read contiguously), and writes its (max, sum, acc[D]); a second kernel joins the splits and the sink.  One
+// work-group a (token, head) gave 48 work-groups for a token and read each key's row a work-item at a time: on the
+// B70 (11-18, 2,356 cells) the attention was 43% of a decode layer.
+namespace {
+std::mutex att_mu;
+std::vector<std::pair<sycl::queue*, std::pair<float*, size_t>>> att_bufs;
+float* att_scratch(sycl::queue& q, size_t n) {
+    std::lock_guard<std::mutex> lk(att_mu);
+    for (auto& b : att_bufs)
+        if (b.first == &q && b.second.second >= n) return b.second.first;
+    float* p = sycl::malloc_device<float>(n, q);   // an older, smaller one stays for the graphs that use it
+    att_bufs.push_back({&q, {p, n}});
+    return p;
+}
+}  // namespace
+
+static void inkling2_attention_split(const float* q, const float* r, const float* sinks, const float* kc,
+                                     const float* vc, const float* table, const int32_t* steps, int n_head,
+                                     int n_head_kv, int rel, int extent, int window, float* out, int n_tokens,
+                                     int splits, const float* gate, void* stream) {
+    constexpr int D = 128, AWG = 128, PW = D + 2;
+    const int G = n_head / n_head_kv;
+    const float qs = 1.0f / sycl::sqrt((float) D);
+    sycl::queue& qu = queue_for(stream);
+    const size_t nwg = (size_t) n_tokens * n_head * splits;
+    float* part = att_scratch(qu, nwg * PW);
+    qu.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sq(sycl::range<1>(D), h);
+        sycl::local_accessor<float, 1> sr(sycl::range<1>(32), h);
+        sycl::local_accessor<float, 1> sc(sycl::range<1>(kAttnChunk), h);
+        h.parallel_for(sycl::nd_range<1>(nwg * AWG, AWG), [=](sycl::nd_item<1> it) {
+            const int g = (int) it.get_group(0), sp = g % splits, th = g / splits, t = th / n_head, hh = th % n_head;
+            const int kvh = hh / G, lid = (int) it.get_local_id(0);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), nl = (int) sg.get_local_linear_range();
+            const int sgi = (int) sg.get_group_linear_id(), nsg = (int) sg.get_group_linear_range();
+            const int64_t pos = steps[(int64_t) t * kStepCount + kStepPos];
+            sq[lid] = q[((int64_t) t * n_head + hh) * D + lid] * qs;
+            if (lid < rel) sr[lid] = r[((int64_t) t * n_head + hh) * rel + lid];
+            const int64_t lo = window > 0 ? sycl::max((int64_t) 0, pos - window + 1) : 0;
+            const int64_t nk = pos - lo + 1, L = (nk + splits - 1) / splits;
+            const int64_t j0 = lo + (int64_t) sp * L, j1 = sycl::min(pos + 1, j0 + L);
+            const int64_t width = (int64_t) n_head_kv * D;
+            sycl::group_barrier(it.get_group());
+            float m = -INFINITY, l = 0.0f, acc = 0.0f;
+            for (int64_t c0 = j0; c0 < j1; c0 += kAttnChunk) {
+                const int64_t c1 = sycl::min(j1, c0 + kAttnChunk);
+                for (int64_t j = c0 + sgi; j < c1; j += nsg) {   // a sub-group a key
+                    const float* kr = kc + j * width + (int64_t) kvh * D;
+                    float s = 0.0f;
+                    for (int d = lane; d < D; d += nl) s += sq[d] * kr[d];
+                    s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+                    if (lane == 0) {
+                        const int64_t dist = pos - j;
+                        if (dist < extent) {
+                            const float* tb = table + dist * rel;
+                            for (int i = 0; i < rel; ++i) s += sr[i] * tb[i];
+                        }
+                        sc[j - c0] = s;
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+                float cm = -INFINITY;
+                for (int64_t j = c0 + lid; j < c1; j += AWG) cm = sycl::fmax(cm, sc[j - c0]);
+                cm = sycl::reduce_over_group(it.get_group(), cm, sycl::maximum<float>());
+                const float nm = sycl::fmax(m, cm), a = sycl::exp(m - nm);
+                l *= a;
+                acc *= a;
+                float ls = 0.0f;
+                for (int64_t j = c0 + lid; j < c1; j += AWG) {
+                    const float p = sycl::exp(sc[j - c0] - nm);
+                    sc[j - c0] = p;
+                    ls += p;
+                }
+                l += sycl::reduce_over_group(it.get_group(), ls, sycl::plus<float>());
+                sycl::group_barrier(it.get_group());
+                for (int64_t j = c0; j < c1; ++j) acc += sc[j - c0] * vc[j * width + (int64_t) kvh * D + lid];
+                m = nm;
+                sycl::group_barrier(it.get_group());
+            }
+            float* pp = part + (size_t) g * PW;
+            if (lid == 0) { pp[0] = m; pp[1] = l; }
+            pp[2 + lid] = acc;
+        });
+    });
+    const auto ev = qu.parallel_for(sycl::nd_range<1>((size_t) n_tokens * n_head * D, D), [=](sycl::nd_item<1> it) {
+        const int th = (int) it.get_group(0), lid = (int) it.get_local_id(0);
+        const float* pp = part + (size_t) th * splits * PW;
+        float M = sinks[th];   // the sink: a logit with a zero value
+        for (int s = 0; s < splits; ++s) M = sycl::fmax(M, pp[(size_t) s * PW]);
+        float den = sycl::exp(sinks[th] - M), num = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const float ms = pp[(size_t) s * PW];
+            if (ms == -INFINITY) continue;
+            const float w = sycl::exp(ms - M);
+            den += w * pp[(size_t) s * PW + 1];
+            num += w * pp[(size_t) s * PW + 2 + lid];
+        }
+        const float o = num / den;
+        out[(int64_t) th * D + lid] = gate ? o / (1.0f + sycl::exp(-gate[(int64_t) th * D + lid])) : o;
+    });
+    sync_if_needed(stream, ev, "inkling2_attention (split)");
+}
+
 void inkling2_attention(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
                         const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
                         int extent, int window, float* out, int n_tokens, void* stream) {
     if (n_tokens <= 0) return;
+    // b70-local: up to 8 tokens through the split kernel (STRATA_INK_ATT_SPLIT=0: off; =N: N splits on every layer)
+    static const int split_env = [] { const char* v = std::getenv("STRATA_INK_ATT_SPLIT"); return v ? std::atoi(v) : -1; }();
+    if (n_tokens <= 8 && split_env != 0 && dim == 128 && rel <= 32 && n_head % n_head_kv == 0) {
+        // 32 splits on the sliding layers (1024 cells), 64 on the full ones (B70, 11-18: 8 -> 32 on the sliding layers
+        // took their attention part from 517K to 351K clock ticks at 2,356 cells)
+        const int splits = split_env > 0 ? split_env : (window > 0 ? 32 : 64);
+        inkling2_attention_split(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, rel, extent, window, out,
+                                 n_tokens, splits, nullptr, stream);
+        return;
+    }
     if (dim != 128 || rel > 32 || n_head % n_head_kv != 0)
         throw core::DeviceError("inkling2_attention: heads of 128 and a bias rank of at most 32");
     constexpr int D = 128, AWG = 128;

@@ -58,6 +58,22 @@ void inkling2_attention(const float* q, const float* r, const float* sinks, cons
 /// x *= sigmoid(g), n values.
 void inkling2_sigmoid_mul(float* x, const float* g, int64_t n, void* stream);
 
+/// b70-local: a few tokens' (n_tokens <= 8) attention inputs in one launch, inkling2_conv of k and v (with the dynamic
+/// taps kdyn / vdyn or null, the histories' snapshots as inkling2_conv's), the clips of q, k and r, v's RMS norm and the
+/// cache store - the same arithmetic as those kernels one after another.  kr / vr [T][nkv D] in, q [T][H][D] and
+/// r [T][H][rel] clipped in place.
+void inkling2_attn_prep(const float* kr, const float* vr, float* conv_k, float* conv_v, const float* k_w,
+                        const float* v_w, const float* kdyn, const float* vdyn, int n_taps, float conv_scale, float* q,
+                        float* r, const float* q_clip, const float* r_clip, float qk_thr, float r_thr, float alpha,
+                        float floor_, float eps, const int32_t* steps, float* kc, float* vc, int n_head, int n_head_kv,
+                        int dim, int rel, int n_tokens, float* snap_k, float* snap_v, int64_t snap_stride, int n_snap,
+                        void* stream);
+
+/// b70-local: inkling2_attention and then out *= sigmoid(gate) (gate [T][H][D]; null: none).
+void inkling2_attention_gated(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
+                              const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
+                              int extent, int window, float* out, const float* gate, int n_tokens, void* stream);
+
 /// x = cap tanh(x / cap) over `cols` of each of `rows` rows `ld` apart.
 void inkling2_softcap(float* x, int64_t rows, int64_t cols, int64_t ld, float cap, void* stream);
 

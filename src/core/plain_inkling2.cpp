@@ -410,17 +410,26 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
 
     // ---- k and v through their convolutions, the clips, the cache, the attention
     const float sk = 1.0f / std::sqrt((float) ((b.swa ? 1 : 2) * KT + 1));
-    k::inkling2_conv(i_kr_, conv_k, b.k_conv, b.swa ? nullptr : i_kp_, (int) NKV, i_k_, KVW, (int) KT, sk, T, cs, snap_k, sst, ns);
-    k::inkling2_conv(i_vr_, conv_v, b.v_conv, b.swa ? nullptr : i_vp_, (int) NKV, i_v_, KVW, (int) KT, sk, T, cs, snap_v, sst, ns);
     const float alpha = b.swa ? 0.0f : (float) s.log_scale_alpha, fl = (float) s.log_scale_floor;
-    k::inkling2_head_clip(i_q_, b.q_clip, (float) s.qk_clip, alpha, fl, step_, (int) H, (int) D, T, cs);
-    k::inkling2_head_clip(i_k_, nullptr, (float) s.qk_clip, 0.0f, fl, step_, (int) NKV, (int) D, T, cs);
-    k::inkling2_head_rms(i_v_, eps, (int) NKV, (int) D, T, cs);
-    k::inkling2_head_clip(i_r_, b.rel_clip, (float) s.rel_clip, alpha, fl, step_, (int) H, (int) R, T, cs);
-    k::inkling2_kv_store(i_k_, i_v_, step_, b.kc, b.vc, KVW, T, cs);
-    k::inkling2_attention(i_q_, i_r_, i_sink_, b.kc, b.vc, b.rel_table, step_, (int) H, (int) NKV, (int) D, (int) R,
-                          (int) b.extent, b.swa ? (int) s.n_swa : 0, i_att_, T, cs);
-    k::inkling2_sigmoid_mul(i_att_, i_gate_, (int64_t) T * H * D, cs);
+    // b70-local: a few tokens' inputs in one launch (STRATA_INK_PREP_FUSED=0: the kernels one by one), the gate in the
+    // attention's last kernel
+    static const bool prep_fused = [] { const char* v = std::getenv("STRATA_INK_PREP_FUSED"); return v == nullptr || v[0] != '0'; }();
+    if (prep_fused && T <= 8 && D == 128) {
+        k::inkling2_attn_prep(i_kr_, i_vr_, conv_k, conv_v, b.k_conv, b.v_conv, b.swa ? nullptr : i_kp_,
+                              b.swa ? nullptr : i_vp_, (int) KT, sk, i_q_, i_r_, b.q_clip, b.rel_clip, (float) s.qk_clip,
+                              (float) s.rel_clip, alpha, fl, eps, step_, b.kc, b.vc, (int) H, (int) NKV, (int) D, (int) R,
+                              T, snap_k, snap_v, sst, ns, cs);
+    } else {
+        k::inkling2_conv(i_kr_, conv_k, b.k_conv, b.swa ? nullptr : i_kp_, (int) NKV, i_k_, KVW, (int) KT, sk, T, cs, snap_k, sst, ns);
+        k::inkling2_conv(i_vr_, conv_v, b.v_conv, b.swa ? nullptr : i_vp_, (int) NKV, i_v_, KVW, (int) KT, sk, T, cs, snap_v, sst, ns);
+        k::inkling2_head_clip(i_q_, b.q_clip, (float) s.qk_clip, alpha, fl, step_, (int) H, (int) D, T, cs);
+        k::inkling2_head_clip(i_k_, nullptr, (float) s.qk_clip, 0.0f, fl, step_, (int) NKV, (int) D, T, cs);
+        k::inkling2_head_rms(i_v_, eps, (int) NKV, (int) D, T, cs);
+        k::inkling2_head_clip(i_r_, b.rel_clip, (float) s.rel_clip, alpha, fl, step_, (int) H, (int) R, T, cs);
+        k::inkling2_kv_store(i_k_, i_v_, step_, b.kc, b.vc, KVW, T, cs);
+    }
+    k::inkling2_attention_gated(i_q_, i_r_, i_sink_, b.kc, b.vc, b.rel_table, step_, (int) H, (int) NKV, (int) D, (int) R,
+                                (int) b.extent, b.swa ? (int) s.n_swa : 0, i_att_, i_gate_, T, cs);
     glm5_decode_stamp(this, l, 2, cs);
     gproj(b.o, i_att_, i_o_, T, false, cs);
     const float s1 = 1.0f / std::sqrt((float) (KT + 1));

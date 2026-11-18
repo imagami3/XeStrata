@@ -487,6 +487,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             return r;
         };
         int64_t resume = takes(live);
+        // b70-local: STRATA_NO_RESUME=1 - every request read from its start (a tap dump for the drafter's training
+        // needs each sequence whole)
+        static const bool no_resume = std::getenv("STRATA_NO_RESUME") != nullptr;
+        if (no_resume) resume = 0;
         // the live conversation set aside before a request that does not continue it overwrites it, as far as the
         // budget, the slots and the RAM let it (the least recently used ones dropped first)
         auto park_live = [&](std::list<ConversationCache::Entry>::iterator keep) {
