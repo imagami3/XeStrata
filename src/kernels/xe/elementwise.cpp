@@ -110,6 +110,16 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
     sync_if_needed(stream, event);
 }
 
+void add_rows_inplace(float* dst, const float* src, int64_t stride, int count, int64_t n, void* stream) {
+    if (n <= 0 || count <= 0) return;
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        float v = dst[i];
+        for (int j = 0; j < count; ++j) v += src[(size_t) j * (size_t) stride + i[0]];
+        dst[i] = v;
+    });
+    sync_if_needed(stream, event);
+}
+
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
@@ -139,6 +149,9 @@ inline void bump_host(uint32_t* p) {
     const uint32_t n = *v + 1u;
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
     *v = n;
+    // b70-local (11-18): the store pushed out now; without it the line sat in the GPU's cache until something evicted
+    // it (an EP helper's sums seen ~40 us late: its next kernel only spins)
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
 }
 }  // namespace
 
@@ -256,7 +269,56 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
 
 namespace {
 struct MappedCopies { MappedCopy c[8]; };
+// b70-local: a work-group waits for every flag (one item spins), then sees what was written before them
+inline void wg_wait_flags(const sycl::nd_item<1>& it, const uint32_t* f, int stride, int n, uint32_t v) {
+    if (it.get_local_id(0) == 0)
+        for (int i = 0; i < n; ++i)
+            while (read_host(f + (size_t) i * (size_t) stride) < v) {
+            }
+    sycl::group_barrier(it.get_group());
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+}
 }  // namespace
+
+void copy_from_mapped_multi_after(const MappedCopy* copies, int n, const uint32_t* flag, int stride, int n_flags,
+                                  uint32_t value, void* stream) {
+    if (n <= 0) return;
+    if (n > 8) throw core::DeviceError("copy_from_mapped_multi_after: at most 8 copies");
+    MappedCopies a{};
+    int64_t tot = 0;
+    for (int i = 0; i < n; ++i) {
+        a.c[i] = copies[i];
+        tot += copies[i].words;
+    }
+    // one flat range of 4-byte words over the copies, in groups of 256 (at most 64 groups)
+    const size_t groups = (size_t) std::clamp<int64_t>((tot + 255) / 256, 1, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        wg_wait_flags(it, flag, stride, n_flags, value);
+        const int64_t st = (int64_t) it.get_global_range(0);
+        for (int k = 0; k < n; ++k) {
+            const MappedCopy c = a.c[k];
+            const volatile int32_t* s = static_cast<const volatile int32_t*>(c.src);
+            int32_t* d = static_cast<int32_t*>(c.dst);
+            for (int64_t i = (int64_t) it.get_global_id(0); i < c.words; i += st) d[i] = s[i];
+        }
+    });
+}
+
+void add_rows_inplace_after(float* dst, const float* src, int64_t stride, int count, int64_t n, const uint32_t* flag,
+                            int fstride, int n_flags, uint32_t value, void* stream) {
+    if (n <= 0) return;
+    const size_t groups = (size_t) std::clamp<int64_t>((n + 255) / 256, 1, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        wg_wait_flags(it, flag, fstride, n_flags, value);
+        const int64_t st = (int64_t) it.get_global_range(0);
+        const volatile float* s = src;
+        for (int64_t i = (int64_t) it.get_global_id(0); i < n; i += st) {
+            float v = dst[i];
+            for (int j = 0; j < count; ++j) v += s[(size_t) j * (size_t) stride + (size_t) i];
+            dst[i] = v;
+        }
+    });
+}
 
 // upstream 4a5713fb: the draft graphs' inputs from mapped memory in one launch instead of one each
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {

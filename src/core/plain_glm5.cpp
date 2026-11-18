@@ -32,6 +32,8 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
+
+#include <map>
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -451,10 +453,10 @@ void PlainModel::gproj(const W& w, const float* x, float* y, int T, bool quantiz
 // (0 start, 1 hc_read, 2 mixer, 3 hc_post + hc_read of the FFN, 4 router + shared expert, 5 routed experts + combine),
 // read after each window (glm5_decode_prof_read) and printed every 64 windows as each part's share of the ticks.
 namespace {
-struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}, kda[5] = {}, dsa_vb = 0; int o_type = 0, o_in = 0, o_out = 0; double sum[2][6] = {}; long long n[2] = {}; long long windows = 0; };
+struct DecProf { unsigned long long* dev = nullptr; std::vector<unsigned long long> h; double dsa[5] = {}, kda[5] = {}, dsa_vb = 0; int o_type = 0, o_in = 0, o_out = 0; double sum[2][6] = {}, wt[6] = {}; long long n[2] = {}; long long windows = 0; };
 std::unordered_map<const void*, DecProf>& dec_profs() { static std::unordered_map<const void*, DecProf> m; return m; }
 bool dec_prof_on() { static const bool on = std::getenv("STRATA_DECODE_PROFILE") != nullptr && k::gpu_stamp_available(); return on; }
-constexpr int kDecSlots = 12, kDecLayers = 96;
+constexpr int kDecSlots = 16, kDecLayers = 96;
 }
 
 void glm5_decode_note_o(const void* model, int type, int n_in, int n_out) {
@@ -516,6 +518,30 @@ void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, i
                      model, d.dsa_vb / d.n[1], (d.dsa[4] - d.dsa_vb) / d.n[1], d.o_type, d.o_in, d.o_out);
 }
 
+// b70-local: a helper GPU's stamps of another stage's layers (record_assist): 0 the experts' input seen, 1 copied in and
+// published, 2 experts + combine done, 3 sums out (doorbell)
+void ink_assist_prof_read(const void* model, int64_t first_l, int64_t last_l) {
+    if (!dec_prof_on()) return;
+    auto it = dec_profs().find(model);
+    if (it == dec_profs().end() || it->second.dev == nullptr) return;
+    DecProf& d = it->second;
+    if (!strata::gpu::copy(d.h.data(), d.dev, d.h.size() * 8)) return;
+    struct Acc { long long first = 0, shown = 0; double second[5] = {0, 0, 0, 0, 0}; };
+    static std::map<std::pair<const void*, int64_t>, Acc> acc;   // (helper, the owner's first layer)
+    auto& a = acc[{model, first_l}];
+    for (int64_t l = first_l; l < last_l && l < kDecLayers; ++l) {
+        const unsigned long long* st = &d.h[(size_t) l * kDecSlots];
+        if (st[0] == 0 || st[3] < st[0] || st[1] < st[0] || st[2] < st[1]) continue;
+        for (int i = 0; i < 3; ++i) a.second[i] += (double) (st[i + 1] - st[i]);
+        if (st[4] && st[0] >= st[4]) { a.second[3] += (double) (st[0] - st[4]); a.second[4] += (double) (st[3] - st[4]); }
+        ++a.first;
+    }
+    if (a.first / 2000 != a.shown && (a.shown = a.first / 2000, true))
+        std::fprintf(stderr, "strata assist profile %p for layers from %lld (%lld layers): copy-in+publish %.0f, experts+combine %.0f, out %.0f ticks; "
+                     "o seen -> experts seen %.0f, -> sums out %.0f\n", model, (long long) first_l, a.first, a.second[0] / a.first,
+                     a.second[1] / a.first, a.second[2] / a.first, a.second[3] / a.first, a.second[4] / a.first);
+}
+
 // b70-local: the same stamps in Inkling 2's layers (record_iblock): 0 start, 1 norms + projections, 2 convolutions +
 // clips + attention, 3 o + its convolution + the residual, 4 MoE norm + router, 5 experts + combine + convolution;
 // layers split by kind (sliding-window or global attention)
@@ -535,8 +561,16 @@ void ink_decode_prof_read(const void* model, const std::vector<char>& is_swa, in
             d.dsa[0] += (double) (st[6] - st[3]); d.dsa[1] += (double) (st[7] - st[6]); d.dsa[2] += (double) (st[4] - st[7]);
             d.dsa_vb += 1;
         }
+        if (st[9] >= st[8] && st[8]) { d.wt[0] += (double) (st[9] - st[8]); d.wt[3] += 1; }   // b70-local: EP/TP waits
+        if (st[11] >= st[10] && st[10]) d.wt[1] += (double) (st[11] - st[10]);
+        if (st[13] >= st[12] && st[12]) d.wt[2] += (double) (st[13] - st[12]);
+        if (st[14] && st[9] >= st[14] && st[15] >= st[14]) { d.wt[4] += (double) (st[9] - st[14]); d.wt[5] += (double) (st[15] - st[14]); }
         ++d.n[kk];
     }
+    if (d.windows % 64 == 63 && d.wt[3] > 0)
+        std::fprintf(stderr, "strata decode profile %p waits a layer (ticks): q/gate %.0f, o %.0f, experts %.0f; o published -> "
+                     "experts published %.0f, -> their sums in %.0f\n", model, d.wt[2] / d.wt[3], d.wt[1] / d.wt[3],
+                     d.wt[0] / d.wt[3], d.wt[5] / d.wt[3], d.wt[4] / d.wt[3]);
     if (d.windows % 64 == 63 && d.dsa_vb > 0)
         std::fprintf(stderr, "strata decode profile %p router part: residual mix %.0f, norm+product %.0f, top-k+publish %.0f\n",
                      model, d.dsa[0] / d.dsa_vb, d.dsa[1] / d.dsa_vb, d.dsa[2] / d.dsa_vb);

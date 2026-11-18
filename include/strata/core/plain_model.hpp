@@ -552,6 +552,31 @@ private:
     float *h_ay_ = nullptr, *m_ay_ = nullptr;
     uint32_t *h_ain_ = nullptr, *m_ain_ = nullptr, *h_aout_ = nullptr, *m_aout_ = nullptr;
     std::unordered_map<int, strata::gpu::Graph*> assist_;   ///< EP helper: (owner stage << 16 | T) -> its graph
+    /// b70-local STRATA_INK_EP_DIRECT=1: the relay without the host: one mapped region of the owner's, registered in
+    /// every helper's context, which the GPUs' kernels read and write themselves (the owner's rows and sequence
+    /// numbers in, each helper's sums and flag out); the host only launches the graphs and watches the flags
+    bool ep_direct_ = false, ep_reg_shared_ = false;
+    void* ep_reg_ = nullptr;
+    size_t ep_reg_bytes_ = 0;
+    static constexpr int kEpFlagStride = 16;        ///< a helper's flag a 64-byte line
+    struct EpReg {
+        uint32_t *tseq = nullptr, *eseq = nullptr, *flag = nullptr;   ///< TP publishes, expert publishes; helpers' phases
+        float *tx = nullptr, *ex = nullptr, *ew = nullptr, *trem = nullptr, *rem = nullptr;
+        int32_t* eids = nullptr;
+    } epr_;
+    uint32_t ep_hc_ = 0;                            ///< EP direct owner: the helpers' phases recorded so far in this window
+    /// b70-local TP cuts (STRATA_INK_TP_QG / STRATA_INK_TP_O: the owner's fraction of q / gate's rows and of o's; the
+    /// helpers share the rest; default 1 / ep_n_): stage st's rows [off[st], off[st] + w[st]) of layer l's matrix
+    struct TpCut { int64_t off[4] = {0, 0, 0, 0}, w[4] = {0, 0, 0, 0}; };
+    std::vector<int64_t> ep_bounds_;                ///< the stages' first layers, then n_layer
+    double tp_fqg_ = 0, tp_fo_ = 0;
+    int ep_owner_stage(int64_t l) const {
+        for (size_t i = 0; i + 1 < ep_bounds_.size(); ++i)
+            if (l < ep_bounds_[i + 1]) return (int) i;
+        return 0;
+    }
+    TpCut tp_cut(int64_t l, int64_t rows, bool o) const;
+    int64_t tp_wmax_qg_ = 0;                        ///< the widest q / gate slice of any stage (a relay slot's [T][2 x it])
     bool record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
                        strata::gpu::Stream cs, std::string& err);
     /// `mtp`: the MTP layer's block, without the mHC mixes

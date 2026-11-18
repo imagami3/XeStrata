@@ -111,11 +111,14 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
     b.extent = b.swa ? s.n_swa : s.rel_extent;
     b.n_aq = l == 0 ? 0 : (b.swa ? 1 : 3);
     // b70-local TP: q, gate and o as this GPU's slice of their rows
-    const int64_t tn = tp_ ? ep_n_ : 1, ts = tp_ ? ep_stage_ : 0, qs = H * D / tn, os = (int64_t) N / tn;
-    if (!upload(m, p + "attn_q.weight", b.q, err, false, ts * qs, tp_ ? qs : -1) || !upload(m, p + "attn_k.weight", b.k, err) ||
+    const TpCut cq = tp_cut(l, H * D, false), co = tp_cut(l, (int64_t) N, true);
+    const int ts = tp_ ? ep_stage_ : 0;
+    const int64_t q0r = tp_ ? cq.off[ts] : 0, qs = tp_ ? cq.w[ts] : H * D, o0r = tp_ ? co.off[ts] : 0,
+                  os = tp_ ? co.w[ts] : (int64_t) N;
+    if (!upload(m, p + "attn_q.weight", b.q, err, false, q0r, tp_ ? qs : -1) || !upload(m, p + "attn_k.weight", b.k, err) ||
         !upload(m, p + "attn_v.weight", b.v, err) ||
-        !upload(m, p + "attn_output.weight", b.o, err, false, ts * os, tp_ ? os : -1) ||
-        !upload(m, p + "attn_gate.weight", b.gate, err, false, ts * qs, tp_ ? qs : -1) ||
+        !upload(m, p + "attn_output.weight", b.o, err, false, o0r, tp_ ? os : -1) ||
+        !upload(m, p + "attn_gate.weight", b.gate, err, false, q0r, tp_ ? qs : -1) ||
         !upload(m, p + "attn_rel.weight", b.rel, err) ||
         !upload(m, p + "attn_sink_proj.weight", b.sink, err) ||
         !upload_f32(m, p + "attn_q_clip.weight", (uint64_t) (H * D), b.q_clip, err) ||
@@ -167,10 +170,9 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
         return false;
     }
     if (b.n_aq > 0 && !upload_f32(m, p + "attn_res_query.weight", N * (uint64_t) b.n_aq, b.attn_rq, err)) return false;
-    if ((H * D) % tn != 0 || (int64_t) N % tn != 0) return bad("attention projections (the TP slices)");
-    if ((uint64_t) b.q.n_in != N || b.q.n_out * tn != H * D || (uint64_t) b.k.n_in != N || b.k.n_out != NKV * D ||
-        (uint64_t) b.v.n_in != N || b.v.n_out != NKV * D || b.o.n_in != H * D || (uint64_t) b.o.n_out * tn != N ||
-        (uint64_t) b.gate.n_in != N || b.gate.n_out * tn != H * D || (uint64_t) b.rel.n_in != N || b.rel.n_out != H * R ||
+    if ((uint64_t) b.q.n_in != N || b.q.n_out != qs || (uint64_t) b.k.n_in != N || b.k.n_out != NKV * D ||
+        (uint64_t) b.v.n_in != N || b.v.n_out != NKV * D || b.o.n_in != H * D || b.o.n_out != os ||
+        (uint64_t) b.gate.n_in != N || b.gate.n_out != qs || (uint64_t) b.rel.n_in != N || b.rel.n_out != H * R ||
         (uint64_t) b.sink.n_in != N || b.sink.n_out != H)
         return bad("attention projections");
     if (!b.swa && (b.kproj.n_out != KT * NKV || b.vproj.n_out != KT * NKV)) return bad("dynamic convolution taps");
@@ -236,7 +238,6 @@ bool PlainModel::load_inkling2(std::string& err) {
     for (int64_t l = lb_; l < le_; ++l)
         if (!load_iblock(m, l, iblocks_[(size_t) l], err)) return false;
     if (tp_) {   // b70-local TP: this GPU's slices of the other stages' layers too
-        const int64_t qs = s.n_head * s.key_length / ep_n_, os = s.n_embd / ep_n_;
         tpw_.resize((size_t) s.n_layer);
         for (int64_t l = 0; l < s.n_layer; ++l) {
             TPW& t = tpw_[(size_t) l];
@@ -248,9 +249,11 @@ bool PlainModel::load_inkling2(std::string& err) {
                 continue;
             }
             const std::string p = "blk." + std::to_string(l) + ".";
-            if (!upload(m, p + "attn_q.weight", t.q, err, false, ep_stage_ * qs, qs) ||
-                !upload(m, p + "attn_gate.weight", t.gate, err, false, ep_stage_ * qs, qs) ||
-                !upload(m, p + "attn_output.weight", t.o, err, false, ep_stage_ * os, os))
+            const TpCut cq = tp_cut(l, s.n_head * s.key_length, false), co = tp_cut(l, s.n_embd, true);
+            const int64_t q0r = cq.off[ep_stage_], qs = cq.w[ep_stage_], o0r = co.off[ep_stage_], os = co.w[ep_stage_];
+            if (!upload(m, p + "attn_q.weight", t.q, err, false, q0r, qs) ||
+                !upload(m, p + "attn_gate.weight", t.gate, err, false, q0r, qs) ||
+                !upload(m, p + "attn_output.weight", t.o, err, false, o0r, os))
                 return false;
         }
     }
@@ -301,7 +304,18 @@ bool PlainModel::load_inkling2(std::string& err) {
         return false;
     }
     // b70-local EP: the relay's rows (an owner's: the other GPUs' sums; a helper's: the owner's rows in, its sum out)
-    const uint64_t TQS = tp_ ? 2 * HD / (uint64_t) ep_n_ : 0, AXW = tp_ ? std::max(UN, HD) : UN,
+    if (tp_) {   // the widest q / gate slice (every layer's cuts have the same widths, by owner or helper)
+        const TpCut c = tp_cut(0, (int64_t) HD, false), co = tp_cut(0, (int64_t) UN, true);
+        tp_wmax_qg_ = 0;
+        for (int st = 0; st < ep_n_; ++st) tp_wmax_qg_ = std::max({tp_wmax_qg_, c.w[st], (co.w[st] + 1) / 2});
+        const bool even = tp_wmax_qg_ * ep_n_ == (int64_t) HD && c.w[0] == c.w[ep_n_ - 1] && co.w[0] == co.w[ep_n_ - 1];
+        const char* v = std::getenv("STRATA_INK_EP_DIRECT");
+        if (!even && v != nullptr && v[0] == '0') {
+            err = "plain model: uneven TP cuts (STRATA_INK_TP_QG / _O) need the direct relay";
+            return false;
+        }
+    }
+    const uint64_t TQS = tp_ ? 2 * (uint64_t) tp_wmax_qg_ : 0, AXW = tp_ ? std::max(UN, HD) : UN,
                    AYW = std::max(UN, TQS);   // TP: a helper's input (o's: H x D) and its two q / gate slices out
     if (ep_ && (!imapped((uint64_t) (ep_n_ - 1) * T * UN * 4, (void**) &h_rem_, (void**) &m_rem_) ||
                 !imapped(T * AXW * 4, (void**) &h_ax_, (void**) &m_ax_) ||
@@ -317,6 +331,33 @@ bool PlainModel::load_inkling2(std::string& err) {
                 !imapped((uint64_t) (ep_n_ - 1) * T * TQS * 4, (void**) &h_trem_, (void**) &m_trem_))) {
         err = "plain model: the TP relay's mapped buffers";
         return false;
+    }
+    if (ep_) {   // b70-local EP direct: the region (STRATA_INK_EP_DIRECT=0: the host relays)
+        const char* v = std::getenv("STRATA_INK_EP_DIRECT");
+        ep_direct_ = v == nullptr || v[0] != '0';
+    }
+    if (ep_ && ep_direct_) {
+        size_t off = 4096;
+        auto take = [&](uint64_t bytes) { const size_t o = off; off += (size_t) ((bytes + 255) / 256 * 256); return o; };
+        const size_t o_tx = take(T * AXW * 4), o_ex = take(T * UN * 4), o_ids = take(T * K * 4), o_w = take(T * K * 4),
+                     o_trem = take((uint64_t) (ep_n_ - 1) * T * std::max<uint64_t>(TQS, 1) * 4),
+                     o_rem = take((uint64_t) (ep_n_ - 1) * T * UN * 4);
+        ep_reg_bytes_ = (off + 65535) / 65536 * 65536;
+        void* dm = nullptr;
+        if (!imapped(ep_reg_bytes_, &ep_reg_, &dm) || dm != ep_reg_) {
+            err = "plain model: the direct relay's region";
+            return false;
+        }
+        uint8_t* b8 = (uint8_t*) ep_reg_;
+        epr_.tseq = (uint32_t*) b8;
+        epr_.eseq = (uint32_t*) (b8 + 64);
+        epr_.flag = (uint32_t*) (b8 + 128);
+        epr_.tx = (float*) (b8 + o_tx);
+        epr_.ex = (float*) (b8 + o_ex);
+        epr_.eids = (int32_t*) (b8 + o_ids);
+        epr_.ew = (float*) (b8 + o_w);
+        epr_.trem = (float*) (b8 + o_trem);
+        epr_.rem = (float*) (b8 + o_rem);
     }
     // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 256)
     const size_t xq = std::max(k::native_q8_1_bytes((int) UN, 1), k::native_q8_1_bytes((int) HD, 1)) * (size_t) T;
@@ -487,24 +528,81 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     };
     // b70-local TP: this GPU's rows of q and gate (or o) and the other GPUs', relayed, each in its columns
     const int64_t tqs = tp_ ? H * D / ep_n_ : 0, tos = tp_ ? (int64_t) N / ep_n_ : 0;
+    const bool epd = ep_direct_;
+    float* const tp_rem = epd ? epr_.trem : m_trem_;
     auto tp_others = [&](float* dst, int64_t ld, int64_t w, int64_t off) {   // the relay's slices of every other GPU
         int j = 0;
         for (int st = 0; st < ep_n_; ++st) {
             if (st == ep_stage_) continue;
-            k::inkling2_put_cols(dst, ld, st * w, m_trem_ + (size_t) j * T * 2 * tqs + (size_t) off, w, T, cs);
+            k::inkling2_put_cols(dst, ld, st * w, tp_rem + (size_t) j * T * 2 * tqs + (size_t) off, w, T, cs);
             ++j;
         }
     };
     // published first (the other GPUs start while this one runs its other projections), finished after them
     auto tp_pub = [&](const float* xin) {
-        k::doorbell_publish(xin, ids_, w_, (int64_t) T * N, 0, m_tx_, nullptr, nullptr, m_tseq_, cs);
+        k::doorbell_publish(xin, ids_, w_, (int64_t) T * N, 0, epd ? epr_.tx : m_tx_, nullptr, nullptr,
+                            epd ? epr_.tseq : m_tseq_, cs);
+    };
+    // b70-local: EP direct: the waits inside the kernels that read what they wait for (STRATA_INK_EP_FUSEWAIT=0: apart)
+    static const bool fw_env = [] { const char* v = std::getenv("STRATA_INK_EP_FUSEWAIT"); return v == nullptr || v[0] != '0'; }();
+    const bool fw = epd && fw_env;
+    auto tp_wait = [&] {   // the other GPUs' slices of this phase there
+        if (epd) k::wait_flags_ge(epr_.flag, kEpFlagStride, ep_n_ - 1, ++ep_hc_, cs);
+        else k::wait_flag_ge(m_tflag_, ++tp_ring_, cs);
+    };
+    // b70-local: one kernel places the slices (STRATA_INK_TP_PLACE=0: one put_cols a slice); one token: this GPU's
+    // rows straight into their columns
+    static const bool tp_place = [] { const char* v = std::getenv("STRATA_INK_TP_PLACE"); return v == nullptr || v[0] != '0'; }();
+    // b70-local: the direct relay's slots: [T][2 x the widest slice]; the cuts may be uneven (tp_cut)
+    const int64_t slot = (int64_t) T * 2 * tp_wmax_qg_;
+    auto pcut = [&](const TpCut& c) {
+        k::TpPlaceCut p{};
+        for (int st = 0; st < 4; ++st) { p.off[st] = c.off[st]; p.w[st] = c.w[st]; }
+        return p;
     };
     auto tp_qg = [&](const float* xin, bool quantized) {
+        if (tp_place && epd) {
+            const TpCut c = tp_cut(l, H * D, false);
+            const int64_t wq = c.w[ep_stage_], oq = c.off[ep_stage_];
+            const bool direct = T == 1;
+            float* q0 = direct ? i_q_ + (size_t) oq : i_tps_;
+            float* g0 = direct ? i_gate_ + (size_t) oq : i_tps_ + (size_t) T * wq;
+            gproj(b.q, xin, q0, T, quantized, cs);
+            gproj(b.gate, xin, g0, T, true, cs);
+            glm5_decode_stamp(this, l, 12, cs);
+            if (!fw) {
+                tp_wait();
+                glm5_decode_stamp(this, l, 13, cs);
+            }
+            k::inkling2_tp_place_cut(i_q_, i_gate_, H * D, pcut(c), ep_n_, T, direct ? nullptr : q0, direct ? nullptr : g0,
+                                     ep_stage_, epr_.trem, slot, cs, fw ? epr_.flag : nullptr, kEpFlagStride, ep_n_ - 1,
+                                     fw ? ++ep_hc_ : 0);
+            return;
+        }
+        if (tp_place) {
+            const bool direct = T == 1;
+            float* q0 = direct ? i_q_ + (size_t) ep_stage_ * tqs : i_tps_;
+            float* g0 = direct ? i_gate_ + (size_t) ep_stage_ * tqs : i_tps_ + (size_t) T * tqs;
+            gproj(b.q, xin, q0, T, quantized, cs);
+            gproj(b.gate, xin, g0, T, true, cs);
+            glm5_decode_stamp(this, l, 12, cs);
+            if (fw) {
+                k::inkling2_tp_place(i_q_, i_gate_, H * D, tqs, T, direct ? nullptr : q0, direct ? nullptr : g0, ep_stage_,
+                                     tp_rem, (int64_t) T * 2 * tqs, (int64_t) T * tqs, ep_n_, cs, epr_.flag, kEpFlagStride,
+                                     ep_n_ - 1, ++ep_hc_);
+                return;
+            }
+            tp_wait();
+            glm5_decode_stamp(this, l, 13, cs);
+            k::inkling2_tp_place(i_q_, i_gate_, H * D, tqs, T, direct ? nullptr : q0, direct ? nullptr : g0, ep_stage_,
+                                 tp_rem, (int64_t) T * 2 * tqs, (int64_t) T * tqs, ep_n_, cs);
+            return;
+        }
         gproj(b.q, xin, i_tps_, T, quantized, cs);
         gproj(b.gate, xin, i_tps_ + (size_t) T * tqs, T, true, cs);
         k::inkling2_put_cols(i_q_, H * D, ep_stage_ * tqs, i_tps_, tqs, T, cs);
         k::inkling2_put_cols(i_gate_, H * D, ep_stage_ * tqs, i_tps_ + (size_t) T * tqs, tqs, T, cs);
-        k::wait_flag_ge(m_tflag_, ++tp_ring_, cs);
+        tp_wait();
         tp_others(i_q_, H * D, tqs, 0);
         tp_others(i_gate_, H * D, tqs, (int64_t) T * tqs);
     };
@@ -565,11 +663,42 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
                                 (int) b.extent, b.swa ? (int) s.n_swa : 0, i_att_, i_gate_, T, cs);
     glm5_decode_stamp(this, l, 2, cs);
     if (tp_) {   // b70-local TP: o's rows, this GPU's and the others'
-        k::doorbell_publish(i_att_, ids_, w_, (int64_t) T * H * D, 0, m_tx_, nullptr, nullptr, m_tseq_, cs);
+        glm5_decode_stamp(this, l, 14, cs);
+        k::doorbell_publish(i_att_, ids_, w_, (int64_t) T * H * D, 0, epd ? epr_.tx : m_tx_, nullptr, nullptr,
+                            epd ? epr_.tseq : m_tseq_, cs);
+        if (tp_place && epd) {
+            const TpCut c = tp_cut(l, (int64_t) N, true);
+            const bool direct = T == 1;
+            float* o0 = direct ? i_o_ + (size_t) c.off[ep_stage_] : i_tps_;
+            gproj(b.o, i_att_, o0, T, false, cs);
+            glm5_decode_stamp(this, l, 10, cs);
+            if (!fw) {
+                tp_wait();
+                glm5_decode_stamp(this, l, 11, cs);
+            }
+            k::inkling2_tp_place_cut(i_o_, nullptr, N, pcut(c), ep_n_, T, direct ? nullptr : o0, nullptr, ep_stage_,
+                                     epr_.trem, slot, cs, fw ? epr_.flag : nullptr, kEpFlagStride, ep_n_ - 1,
+                                     fw ? ++ep_hc_ : 0);
+        } else if (tp_place) {
+            const bool direct = T == 1;
+            float* o0 = direct ? i_o_ + (size_t) ep_stage_ * tos : i_tps_;
+            gproj(b.o, i_att_, o0, T, false, cs);
+            glm5_decode_stamp(this, l, 10, cs);
+            if (fw) {
+                k::inkling2_tp_place(i_o_, nullptr, N, tos, T, direct ? nullptr : o0, nullptr, ep_stage_, tp_rem,
+                                     (int64_t) T * 2 * tqs, 0, ep_n_, cs, epr_.flag, kEpFlagStride, ep_n_ - 1, ++ep_hc_);
+            } else {
+            tp_wait();
+            glm5_decode_stamp(this, l, 11, cs);
+            k::inkling2_tp_place(i_o_, nullptr, N, tos, T, direct ? nullptr : o0, nullptr, ep_stage_, tp_rem,
+                                 (int64_t) T * 2 * tqs, 0, ep_n_, cs);
+            }
+        } else {
         gproj(b.o, i_att_, i_tps_, T, false, cs);
         k::inkling2_put_cols(i_o_, N, ep_stage_ * tos, i_tps_, tos, T, cs);
-        k::wait_flag_ge(m_tflag_, ++tp_ring_, cs);
+        tp_wait();
         tp_others(i_o_, N, tos, 0);
+        }
     } else
     gproj(b.o, i_att_, i_o_, T, false, cs);
     const float s1 = 1.0f / std::sqrt((float) (KT + 1));
@@ -597,7 +726,10 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
     glm5_decode_stamp(this, l, 4, cs);
     ++ring;
-    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+    glm5_decode_stamp(this, l, 15, cs);
+    if (ep_direct_ && win_.ep())   // b70-local EP direct: the rows, ids and weights straight to the helpers (their kernels read them)
+        k::doorbell_publish(hn_, ids_, w_, (int64_t) T * N, (int64_t) T * K, epr_.ex, epr_.eids, epr_.ew, epr_.eseq, cs);
+    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs, !(ep_direct_ && win_.ep()));
     if (win_.segmented()) {   // a graph ends where the host must answer the ring
         strata::gpu::Graph* g = nullptr;
         if (!strata::gpu::end_capture(cs, &g)) {
@@ -610,10 +742,25 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     if (!win_.experts(s.moe_index(l), ring, 0, 0, T, cs, err)) return false;
     k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
     if (win_.ep()) {   // b70-local EP: the other GPUs' sums of their experts, in GPU order (the relay's rows)
-        k::wait_flag_ge(win_.dev_flag(), ring, cs);
+        glm5_decode_stamp(this, l, 8, cs);   // b70-local profile: this GPU's experts done (the wait starts)
+        static const bool fwe = [] { const char* v = std::getenv("STRATA_INK_EP_FUSEWAIT"); return v == nullptr || v[0] != '0'; }();
+        if (ep_direct_ && fwe)
+            k::add_rows_inplace_after(moe_out_, epr_.rem, (int64_t) T * N, ep_n_ - 1, (int64_t) T * N, epr_.flag,
+                                      kEpFlagStride, ep_n_ - 1, ++ep_hc_, cs);
+        else {
+        if (ep_direct_) k::wait_flags_ge(epr_.flag, kEpFlagStride, ep_n_ - 1, ++ep_hc_, cs);
+        else k::wait_flag_ge(win_.dev_flag(), ring, cs);
+        glm5_decode_stamp(this, l, 9, cs);
+        static const bool add1 = [] { const char* v = std::getenv("STRATA_INK_EP_ADD1"); return v == nullptr || v[0] != '0'; }();
+        if (ep_direct_)
+            k::add_rows_inplace(moe_out_, epr_.rem, (int64_t) T * N, ep_n_ - 1, (int64_t) T * N, cs);
+        else if (add1)   // one kernel: the sums straight from the mapped rows, in GPU order
+            k::add_rows_inplace(moe_out_, m_rem_, (int64_t) T * N, ep_n_ - 1, (int64_t) T * N, cs);
+        else
         for (int j = 0; j + 1 < ep_n_; ++j) {
             k::copy_from_mapped(i_o_, m_rem_ + (size_t) j * T * N, (int64_t) T * N, cs);
             k::add_inplace(moe_out_, i_o_, (int64_t) T * N, cs);
+        }
         }
     }
     k::inkling2_conv(moe_out_, conv_f, b.ffn_post_conv, nullptr, 0, mix_, N, (int) KT, s1, T, cs, snap_f, sst, ns);
@@ -634,10 +781,42 @@ bool PlainModel::record_assist(const PlainModel& own, int T, strata::gpu::Graph*
     if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
     uint32_t r = 0, P = 0;
     const int64_t HD = s.n_head * s.key_length, tqs = tp_ ? HD / ep_n_ : 0, tos = tp_ ? N / ep_n_ : 0;
+    // b70-local EP direct: the owner's region (registered in this context): its sequence numbers in, this GPU's slot out
+    const bool epd = own.ep_direct_;
+    const EpReg& R = own.epr_;
+    const int j = ep_stage_ < own.ep_stage_ ? ep_stage_ : ep_stage_ - 1;
+    uint32_t* const myflag = epd ? R.flag + (size_t) j * kEpFlagStride : nullptr;
+    uint32_t tc = 0;
     for (int64_t l = own.lb_; l < own.le_; ++l) {
         if (!s.layer_routes(l)) continue;
         ++r;
-        if (tp_) {   // TP: this GPU's rows of the layer's q and gate, then of o
+        if (tp_ && epd) {
+            const TPW& t = tpw_[(size_t) l];
+            float* const out = R.trem + (size_t) j * T * 2 * (size_t) own.tp_wmax_qg_;
+            const int64_t wq = t.q.n_out, wo = t.o.n_out;   // this GPU's cut of the layer (tp_cut)
+            const bool fwh = std::getenv("STRATA_INK_EP_FUSEWAIT") == nullptr || std::getenv("STRATA_INK_EP_FUSEWAIT")[0] != '0';
+            if (fwh) {
+                const k::MappedCopy c{hn_, R.tx, (int64_t) T * N};
+                k::copy_from_mapped_multi_after(&c, 1, R.tseq, 0, 1, ++tc, cs);
+            } else {
+            k::wait_flag_ge(R.tseq, ++tc, cs);
+            k::copy_from_mapped(hn_, R.tx, (int64_t) T * N, cs);
+            }
+            gproj_win(t.q, hn_, i_tps_, T, false, cs);
+            gproj_win(t.gate, hn_, i_tps_ + (size_t) T * wq, T, false, cs);
+            k::doorbell_publish(i_tps_, ids_, w_, (int64_t) T * 2 * wq, 0, out, nullptr, nullptr, myflag, cs);
+            if (fwh) {
+                const k::MappedCopy c{i_att_, R.tx, (int64_t) T * HD};
+                k::copy_from_mapped_multi_after(&c, 1, R.tseq, 0, 1, ++tc, cs);
+                if (T == 1) glm5_decode_stamp(this, l, 4, cs);
+            } else {
+            k::wait_flag_ge(R.tseq, ++tc, cs);
+            if (T == 1) glm5_decode_stamp(this, l, 4, cs);
+            k::copy_from_mapped(i_att_, R.tx, (int64_t) T * HD, cs);
+            }
+            gproj_win(t.o, i_att_, i_tps_, T, false, cs);
+            k::doorbell_publish(i_tps_, ids_, w_, (int64_t) T * wo, 0, out, nullptr, nullptr, myflag, cs);
+        } else if (tp_) {   // TP: this GPU's rows of the layer's q and gate, then of o
             const TPW& t = tpw_[(size_t) l];
             k::wait_flag_ge(m_ain_, ++P, cs);
             k::copy_from_mapped(hn_, m_ax_, (int64_t) T * N, cs);
@@ -649,14 +828,35 @@ bool PlainModel::record_assist(const PlainModel& own, int T, strata::gpu::Graph*
             gproj_win(t.o, i_att_, i_tps_, T, false, cs);
             k::doorbell_publish(i_tps_, ids_, w_, (int64_t) T * tos, 0, m_ay_, nullptr, nullptr, m_aout_, cs);
         }
+        static const bool fwx = [] { const char* v = std::getenv("STRATA_INK_EP_FUSEWAIT"); return v == nullptr || v[0] != '0'; }();
+        if (epd && fwx) {
+            const k::MappedCopy c[3] = {{hn_, R.ex, (int64_t) T * N}, {ids_, R.eids, (int64_t) T * K}, {w_, R.ew, (int64_t) T * K}};
+            k::copy_from_mapped_multi_after(c, 3, R.eseq, 0, 1, (uint32_t) r, cs);
+            if (T == 1) glm5_decode_stamp(this, l, 0, cs);
+        } else if (epd) {
+            k::wait_flag_ge(R.eseq, (uint32_t) r, cs);
+            if (T == 1) glm5_decode_stamp(this, l, 0, cs);
+            k::copy_from_mapped(hn_, R.ex, (int64_t) T * N, cs);
+            k::copy_i32_from_mapped(ids_, R.eids, (int64_t) T * K, cs);
+            k::copy_from_mapped(w_, R.ew, (int64_t) T * K, cs);
+        } else {
         k::wait_flag_ge(m_ain_, ++P, cs);
+        if (T == 1) glm5_decode_stamp(this, l, 0, cs);
         k::copy_from_mapped(hn_, m_ax_, (int64_t) T * N, cs);
         k::copy_i32_from_mapped(ids_, m_aids_, (int64_t) T * K, cs);
         k::copy_from_mapped(w_, m_aw_, (int64_t) T * K, cs);
+        }
         win_.publish(r, 0, 0, T, hn_, ids_, w_, cs, false);
+        if (T == 1) glm5_decode_stamp(this, l, 1, cs);
         if (!win_.experts(s.moe_index(l), r, 0, 0, T, cs, err)) return false;
         k::native_moe_combine_multi(win_.parts(), w_, nullptr, moe_out_, N, K, T, cs);
+        if (T == 1) glm5_decode_stamp(this, l, 2, cs);
+        if (epd)
+            k::doorbell_publish(moe_out_, ids_, w_, (int64_t) T * N, 0, R.rem + (size_t) j * T * N, nullptr, nullptr,
+                                myflag, cs);
+        else
         k::doorbell_publish(moe_out_, ids_, w_, (int64_t) T * N, 0, m_ay_, m_aids_, m_aw_, m_aout_, cs);
+        if (T == 1) glm5_decode_stamp(this, l, 3, cs);
     }
     if (!strata::gpu::end_capture(cs, g)) {
         err = std::string("plain model: the relay's capture: ") + strata::gpu::last_error();
@@ -682,6 +882,7 @@ bool PlainModel::record_window_inkling2(int T, strata::gpu::Stream cs, std::stri
     }
     uint32_t ring = 0;
     tp_ring_ = 0;
+    ep_hc_ = 0;
     for (int64_t l = lb_; l < le_; ++l)
         if (!record_iblock(iblocks_[(size_t) l], l, T, ring, segs_[(size_t) T], cs, err)) return false;
     if (!last()) {

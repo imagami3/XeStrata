@@ -591,6 +591,82 @@ void inkling2_put_cols(float* dst, int64_t dst_ld, int64_t col0, const float* sr
     sync_if_needed(stream, ev, "inkling2_put_cols");
 }
 
+void inkling2_tp_place(float* d0, float* d1, int64_t ld, int64_t w, int64_t rows, const float* own0, const float* own1,
+                       int own_st, const float* rem, int64_t rem_stride, int64_t rem_off1, int n_st, void* stream,
+                       const uint32_t* flag, int fstride, int n_flags, uint32_t value) {
+    if (rows <= 0 || w <= 0 || n_st <= 0) return;
+    const int nd = d1 != nullptr ? 2 : 1;
+    const int64_t per = rows * w, tot = per * n_st * nd;
+    const size_t wg = 256, groups = (size_t) ((tot + (int64_t) wg - 1) / (int64_t) wg);
+    const auto ev = queue_for(stream).parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+        if (flag != nullptr) {   // the other GPUs' slices there (one item spins), then seen by every item
+            if (it.get_local_id(0) == 0)
+                for (int f = 0; f < n_flags; ++f)
+                    while (true) {
+                        const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(flag + (size_t) f * (size_t) fstride);
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                        if (v >= value) break;
+                    }
+            sycl::group_barrier(it.get_group());
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        }
+        const int64_t i = (int64_t) it.get_global_id(0);
+        if (i >= tot) return;
+        const int64_t k = i / (per * n_st), r = i % (per * n_st);
+        const int st = (int) (r / per);
+        const int64_t e = r % per, t = e / w, c = e % w;
+        float* d = k ? d1 : d0;
+        const float* src;
+        if (st == own_st) {
+            src = k ? own1 : own0;
+            if (src == nullptr) return;
+        } else {
+            src = rem + (int64_t) (st < own_st ? st : st - 1) * rem_stride + (k ? rem_off1 : 0);
+        }
+        d[t * ld + (int64_t) st * w + c] = reinterpret_cast<const volatile float*>(src)[e];
+    });
+    sync_if_needed(stream, ev, "inkling2_tp_place");
+}
+
+void inkling2_tp_place_cut(float* d0, float* d1, int64_t ld, const TpPlaceCut& cut, int n_st, int64_t rows,
+                           const float* own0, const float* own1, int own_st, const float* rem, int64_t rem_stride,
+                           void* stream, const uint32_t* flag, int fstride, int n_flags, uint32_t value) {
+    if (rows <= 0 || ld <= 0 || n_st <= 0 || n_st > 4) return;
+    const int nd = d1 != nullptr ? 2 : 1;
+    const int64_t per = rows * ld, tot = per * nd;
+    const TpPlaceCut c = cut;
+    const size_t wg = 256, groups = (size_t) ((tot + (int64_t) wg - 1) / (int64_t) wg);
+    const auto ev = queue_for(stream).parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
+        if (flag != nullptr) {   // the other GPUs' slices there (one item spins), then seen by every item
+            if (it.get_local_id(0) == 0)
+                for (int f = 0; f < n_flags; ++f)
+                    while (true) {
+                        const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(flag + (size_t) f * (size_t) fstride);
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                        if (v >= value) break;
+                    }
+            sycl::group_barrier(it.get_group());
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        }
+        const int64_t i = (int64_t) it.get_global_id(0);
+        if (i >= tot) return;
+        const int k = (int) (i / per);
+        const int64_t e = i % per, t = e / ld, col = e % ld;
+        int st = 0;
+        while (st + 1 < n_st && col >= c.off[st + 1]) ++st;
+        const int64_t w = c.w[st], cc = col - c.off[st];
+        const float* src;
+        if (st == own_st) {
+            src = k ? own1 : own0;
+            if (src == nullptr) return;
+        } else {
+            src = rem + (int64_t) (st < own_st ? st : st - 1) * rem_stride + (k ? rows * w : 0);
+        }
+        (k ? d1 : d0)[t * ld + col] = reinterpret_cast<const volatile float*>(src)[t * w + cc];
+    });
+    sync_if_needed(stream, ev, "inkling2_tp_place_cut");
+}
+
 void inkling2_softcap(float* x, int64_t rows, int64_t cols, int64_t ld, float cap, void* stream) {
     if (rows <= 0 || cols <= 0) return;
     const float ic = 1.0f / cap;

@@ -57,6 +57,11 @@ void scale_inplace(float* x, int64_t n, float s, void* stream);
 /// the copy of the misses into `parts` cannot happen until the pool has produced them, and the kernel is
 /// then ordered behind that copy.  Measured: the drain fell 18.2 -> 10.2 ms and the token did not move.
 void add_inplace(float* dst, const float* src, int64_t n, void* stream);
+// b70-local: dst += src[0], then += src[stride], ... (count rows of n, in order: add_inplace's sums one by one)
+void add_rows_inplace(float* dst, const float* src, int64_t stride, int count, int64_t n, void* stream);
+/// b70-local: add_rows_inplace after flag[i * fstride] >= value for the n_flags flags (src mapped), in one kernel
+void add_rows_inplace_after(float* dst, const float* src, int64_t stride, int count, int64_t n, const uint32_t* flag,
+                            int fstride, int n_flags, uint32_t value, void* stream);
 
 /// `y[i] = f16(x[i])`, round-to-nearest-even, using the shared conversion in `f16_bits.hpp`.
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);
@@ -130,6 +135,10 @@ struct MappedCopy {
     int64_t words = 0;
 };
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream);
+/// b70-local: copy_from_mapped_multi that first waits, in the kernel, for flag[i * stride] >= value (n_flags flags),
+/// one launch less than wait_flag_ge + the copies (an EP helper's input)
+void copy_from_mapped_multi_after(const MappedCopy* copies, int n, const uint32_t* flag, int stride, int n_flags,
+                                  uint32_t value, void* stream);
 /// `rows` rows of 2n floats: row r of `a` (n floats), then row r of `b` (the MTP layer's input, [embedding | hidden]).
 /// n a multiple of 4, every pointer 16-byte aligned.  Graph-capturable.
 void concat_rows(float* dst, const float* a, const float* b, int64_t n, int64_t rows, void* stream);

@@ -62,6 +62,8 @@ bool graph_branch_pays(void* stream, void* side0, void* side1);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// b70-local: wait_flag_ge for n flags (flag[i * stride]), every one >= value
+void wait_flags_ge(const uint32_t* flag, int stride, int n, uint32_t value, void* stream);
 /// Whether a running kernel sees the host's write to host memory, as wait_flag_ge needs: a kernel rings, then spins
 /// (bounded) on a flag the host sets once it has seen the ring.  The UHD 770 sees neither direction while the
 /// kernel runs (the verify window then runs in host-launched segments); the B70 sees both.  Synchronizes `stream`.

@@ -777,6 +777,14 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     });
 }
 
+void wait_flags_ge(const uint32_t* flag, int stride, int n, uint32_t value, void* stream) {
+    Q(stream).single_task([=] {
+        for (int i = 0; i < n; ++i)
+            while (read_host(flag + (size_t) i * (size_t) stride) < value) {
+            }
+    });
+}
+
 bool doorbell_visible(void* stream) {
     auto& q = Q(stream);
     auto* m = sycl::malloc_host<uint32_t>(4, q);

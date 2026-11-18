@@ -231,6 +231,9 @@ inline void bump_host(uint32_t* p) {
     const uint32_t n = *v + 1u;
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
     *v = n;
+    // b70-local (11-18): the store pushed out now; without it the line sat in the GPU's cache until something evicted
+    // it (an EP helper's sums seen ~40 us late: its next kernel only spins)
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
 }
 }  // namespace
 

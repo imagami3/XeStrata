@@ -79,5 +79,19 @@ void inkling2_softcap(float* x, int64_t rows, int64_t cols, int64_t ld, float ca
 /// b70-local (tensor-parallel slices): dst[t * dst_ld + col0 + i] = src[t * w + i] for t < rows, i < w; src may be
 /// mapped host memory
 void inkling2_put_cols(float* dst, int64_t dst_ld, int64_t col0, const float* src, int64_t w, int64_t rows, void* stream);
+// b70-local TP: every GPU's column slice of one or two outputs (d1 may be null) in one launch: stage st's slice of width w
+// goes to columns st*w..; this GPU's (own_st) from own0/own1 ([rows][w], null: already in place), the others' from rem
+// (helper j = the j-th other stage: rem + j*rem_stride, d1's at + rem_off1)
+void inkling2_tp_place(float* d0, float* d1, int64_t ld, int64_t w, int64_t rows, const float* own0, const float* own1,
+                       int own_st, const float* rem, int64_t rem_stride, int64_t rem_off1, int n_st, void* stream,
+                       const uint32_t* flag = nullptr, int fstride = 0, int n_flags = 0, uint32_t value = 0);
+///< (b70-local: flag non-null: first waits in the kernel for flag[i * fstride] >= value, the n_flags flags)
+/// b70-local: inkling2_tp_place for uneven cuts: stage st's columns [off[st], off[st] + w[st]) of the ld-wide rows;
+/// own0 / own1 [rows][w[own_st]], a helper's slot at rem + j * rem_stride holding d0's [rows][w] then d1's
+struct TpPlaceCut { int64_t off[4], w[4]; };
+void inkling2_tp_place_cut(float* d0, float* d1, int64_t ld, const TpPlaceCut& cut, int n_st, int64_t rows,
+                           const float* own0, const float* own1, int own_st, const float* rem, int64_t rem_stride,
+                           void* stream, const uint32_t* flag = nullptr, int fstride = 0, int n_flags = 0,
+                           uint32_t value = 0);
 
 }  // namespace strata::kernels

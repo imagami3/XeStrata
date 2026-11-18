@@ -47,6 +47,7 @@
 #include "strata/platform/memory.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -60,6 +61,7 @@
 namespace strata::core {
 void glm5_decode_prof_read(const void* model, const std::vector<char>& is_kda, int64_t first_l, int64_t last_l);
 void ink_decode_prof_read(const void* model, const std::vector<char>& is_swa, int64_t first_l, int64_t last_l);
+void ink_assist_prof_read(const void* model, int64_t first_l, int64_t last_l);
 namespace {
 
 namespace k = strata::kernels;
@@ -326,6 +328,18 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     ep_n_ = (int) at.size() + 1;
     ep_ = ep_n_ > 1 && [] { const char* v = std::getenv("STRATA_INK_EP"); return v != nullptr && v[0] == '1'; }();
     tp_ = ep_ && [] { const char* v = std::getenv("STRATA_INK_TP"); return v != nullptr && v[0] == '1'; }();
+    ep_bounds_.assign(1, 0);
+    for (int64_t a : at) ep_bounds_.push_back(a);
+    ep_bounds_.push_back(nl);
+    {
+        auto frac = [&](const char* name) {
+            const char* v = std::getenv(name);
+            const double f = v != nullptr ? std::atof(v) : 0.0;
+            return f > 0.0 && f < 1.0 ? f : 1.0 / (double) ep_n_;
+        };
+        tp_fqg_ = frac("STRATA_INK_TP_QG");
+        tp_fo_ = frac("STRATA_INK_TP_O");
+    }
     {   // the stages' cumulative shares of each layer's experts
         std::vector<double> sh((size_t) ep_n_, 1.0);
         if (const char* v = std::getenv("STRATA_INK_EP_SHARE")) {
@@ -357,6 +371,9 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         st->ep_ = ep_;
         st->ep_cum_ = ep_cum_;
         st->tp_ = tp_;
+        st->ep_bounds_ = ep_bounds_;
+        st->tp_fqg_ = tp_fqg_;
+        st->tp_fo_ = tp_fo_;
         const int64_t lb = at[i], le = i + 1 < at.size() ? at[i + 1] : nl;
         if (!st->load_stage(opt_, this, lb, le, split_devs_[i + 1], err)) return false;
         next_.push_back(std::move(st));
@@ -1167,6 +1184,7 @@ bool PlainModel::open_experts(std::string& err) {
         std::fprintf(stderr, "strata plain: STRATA_INK_EP is for Inkling 2's RVQ groups: off\n");
         ep_ = false;
     }
+    if (!ep_) ep_direct_ = false;
     win_.set_ep(ep_);
     win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
 
@@ -1989,6 +2007,30 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     return true;
 }
 
+// b70-local TP: the owner's rows first by its fraction (64-row units), the helpers an even share of the rest (the last
+// helper the remainder); 1 / ep_n_ gives every stage rows / ep_n_ when that is a multiple of 64
+PlainModel::TpCut PlainModel::tp_cut(int64_t l, int64_t rows, bool o) const {
+    TpCut c;
+    const int n = std::max(1, std::min(ep_n_, 4));
+    if (n == 1) { c.w[0] = rows; return c; }
+    const int own = ep_owner_stage(l);
+    const int64_t u = 64;
+    const double f = o ? tp_fo_ : tp_fqg_;
+    int64_t wo = (int64_t) std::llround(rows * f / (double) u) * u;
+    wo = std::clamp<int64_t>(wo, u, rows - (int64_t) (n - 1) * u);
+    const int64_t rest = rows - wo, base = rest / (n - 1) / u * u;
+    int64_t off = 0, hi = 0;
+    for (int st = 0; st < n; ++st) {
+        int64_t w;
+        if (st == own) w = wo;
+        else w = ++hi == n - 1 ? rest - base * (n - 2) : base;
+        c.off[st] = off;
+        c.w[st] = w;
+        off += w;
+    }
+    return c;
+}
+
 // b70-local EP: one launch of this stage's graph with the other GPUs' shares: their graphs for this stage's layers
 // (record_assist, made once a window size) go first, then this one; for each MoE layer the host copies the published
 // rows to every helper, waits for their sums and hands them to this GPU (flag), which adds them in GPU order
@@ -1997,6 +2039,16 @@ bool PlainModel::ep_relay(strata::gpu::Graph* g, int T, std::string& err) {
     for (PlainModel* st : root_->chain())
         if (st != this) hs.push_back(st);
     const int key = ep_stage_ << 16 | T;
+    if (ep_direct_ && !ep_reg_shared_) {   // b70-local EP direct: this GPU's region usable by the helpers' kernels
+        for (PlainModel* h : hs) {
+            const OnDevice on(h->dev_);
+            if (!strata::gpu::host_register(ep_reg_, ep_reg_bytes_)) {
+                err = std::string("plain model: the direct relay's region in a helper's context: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        ep_reg_shared_ = true;
+    }
     for (PlainModel* h : hs)
         if (h->assist_.find(key) == h->assist_.end()) {
             const OnDevice on(h->dev_);
@@ -2005,6 +2057,45 @@ bool PlainModel::ep_relay(strata::gpu::Graph* g, int T, std::string& err) {
             h->assist_[key] = ag;
         }
     const int64_t N = spec_.n_embd, K = spec_.n_expert_used;
+    if (ep_direct_) {   // the GPUs relay themselves: the host zeroes the sequence numbers, launches, and watches
+        win_.reset();
+        *(volatile uint32_t*) epr_.tseq = 0;
+        *(volatile uint32_t*) epr_.eseq = 0;
+        for (size_t j = 0; j < hs.size(); ++j) *(volatile uint32_t*) (epr_.flag + j * kEpFlagStride) = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (PlainModel* h : hs) {
+            const OnDevice on(h->dev_);
+            if (!strata::gpu::graph_launch(h->assist_[key], h->cs_)) {
+                err = std::string("plain model: the relay's launch: ") + strata::gpu::last_error();
+                return false;
+            }
+            (void) strata::gpu::stream_idle(h->cs_);
+        }
+        if (!strata::gpu::graph_launch(g, cs_)) {
+            err = std::string("plain model: launch: ") + strata::gpu::last_error();
+            return false;
+        }
+        (void) strata::gpu::stream_idle(cs_);
+        uint32_t phases = 0;
+        for (int64_t l = lb_; l < le_; ++l) phases += spec_.layer_routes(l) ? (tp_ ? 3u : 1u) : 0u;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t j = 0; j < hs.size(); ++j) {   // a watch only: 30 s without a helper's last phase is an error
+            const volatile uint32_t* f = epr_.flag + j * kEpFlagStride;
+            for (uint32_t n = 0; *f < phases; ++n)
+                if ((n & 0xfffff) == 0xfffff && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+                    err = "plain model: the direct expert relay waited 30 s for a helper GPU";
+                    return false;
+                }
+        }
+        for (PlainModel* h : hs) {
+            const OnDevice on(h->dev_);
+            if (!strata::gpu::stream_sync(h->cs_)) {
+                err = std::string("plain model: a helper GPU: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        return true;
+    }
     win_.reset();
     for (PlainModel* h : hs) {
         *(volatile uint32_t*) h->h_ain_ = 0;
@@ -2249,6 +2340,12 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         std::vector<char> swa(iblocks_.size(), 0);
         for (size_t i = 0; i < swa.size(); ++i) swa[i] = iblocks_[i].swa ? 1 : 0;
         ink_decode_prof_read(this, swa, lb_, le_);
+        if (win_.ep() && T == 1)
+            for (PlainModel* st : root_->chain())
+                if (st != this) {
+                    const OnDevice on(st->dev_);
+                    ink_assist_prof_read(st, lb_, le_);
+                }
     }
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
