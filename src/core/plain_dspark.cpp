@@ -22,6 +22,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 namespace k = strata::kernels;
@@ -182,6 +184,39 @@ bool PlainModel::dspark_load(std::string& err) {
         err = "plain model: no mapped memory for the drafter";
         return false;
     }
+    // STRATA_DSPARK_VOCAB=ids.bin (int32 token ids): the drafts read the target's head rows of these tokens only (the
+    // whole head is 760 MB of Q6_K a draft on Inkling 2: most of a draft's time); the window's check keeps the whole head
+    if (const char* vp = std::getenv("STRATA_DSPARK_VOCAB"); vp != nullptr && vp[0] != '\0') {
+        std::vector<int32_t> ids;
+        if (FILE* f = std::fopen(vp, "rb")) {
+            int32_t v = 0;
+            while (std::fread(&v, sizeof v, 1, f) == 1)
+                if (v >= 0 && v < n_vocab_) ids.push_back(v);
+            std::fclose(f);
+        }
+        const int gt = head_.type == k::kNativeQ8Rows ? 8 : head_.type == k::kNativeQ6KRows ? 14 : head_.type;
+        const size_t row = k::cpu::native_row_bytes(gt, head_.n_in);
+        void* di = nullptr;
+        void* dh = nullptr;
+        if (ids.empty() || row == 0) {
+            std::fprintf(stderr, "strata plain: %s: no draft tokens read; the drafts use the whole head\n", vp);
+        } else if (!strata::gpu::alloc_device(&di, ids.size() * 4) || !strata::gpu::alloc_device(&dh, ids.size() * row)) {
+            err = "plain model: no VRAM for the drafts' head";
+            return false;
+        } else {
+            allocs_.push_back(di);
+            allocs_.push_back(dh);
+            if (!strata::gpu::copy(di, ids.data(), ids.size() * 4)) { err = "plain model: the drafts' head"; return false; }
+            k::gather_rows(static_cast<const uint8_t*>(head_.data), (int64_t) row, (const int32_t*) di,
+                           (int64_t) ids.size(), static_cast<uint8_t*>(dh), cs_);
+            if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the drafts' head"; return false; }
+            ds_dhead_ = dh;
+            ds_dids_ = (int32_t*) di;
+            ds_ndv_ = (int64_t) ids.size();
+            std::fprintf(stderr, "strata plain: the drafts' head over %lld tokens (%.1f MiB)\n", (long long) ds_ndv_,
+                         (double) (ids.size() * row) / 1048576.0);
+        }
+    }
     dspark_ = true;
     std::fprintf(stderr, "strata plain: DSpark drafter %s: %d layers, %zu taps, rank %d\n", path, nl, tap_layers_.size(), ds_rank_);
     return true;
@@ -299,9 +334,16 @@ bool PlainModel::dspark_draft(int n, std::string& err) {
         k::add_inplace(ds_corr_, ds_h_ + (size_t) i * N, N, cs_);   // the target's head over row + correction
         lap(3, tp);
         k::native_quantize_q8_1(ds_corr_, ds_xq_, head_.n_in, 1, cs_);
-        k::native_mmvq(head_.type, head_.data, ds_xq_, ds_logits_, head_.n_in, head_.n_out, 1, cs_);
-        k::sample_tokens(ds_logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_dprev_ + i, cs_);
-        k::dspark_top_prob(ds_logits_, n_vocab_, (float) spec_.final_softcap, m_dprob_ + i, cs_);
+        if (ds_dhead_ != nullptr) {   // the subset's rows: its first maximum, mapped back to its token id
+            k::native_mmvq(head_.type, ds_dhead_, ds_xq_, ds_logits_, head_.n_in, ds_ndv_, 1, cs_);
+            k::sample_tokens(ds_logits_, 1, (int) ds_ndv_, nullptr, 0, sp, m_dprev_ + i, cs_);
+            k::dspark_top_prob(ds_logits_, ds_ndv_, (float) spec_.final_softcap, m_dprob_ + i, cs_);
+            k::map_ids(m_dprev_ + i, ds_dids_, 1, cs_);
+        } else {
+            k::native_mmvq(head_.type, head_.data, ds_xq_, ds_logits_, head_.n_in, head_.n_out, 1, cs_);
+            k::sample_tokens(ds_logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_dprev_ + i, cs_);
+            k::dspark_top_prob(ds_logits_, n_vocab_, (float) spec_.final_softcap, m_dprob_ + i, cs_);
+        }
         lap(4, tp);
     }
     if (ds_prof() && ++ds_n % 32 == 0)

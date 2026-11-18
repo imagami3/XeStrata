@@ -484,6 +484,10 @@ private:
           *ds_state_ = nullptr, *ds_lat_ = nullptr, *ds_joint_ = nullptr, *ds_jout_ = nullptr, *ds_corr_ = nullptr,
           *ds_logits_ = nullptr;
     void* ds_xq_ = nullptr;
+    /// b70-local STRATA_DSPARK_VOCAB=ids.bin: the drafts' head over this token subset (its rows of the target's head)
+    void* ds_dhead_ = nullptr;
+    int32_t* ds_dids_ = nullptr;
+    int64_t ds_ndv_ = 0;
     float *h_anchor_ = nullptr, *m_anchor_ = nullptr;
     float *h_dprob_ = nullptr, *m_dprob_ = nullptr;   ///< mapped: each draft's confidence
     int32_t *h_dprev_ = nullptr, *m_dprev_ = nullptr;
