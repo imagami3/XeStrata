@@ -453,6 +453,7 @@ private:
         const float *q_clip = nullptr, *rel_clip = nullptr, *rel_table = nullptr;
         const float *k_conv = nullptr, *v_conv = nullptr, *attn_post_conv = nullptr, *ffn_post_conv = nullptr;
         const float *attn_rq = nullptr, *ffn_rq = nullptr, *router = nullptr, *router_b = nullptr;
+        const uint16_t* router16 = nullptr;   ///< b70-local: the router as BF16 when every value is one (the checkpoint's)
         float *kc = nullptr, *vc = nullptr, *conv = nullptr;   ///< the cache ([cells][nkv D] F32) and conv history
         float* conv_snap = nullptr;   ///< b70-local: the history after each of a window's rows 0 .. n_snap_ - 1
     };

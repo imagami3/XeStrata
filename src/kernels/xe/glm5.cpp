@@ -311,7 +311,60 @@ void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, i
     // they are still computed). Unset or >= k: unchanged.
     static const int keep_env = [] { const char* v = std::getenv("STRATA_MOE_KEEP"); return v ? std::atoi(v) : 0; }();
     const int keep = keep_env > 0 && keep_env < k ? keep_env : k;
-    const auto event = queue_for(stream).parallel_for(
+    // b70-local: a work-item an expert, each counting the experts ahead of it in the same order (larger biased score,
+    // then lower index): rank i < k is pass i's pick of the kernel below, so the ids, their order and the weights are
+    // the same (the logits bitwise).  One sub-group making k passes took ~19 us on the B70 (384 experts, k 8), this
+    // one ~7 (STRATA_DECODE_PROFILE).  STRATA_ROUTER_RANK=0: the passes.
+    static const bool rank_on = [] { const char* v = std::getenv("STRATA_ROUTER_RANK"); return v == nullptr || v[0] != '0'; }();
+    auto& q = queue_for(stream);
+    const size_t wg_r = (size_t) ((n_expert + WARP - 1) / WARP) * WARP;
+    if (rank_on && wg_r <= q.get_device().get_info<sycl::info::device::max_work_group_size>()) {
+        const auto ev = q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> sv(sycl::range<1>(wg_r), h);
+            sycl::local_accessor<float, 1> pw(sycl::range<1>(WARP), h);
+            h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * wg_r, wg_r), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const int t = (int) it.get_group(0), e = (int) it.get_local_id(0);
+                const float* l = logits + (size_t) t * n_expert;
+                const float me = e < n_expert ? sigmoid(l[e]) : 0.0f;
+                const float x = e < n_expert ? me + bias[e] : -INFINITY;
+                sv[e] = x;
+                sycl::group_barrier(it.get_group());
+                // every score into the sub-group's registers (lane i holds scores i, i + 32, ...), then compared by
+                // shuffles: no memory read in the loop (a loop over local memory took ~17 us: a read's latency each)
+                const sycl::sub_group sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id();
+                constexpr int kPer = 16;
+                float v[kPer];
+                #pragma unroll
+                for (int j = 0; j < kPer; ++j) v[j] = j * WARP + lane < n_expert ? sv[j * WARP + lane] : -INFINITY;
+                int r = 0;
+                #pragma unroll
+                for (int j = 0; j < kPer; ++j) {
+                    if (j * WARP >= n_expert) break;
+                    #pragma unroll
+                    for (int sl = 0; sl < WARP; ++sl) {
+                        const float y = sycl::select_from_group(sg, v[j], sl);
+                        const int jj = j * WARP + sl;
+                        r += (y > x || (y == x && jj < e)) ? 1 : 0;
+                    }
+                }
+                if (e < n_expert && r < k) {
+                    ids[(size_t) t * k + r] = e;
+                    pw[r] = me;
+                }
+                sycl::group_barrier(it.get_group());
+                if (e < WARP) {   // the first sub-group: lane i has pick i, summed as the pass kernel sums them
+                    const float mine = e < k ? pw[e] : 0.0f;
+                    float div = 1.0f;
+                    if (norm) div = sycl::fmax(sycl::reduce_over_group(sg, mine, sycl::plus<float>()), 6.103515625e-05f);
+                    if (e < k) weights[(size_t) t * k + e] = e < keep ? mine / div * scale : 0.0f;
+                }
+            });
+        });
+        sync_if_needed(stream, ev, "glm5_router_sigmoid");
+        return;
+    }
+    const auto event = q.parallel_for(
         sycl::nd_range<1>((size_t) n_tokens * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_group(0), lane = (int) sg.get_local_linear_id();

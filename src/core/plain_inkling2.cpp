@@ -124,6 +124,26 @@ bool PlainModel::load_iblock(const GgufModel& m, int64_t l, IBlock& b, std::stri
         !upload_f32(m, p + "ffn_norm.weight", N, b.ffn_norm, err) ||
         !upload_router_padded(m, p, N, E, b.router, b.router_b, err))
         return false;
+    // b70-local: the router read as BF16 (half the bytes; the checkpoint's router is BF16, so the values are the same)
+    // when every F32 value is a BF16 value (STRATA_INK_ROUTER_BF16=0: F32)
+    if (const char* rb = std::getenv("STRATA_INK_ROUTER_BF16"); rb == nullptr || rb[0] != '0') {
+        const uint64_t n = N * E;
+        std::vector<uint32_t> f((size_t) n);
+        std::vector<uint16_t> h((size_t) n);
+        bool exact = strata::gpu::copy(f.data(), b.router, n * 4);
+        for (uint64_t i = 0; i < n && exact; ++i) {
+            exact = (f[(size_t) i] & 0xFFFFu) == 0;
+            h[(size_t) i] = (uint16_t) (f[(size_t) i] >> 16);
+        }
+        void* d = nullptr;
+        if (exact && strata::gpu::alloc_device(&d, n * 2)) {
+            allocs_.push_back(d);
+            if (!strata::gpu::copy(d, h.data(), n * 2)) { err = "plain model: uploading the BF16 router failed"; return false; }
+            b.router16 = (const uint16_t*) d;
+        } else if (!exact && l == 0) {
+            std::fprintf(stderr, "[strata] %sffn_gate_inp.weight is not exact in BF16: the router stays F32\n", p.c_str());
+        }
+    }
     if (b.swa) {
         if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err)) return false;
     } else if (!upload_f32(m, p + "attn_q_inp_norm.weight", N, b.q_norm, err) ||
@@ -458,8 +478,12 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::inkling2_attn_res(i_blocks_, bstride, (int) (l / B + 1), x_, b.ffn_rq, 1, i_in_, N, T, cs);
     glm5_decode_stamp(this, l, 6, cs);   // b70-local profile: the MoE input's residual mix done
     k::native_qsa_rms_norm_weighted_q8_1(i_in_, b.ffn_norm, hn_, g_xq_, (int) N, T, eps, cs);
-    for (int t0 = 0; t0 < T; t0 += 8)
-        k::f32_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        if (b.router16 != nullptr)
+            k::bf16_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router16, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
+        else
+            k::f32_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
+    }
     glm5_decode_stamp(this, l, 7, cs);   // b70-local profile: the norm and the router's product done
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
