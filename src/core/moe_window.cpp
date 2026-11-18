@@ -10,6 +10,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/ink_dspark.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -277,6 +278,9 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
         };
         grouped(p_ptr, p_start, p_counts, cap);
         if (d_res_ != nullptr) {   // device_plan: no PCIe share and no CPU rows; zero the rows the GPU did not write
+            if (ep_)   // EP: the other GPUs' rows are summed there; zero here (not read as zeros over PCIe)
+                dspark_zero(parts_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            else
             copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst,
                                   p_counts + 1, cs);
             moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
