@@ -350,7 +350,8 @@ if(STRATA_ENABLE_XE)
   # quantize_act_parity sees the one-ulp difference in Q8_K's 1/iscale.
   target_compile_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
                          -foffload-fp32-prec-sqrt)
-  # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); device code becomes
+  # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp), SPV_KHR_bit_instructions
+  # the trellis decode's bit-field extracts (tq_kernels.hpp); device code becomes
   # SPIR-V when the executable links.
   # SPIR-V when the executable links (with several targets, the translator's option names the SPIR-V one).
   set(_strata_spirv_translator -Xspirv-translator)
@@ -363,7 +364,7 @@ if(STRATA_ENABLE_XE)
   cmake_host_system_information(RESULT _strata_link_jobs QUERY NUMBER_OF_LOGICAL_CORES)
   target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
                       -foffload-fp32-prec-sqrt -fsycl-max-parallel-link-jobs=${_strata_link_jobs}
-                      "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
+                      "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product,+SPV_KHR_bit_instructions")
   # The SYCL runtime's own libraries beside libsycl, for the linker to find what libsycl's libraries need: where the
   # system's Level Zero is new enough (Fedora 44), intel/llvm v7.2.0 builds UR's loader as a library of its own, and
   # ld.bfd warned at every link that the libumf it needs was not found.

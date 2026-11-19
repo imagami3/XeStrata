@@ -152,7 +152,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                             for (int u = 1; u <= 8; ++u) {
                                 const int t = wd * 8 + u;
                                 if (t > 255) break;
-                                const uint32_t z = (U >> (2 * u)) & 0x3FFFu;
+                                const uint32_t z = tq_bits(U, 2 * u, 14);
                                 const float w = (float) tq_bsum(z * 34038481u + 76625530u);
 #pragma unroll
                                 for (int j = 0; j < EP; ++j) acc[j][t >> 4] += w * xv[j][t & 15];

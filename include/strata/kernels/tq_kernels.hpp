@@ -11,6 +11,7 @@
 
 #if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
 extern SYCL_EXTERNAL unsigned __spirv_UDotKHR(unsigned a, unsigned b, int packed_format);   // 0: 4x8-bit packed
+extern SYCL_EXTERNAL unsigned __spirv_BitFieldUExtract(unsigned base, unsigned offset, unsigned count);
 #endif
 
 namespace strata::kernels {
@@ -22,6 +23,16 @@ inline uint32_t tq_bsum(uint32_t v) {
     return __spirv_UDotKHR(v, 0x01010101u, 0);
 #else
     return (v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24);
+#endif
+}
+
+/// Bits [off, off + n) of v: one bit-field instruction on the device (a shift and a mask take two of the integer pipe,
+/// which the decode fills).
+inline uint32_t tq_bits(uint32_t v, uint32_t off, uint32_t n) {
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
+    return __spirv_BitFieldUExtract(v, off, n);
+#else
+    return (v >> off) & ((1u << n) - 1u);
 #endif
 }
 

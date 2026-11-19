@@ -196,7 +196,7 @@ struct TqXmx {
                             for (int u = 1; u <= 8; ++u) {
                                 const int t = wd * 8 + u;
                                 if (t > 255) break;
-                                row[t & 15] = val((U >> (2 * u)) & 0x3FFFu);
+                                row[t & 15] = val(tq_bits(U, 2 * u, 14));
                                 if ((t & 15) == 15) put(row, t >> 4);
                             }
                             s = (U >> 16) & 0x3FFFu;
