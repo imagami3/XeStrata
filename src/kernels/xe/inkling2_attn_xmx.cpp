@@ -6,16 +6,16 @@
 // inkling2_attention gives every (token, head) a work-group whose work-items each take a whole key row: on the B70 a
 // 512-token window's attention was 36M clock ticks a sliding layer and 121M a full one at ~4.7K cells (a third and two
 // thirds of the layer).  This kernel follows glm5_mla_xmx.cpp's scheme:
-//   * a work-group of 4 sub-groups takes 16 tokens of one head and walks the cells from the first token's window start
-//     to the last token's position, 16 at a time, with an online softmax per token; sub-groups 2g and 2g + 1 own dims
-//     [64g, 64g + 64), rows 0-7 and 8-15;
+//   * a work-group takes the heads that share a KV head for 16 tokens (96 rows; 16 tokens of one head where the heads
+//     do not fit) and walks the cells from the first token's window start to the last token's position, 16 at a time,
+//     with an online softmax per row; sub-group s owns dims [64 (s % 2), + 64) of rows [8 (s / 2), + 8);
 //   * the chunk's K and V rows (FP32 in the cache) go into local memory as FP16 hi + lo, q (scaled by a power of two
 //     that puts its largest value near 2^14) and p likewise: three products each (hi.hi + lo.hi + hi.lo), so they keep
 //     about 22 bits;
 //   * the relative bias r . table[pos - j] (pos - j < extent), the causal and sliding-window masks and the sink (a
 //     logit with a zero value, in the denominator) are applied with the scores in FP32.
-// The attention part of a layer then took 22M ticks (sliding) and 48M (full); against the plain kernel the outputs
-// differ by at most ~2e-6 of their largest value (tests/core/inkling2_attn_xmx_test.cpp).
+// Against the plain kernel the outputs differ by at most ~3e-6 of their largest value (tests/core/
+// inkling2_attn_xmx_test.cpp).
 #include "strata/kernels/inkling2.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -28,6 +28,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -41,11 +42,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using sycl::half;
 
 constexpr int D = 128;             // a head's width
-constexpr int R = 16;              // tokens (rows of q, p and the output) a work-group
 constexpr int NG = 2;              // 64-dim groups
 constexpr int SGS = 16;            // sub-group size
-constexpr int NSG = 2 * NG;        // sub-groups: a group's dims x a tile of 8 rows
-constexpr int WG = NSG * SGS;      // work-items
 constexpr int CH = 16;             // cells a chunk: lane `lane` owns cell `lane` in the softmax
 constexpr int RS = D + 8;          // row strides in halves (16-byte aligned rows)
 constexpr int RELMAX = 32;
@@ -60,7 +58,11 @@ inline auto at(const A& a, size_t off) {
     return a.template get_multi_ptr<sycl::access::decorated::no>() + off;
 }
 
+// RT tiles of 8 rows a work-group (R rows: `hpw` heads that share a KV head x R / hpw tokens, row = token * hpw +
+// head); sub-groups 2 x RT
+template<int RT>
 struct AttXmx {
+    static constexpr int R = 8 * RT, NSG = NG * RT, WG = NSG * SGS;
     const float* q;       // [T][H][D]
     const float* r;       // [T][H][rel]
     const float* sinks;   // [T][H]
@@ -68,9 +70,9 @@ struct AttXmx {
     const float* vc;
     const float* table;   // [extent][rel]
     const int32_t* steps;
-    int T, H, G, rel, extent, window;
+    int T, H, G, hpw, rel, extent, window;
     float* out;
-    sycl::local_accessor<half, 1> kv;      // kh, kl, vh, vl [CH][RS]; at the start qh, ql [R][RS]
+    sycl::local_accessor<half, 1> kv;      // kh, kl, vh, vl [CH][RS]; at the start qh, ql [R][RS] (the larger)
     sycl::local_accessor<float, 3> part;   // [NG][R][CH]
     sycl::local_accessor<half, 2> pp;      // [2][R * CH]: p' hi, lo
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
@@ -88,20 +90,23 @@ struct AttXmx {
 #else
         const auto grp = it.get_group();
         const auto sg = it.get_sub_group();
-        const int nblk = (T + R - 1) / R;
-        const int wgi = (int) it.get_group(0), hh = wgi / nblk, t0 = (wgi % nblk) * R;
-        const int kvh = hh / G;
+        const int bt = R / hpw, nblk = (T + bt - 1) / bt;
+        const int wgi = (int) it.get_group(0), h0 = (wgi / nblk) * hpw, t0 = (wgi % nblk) * bt;
+        const int kvh = h0 / G;
         const int t = (int) it.get_local_id(0), s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
-        const int g = s / 2, mt = s % 2;
+        const int g = s % NG, mt = s / NG;
+        // row rr: token t0 + rr / hpw, head h0 + rr % hpw
+        auto tok = [&](int rr) { return t0 + rr / hpw; };
+        auto qrow = [&](int rr) { return (int64_t) tok(rr) * H + h0 + rr % hpw; };
         const int64_t width = (int64_t) (H / G) * D;
         const size_t QH = 0, QL = (size_t) R * RS;
         const size_t KH = 0, KL = (size_t) CH * RS, VH = 2 * (size_t) CH * RS, VL = 3 * (size_t) CH * RS;
 
-        // q: 16 tokens, times 2^(14 - e) for its largest |value| < 2^e, as FP16 hi + lo; the rows' r and positions
+        // q: the rows, times 2^(14 - e) for its largest |value| < 2^e, as FP16 hi + lo; the rows' r and positions
         float qm = 0.0f;
         for (int i = t; i < R * D; i += WG) {
             const int rr = i / D, d = i % D;
-            if (t0 + rr < T) qm = sycl::fmax(qm, sycl::fabs(q[((int64_t) (t0 + rr) * H + hh) * D + d]));
+            if (tok(rr) < T) qm = sycl::fmax(qm, sycl::fabs(q[qrow(rr) * D + d]));
         }
         qm = sycl::reduce_over_group(grp, qm, sycl::maximum<float>());
         const int qe = qm > 0.0f ? (int) ((sycl::bit_cast<uint32_t>(qm) >> 23) & 0xFF) - 126 : 0;
@@ -109,19 +114,19 @@ struct AttXmx {
         for (int i = t; i < R * D; i += WG) {
             const int rr = i / D, d = i % D;
             half hi(0.0f), lo(0.0f);
-            if (t0 + rr < T) split(q[((int64_t) (t0 + rr) * H + hh) * D + d] * qup, hi, lo);
+            if (tok(rr) < T) split(q[qrow(rr) * D + d] * qup, hi, lo);
             kv[QH + (size_t) rr * RS + d] = hi;
             kv[QL + (size_t) rr * RS + d] = lo;
         }
         for (int i = t; i < R * RELMAX; i += WG) {
             const int rr = i / RELMAX, k = i % RELMAX;
-            rv[rr][k] = t0 + rr < T && k < rel ? r[((int64_t) (t0 + rr) * H + hh) * rel + k] : 0.0f;
+            rv[rr][k] = tok(rr) < T && k < rel ? r[qrow(rr) * rel + k] : 0.0f;
         }
-        if (t < R) {
-            const bool live = t0 + t < T;
-            rpos[t] = live ? steps[(int64_t) (t0 + t) * kStepCount + kStepPos] : -1;
-            mrow[t] = live ? sinks[(int64_t) (t0 + t) * H + hh] * LOG2E : 0.0f;   // the sink's logit
-            lsum[t] = 1.0f;                                                      // its term at m = itself
+        for (int rr = t; rr < R; rr += WG) {
+            const bool live = tok(rr) < T;
+            rpos[rr] = live ? steps[(int64_t) tok(rr) * kStepCount + kStepPos] : -1;
+            mrow[rr] = live ? sinks[qrow(rr)] * LOG2E : 0.0f;   // the sink's logit
+            lsum[rr] = 1.0f;                                     // its term at m = itself
         }
         sycl::group_barrier(grp);
         mx::joint_matrix<sycl::sub_group, half, mx::use::a, TM, TK, mx::layout::row_major> qa[4], qb[4];
@@ -240,8 +245,7 @@ struct AttXmx {
         for (int nt = 0; nt < 4; ++nt)
             ix::joint_matrix_apply(sg, acc[nt], [&](float& x, size_t row, size_t col) {
                 const int rr = mt * TM + (int) row;
-                if (t0 + rr < T)
-                    out[((int64_t) (t0 + rr) * H + hh) * D + g * 64 + nt * TN + (int) col] = x / (PSCALE * lsum[rr]);
+                if (tok(rr) < T) out[qrow(rr) * D + g * 64 + nt * TN + (int) col] = x / (PSCALE * lsum[rr]);
             });
 #endif
     }
@@ -249,6 +253,34 @@ struct AttXmx {
         return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<SGS>};
     }
 };
+
+template<int RT>
+bool launch(sycl::event& ev, sycl::queue& queue, const float* q, const float* r, const float* sinks, const float* kc,
+                   const float* vc, const float* table, const int32_t* steps, int T, int H, int G, int hpw, int rel,
+                   int extent, int window, float* out) {
+    using K = AttXmx<RT>;
+    const size_t kvh = (size_t) std::max(2 * K::R * RS, 4 * CH * RS);
+    const size_t need = kvh * 2 + (size_t) NG * K::R * CH * 4 + (size_t) 2 * K::R * CH * 2 + (size_t) 3 * K::R * 4 +
+                        (size_t) K::R * RELMAX * 4 + (size_t) K::R * 4;
+    const auto dev = queue.get_device();
+    if (dev.get_info<sycl::info::device::local_mem_size>() < need ||
+        dev.get_info<sycl::info::device::max_work_group_size>() < (size_t) K::WG)
+        return false;
+    const int bt = K::R / hpw, nblk = (T + bt - 1) / bt;
+    ev = queue.submit([&](sycl::handler& h) {
+        K k{q, r, sinks, kc, vc, table, steps, T, H, G, hpw, rel, extent, window, out,
+            sycl::local_accessor<half, 1>(sycl::range<1>(kvh), h),
+            sycl::local_accessor<float, 3>(sycl::range<3>(NG, K::R, CH), h),
+            sycl::local_accessor<half, 2>(sycl::range<2>(2, (size_t) K::R * CH), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>(K::R), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>(K::R), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>(K::R), h),
+            sycl::local_accessor<float, 2>(sycl::range<2>(K::R, RELMAX), h),
+            sycl::local_accessor<int, 1>(sycl::range<1>(K::R), h)};
+        h.parallel_for(sycl::nd_range<1>((size_t) nblk * (H / hpw) * K::WG, K::WG), k);
+    });
+    return true;
+}
 
 }  // namespace
 
@@ -263,22 +295,20 @@ bool inkling2_attention_xmx(const float* q, const float* r, const float* sinks, 
         !xmx_available(XmxType::f16))
         return false;
     auto& queue = core::Runtime::get().stream(stream);
-    const size_t need = (size_t) 4 * CH * RS * 2 + (size_t) NG * R * CH * 4 + (size_t) 2 * R * CH * 2 + (size_t) 3 * R * 4 +
-                        (size_t) R * RELMAX * 4 + (size_t) R * 4;
-    if (queue.get_device().get_info<sycl::info::device::local_mem_size>() < need || 2 * R * RS > 4 * CH * RS) return false;
-    const int nblk = (n_tokens + R - 1) / R;
-    const auto e = queue.submit([&](sycl::handler& h) {
-        AttXmx k{q, r, sinks, kc, vc, table, steps, n_tokens, n_head, n_head / n_head_kv, rel, extent, window, out,
-                 sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 4 * CH * RS), h),
-                 sycl::local_accessor<float, 3>(sycl::range<3>(NG, R, CH), h),
-                 sycl::local_accessor<half, 2>(sycl::range<2>(2, (size_t) R * CH), h),
-                 sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
-                 sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
-                 sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
-                 sycl::local_accessor<float, 2>(sycl::range<2>(R, RELMAX), h),
-                 sycl::local_accessor<int, 1>(sycl::range<1>(R), h)};
-        h.parallel_for(sycl::nd_range<1>((size_t) nblk * n_head * WG, WG), k);
-    });
+    const int G = n_head / n_head_kv;
+    // the heads that share a KV head together (their K and V rows converted once a chunk for all of them) where 96 (or
+    // 48) rows hold a whole number of tokens of them, else 16 tokens of one head; STRATA_INK_ATT_ROWS caps the rows.
+    // B70, 512 tokens of 48 heads over 8 KV heads, 1,040 / 4,512 cells: 16 rows of one head 10.0 / 30.4 ms, 48 rows
+    // (8 tokens x 6 heads) 7.4 / 18.2 ms, 96 rows 6.7 / 15.2 ms (the plain kernel 17.2 / 114.8 ms)
+    static const int rows = [] { const char* v = std::getenv("STRATA_INK_ATT_ROWS"); return v ? std::atoi(v) : 96; }();
+    sycl::event e;
+    bool ok = false;
+    if (rows >= 96 && 96 % G == 0)
+        ok = launch<12>(e, queue, q, r, sinks, kc, vc, table, steps, n_tokens, n_head, G, G, rel, extent, window, out);
+    if (!ok && rows >= 48 && 48 % G == 0)
+        ok = launch<6>(e, queue, q, r, sinks, kc, vc, table, steps, n_tokens, n_head, G, G, rel, extent, window, out);
+    if (!ok) ok = launch<2>(e, queue, q, r, sinks, kc, vc, table, steps, n_tokens, n_head, G, 1, rel, extent, window, out);
+    if (!ok) return false;
     if (!stream) core::Runtime::get().wait(e, "inkling2_attention_xmx");
     return true;
 }
