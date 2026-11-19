@@ -58,6 +58,13 @@ struct ExpertLayout {
     static constexpr int kMixedShardShift = 56;
     static uint64_t mixed_src(size_t shard, uint64_t off) { return ((uint64_t) shard << kMixedShardShift) | off; }
     std::vector<int32_t> n_kept;          ///< per layer: experts present (the router's columns in the file)
+    /// b70-local tq layers (fmt.tq): the rotation's signs of each input width K (the GGUF's tq.sign.<K>), one bit an
+    /// input (1 = -1), copied into every blob of that width
+    std::vector<std::pair<int64_t, std::vector<uint8_t>>> tq_signs;
+    const std::vector<uint8_t>* tq_sign_bits(int64_t K) const {
+        for (const auto& p : tq_signs) if (p.first == K) return &p.second;
+        return nullptr;
+    }
     uint64_t expert_bytes(int64_t layer, int64_t expert) const {
         return mixed ? e_bytes[(size_t) (layer * n_expert + expert)] : blob_bytes(layer);
     }

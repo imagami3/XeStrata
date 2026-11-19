@@ -262,6 +262,7 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
                 L.tail_off = f.tail_off;   // NVFP4: the per-expert scales at the blob's end
                 if (f.tail_off != 0) L.bytes = f.bytes;
                 L.mixed = f.mixed;   // b70-local: per-expert widths (the blob header)
+                L.tq = f.tq;         // b70-local: trellis-coded blobs
                 if (f.gu_type == 150 || f.gu_type == 151)
                     native_expert_grouped_rvq(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
                                               hit_scratch_, hit_out, cs, grid_groups);

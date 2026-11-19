@@ -58,6 +58,9 @@ struct NativeFmt {
     /// expert), then its gate / up / down codes, gains and the layer's books at offsets derived from that width
     /// (rvq_mixed_*); n_ff here is the layer's widest expert (the kernels' grid and scratch).
     bool mixed = false;
+    /// b70-local (11-19): the mixed layer's experts are trellis-coded (tq2, tq_kernels.hpp) instead of RVQ2X8: gu_type
+    /// stays 150 (no CPU kernel, FP32 inputs, per-expert blobs), the blob is tq_kernels.cpp's.
+    bool tq = false;
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another

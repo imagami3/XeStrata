@@ -123,6 +123,7 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
     sk::NativeExpertLayout L = sk::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
     L.tail_off = f.tail_off;   // NVFP4: the per-expert scales at the blob's end
     if (f.tail_off != 0) L.bytes = f.bytes;
+    if (f.tq) { L.mixed = true; L.tq = true; }   // b70-local: trellis-coded blobs (the kernels read each blob's header)
     constexpr int kRing = 16, kCap = 8;
     const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
     const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);

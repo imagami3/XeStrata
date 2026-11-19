@@ -34,6 +34,7 @@
 #include "strata/kernels/canon_math.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/kernels/tq_kernels.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -2854,10 +2855,13 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     const bool mixed = L.mixed;
     const size_t gu_row = L.gu_row;   // n_embd / D codes, the same for every width
     // b70-local: a big window of mixed experts (an Inkling prompt window) on the XMX engines (rvq_xmx.cpp)
-    const bool use_xmx = D == 8 && mixed && rvq_xmx_on(cap_entries, N, FF);
+    // b70-local (11-19): trellis-coded blobs (tq_kernels.cpp): their gate / up, the same SwiGLU below, their down
+    const bool use_tq = L.tq;
+    const bool use_xmx = D == 8 && mixed && !use_tq && rvq_xmx_on(cap_entries, N, FF);
     // b70-local: one token (the decode) by lookup tables of the layer's books against x (rvq_lut.cpp)
-    const bool use_lut = D == 8 && !use_xmx && rvq_lut_on(q, cap_entries, N, FF, mixed, L.up_off, L.down_off, L.d_row);
-    if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
+    const bool use_lut = D == 8 && !use_xmx && !use_tq && rvq_lut_on(q, cap_entries, N, FF, mixed, L.up_off, L.down_off, L.d_row);
+    if (use_tq) tq_expert_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
+    else if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
     else if (use_lut) rvq_lut_gu(q, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF, mixed, gu_row, L.up_off, tail, h);
     else
     q.parallel_for(sycl::nd_range<2>({cg, (size_t) ((2 * FF + kRows - 1) / kRows) * kRows * kWarp}, {1, (size_t) kRows * kWarp}),
@@ -2908,6 +2912,11 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         swiglu_clamp(g, u, lim.lim);
         h[i] = (g / (1.0f + sycl::exp(-g))) * u;
     });
+    if (use_tq) {
+        const sycl::event et = tq_expert_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
+        sync_if_needed(stream, et, "native_expert_grouped_rvq (trellis)");
+        return;
+    }
     if (use_lut) {
         const sycl::event el = rvq_lut_down(q, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF, mixed,
                                             gu_row, L.down_off, L.d_row, tail);
