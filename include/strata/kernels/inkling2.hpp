@@ -69,6 +69,13 @@ void inkling2_attn_prep(const float* kr, const float* vr, float* conv_k, float* 
                         int dim, int rel, int n_tokens, float* snap_k, float* snap_v, int64_t snap_stride, int n_snap,
                         void* stream);
 
+/// b70-local: inkling2_attention for a prompt window on the matrix engines (inkling2_attn_xmx.cpp): the same result
+/// to about 22 bits.  False, nothing launched, where it does not run (no XMX, a head other than 128 wide, a bias rank
+/// past 32; STRATA_INK_ATT_XMX=0).
+bool inkling2_attention_xmx(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
+                            const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
+                            int extent, int window, float* out, int n_tokens, void* stream);
+
 /// b70-local: inkling2_attention and then out *= sigmoid(gate) (gate [T][H][D]; null: none).
 void inkling2_attention_gated(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
                               const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,

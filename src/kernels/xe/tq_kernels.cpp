@@ -20,7 +20,9 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+#include <type_traits>
 
 
 namespace strata::kernels {
@@ -57,13 +59,13 @@ inline View view(const uint8_t* blob, int64_t N) {
 // block (a block = 4 tiles = 4 neighbouring lanes, blocks of tiles start at multiples of 16), so a lane does H16 on its 16
 // values and the 4 lanes H4 by two exchanges.  GU: bands [0, ff/16) gate, [ff/16, 2 ff/16) up, input x [ent_tok[e]][N],
 // output gate / up [e][FF]; else down: N/16 bands, input h [e][FF], output out[ent_dst[e]][N].
-template <int S, int EP, bool GU>
+template <int S, int EPM, bool GU>
 sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_idx, const float* xin, int64_t ldx, float* o0, float* o1,
                  int64_t N, int64_t FF) {
     const int64_t bands = GU ? 2 * FF / 16 : N / 16;
     return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> red(S * EP * 16, h);
+        sycl::local_accessor<float, 1> red(S * EPM * 16, h);
         h.parallel_for(sycl::nd_range<2>({cg, (size_t) bands * S * 16}, {1, (size_t) S * 16}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -81,7 +83,10 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                 const uint8_t* sgn = GU ? v.gu_sign : v.d_sign;
                 const int64_t blk0 = sl * per, blk1 = sycl::min(nblk, blk0 + per);
                 const int e0 = grp_start[g], e1 = grp_start[g + 1];
-                for (int e = e0; e < e1; e += EP) {
+                // a pass takes up to EPM entries (each code decoded once for them); a single entry its own pass, so that
+                // it does not pay the second entry's products
+                auto pass = [&](int e, auto ep) {
+                    constexpr int EP = decltype(ep)::value;
                     const int n = sycl::min(EP, e1 - e);
                     float acc[EP][16];
 #pragma unroll
@@ -180,11 +185,18 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                         }
                     }
                     sycl::group_barrier(it.get_group());
+                };
+                for (int e = e0; e < e1;) {
+                    if (EPM > 1 && e1 - e >= 2) { pass(e, std::integral_constant<int, EPM>{}); e += sycl::min(EPM, e1 - e); }
+                    else { pass(e, std::integral_constant<int, 1>{}); e += 1; }
                 }
             }
         });
     });
 }
+
+// STRATA_TQ_PAIR=0: every entry its own pass (else two entries of an expert share a pass, a single one has its own)
+bool tq_pair_on() { static const bool on = [] { const char* v = std::getenv("STRATA_TQ_PAIR"); return !v || std::strtol(v, nullptr, 10) != 0; }(); return on; }
 
 }  // namespace
 
@@ -195,7 +207,7 @@ sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* gr
                          float* up, int64_t N, int64_t FF) {
     if (N % 64 != 0 || FF % 64 != 0) throw std::runtime_error("tq experts: widths must be multiples of 64");
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
-    if (cap_entries > 64) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+    if (tq_pair_on()) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     return gemv<6, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
 }
 
@@ -203,7 +215,7 @@ sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* 
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
                            float* out, int64_t N, int64_t FF) {
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
-    if (cap_entries > 64) return gemv<3, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+    if (tq_pair_on()) return gemv<3, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
     return gemv<3, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
 }
 

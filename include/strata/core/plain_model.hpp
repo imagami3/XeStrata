@@ -626,6 +626,8 @@ private:
         return -1;
     }
     void* i_xh_ = nullptr;   ///< b70-local: an Inkling prompt window's rows in FP16 (the Q6_K projections on XMX)   ///< b70-local: the device plan is on, so windows past MAXT can run (Inkling 2)
+    void* i_w16_ = nullptr;      ///< b70-local: a slice of a Q6_K projection's rows in FP16 (a prompt window's products)
+    int64_t i_w16_elems_ = 0;    ///< its size in FP16 values
 
     PlainOptions opt_;
     ModelSpec spec_;

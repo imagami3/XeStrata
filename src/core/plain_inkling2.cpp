@@ -29,6 +29,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/glm5.hpp"
@@ -359,7 +360,7 @@ bool PlainModel::load_inkling2(std::string& err) {
         epr_.trem = (float*) (b8 + o_trem);
         epr_.rem = (float*) (b8 + o_rem);
     }
-    // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 256)
+    // (a row at a time: native_q8_1_bytes takes at most 8 rows, and a prompt window may be up to 512)
     const size_t xq = std::max(k::native_q8_1_bytes((int) UN, 1), k::native_q8_1_bytes((int) HD, 1)) * (size_t) T;
     auto dev = [&](auto** p, uint64_t bytes) {
         void* d = nullptr;
@@ -388,6 +389,11 @@ bool PlainModel::load_inkling2(std::string& err) {
             err = "plain model: no VRAM for the prompt window's FP16 rows";
             return false;
         }
+        // the weights of a projection as FP16, a slice of rows at a time, for a window's product on the matrix engines
+        // (STRATA_INK_W16_MIB, default 16; 0: the 8-token kernel for every 8 rows of the window)
+        const char* m = std::getenv("STRATA_INK_W16_MIB");
+        const uint64_t mib = m ? (uint64_t) std::strtoull(m, nullptr, 10) : 16;
+        if (mib > 0 && dev(&i_w16_, mib << 20)) i_w16_elems_ = (int64_t) ((mib << 20) / 2);
     }
     const char* spec_kind = std::getenv("STRATA_INK_SPEC");
     const bool want_dspark = spec_kind != nullptr && std::strcmp(spec_kind, "dspark") == 0 && opt_.spec > 1;
@@ -440,6 +446,23 @@ void PlainModel::gproj_win(const W& w, const float* x, float* y, int TT, bool qu
     static const bool q8x_on = [] { const char* v = std::getenv("STRATA_INK_Q8_XMX"); return v == nullptr || v[0] != '0'; }();
     {
         if (TT <= 8) { this->gproj(w, x, y, TT, quantized, c); return; }
+        // a window of many rows: each slice of the weights decoded to FP16 once and multiplied with every row on the
+        // matrix engines (xmx_gemm), not decoded again for every 8 rows (STRATA_INK_W16_MIN rows, default 32)
+        static const int w16_min = [] { const char* v = std::getenv("STRATA_INK_W16_MIN"); return v ? std::atoi(v) : 32; }();
+        if (i_xh_ != nullptr && i_w16_ != nullptr && TT >= w16_min && w.type == k::kNativeQ6KRows && w.n_in % 256 == 0 &&
+            w.n_out % 16 == 0 && k::xmx_available(k::XmxType::f16)) {
+            const int64_t rows = std::min<int64_t>(w.n_out, i_w16_elems_ / w.n_in / 16 * 16);
+            if (rows > 0 && k::xmx_gemm_ok(i_xh_, i_w16_, y, rows, w.n_in, w.n_out)) {
+                k::native_f32_to_f16_rows(x, i_xh_, (int) w.n_in, TT, c);
+                for (int64_t r0 = 0; r0 < w.n_out; r0 += rows) {
+                    const int64_t n = std::min(rows, w.n_out - r0);
+                    k::dequant_f16(w.type, w.data, r0, n, w.n_in, (uint16_t*) i_w16_, c);
+                    k::xmx_gemm(k::XmxType::f16, (const uint16_t*) i_xh_, (const uint16_t*) i_w16_, y + r0, TT, n, w.n_in,
+                                w.n_out, c);
+                }
+                return;
+            }
+        }
         // Q6_K rows on the matrix engines (q6k_xmx.cpp: 8 tokens a launch at about one token's cost), the tokens in
         // FP16: i_xh_ holds the window's rows and 8 zero rows past them
         if (i_xh_ != nullptr && w.type == k::kNativeQ6KRows && w.n_in % 256 == 0 && w.n_out % 16 == 0 &&

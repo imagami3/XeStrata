@@ -220,8 +220,12 @@ void inkling2_attention_gated(const float* q, const float* r, const float* sinks
                                  n_tokens, splits, gate, stream);
         return;
     }
-    inkling2_attention(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, dim, rel, extent, window, out, n_tokens,
-                       stream);
+    // a prompt window on the matrix engines (inkling2_attn_xmx.cpp; tests/core/inkling2_attn_xmx_test.cpp checks it
+    // against this file's kernel)
+    if (n_tokens <= 8 || !inkling2_attention_xmx(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, dim, rel, extent,
+                                                 window, out, n_tokens, stream))
+        inkling2_attention(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, dim, rel, extent, window, out,
+                           n_tokens, stream);
     if (gate != nullptr) inkling2_sigmoid_mul(out, gate, (int64_t) n_tokens * n_head * dim, stream);
 }
 
