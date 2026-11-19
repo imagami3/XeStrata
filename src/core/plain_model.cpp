@@ -262,8 +262,8 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             return false;
         }
     }
-    // b70-local: Inkling 2 with every expert resident takes windows up to 256 (its prompt; checked in open_experts)
-    if (opt_.max_t < 1 || opt_.max_t > 256 || opt_.max_cells < 16) {
+    // b70-local: Inkling 2 with every expert resident takes windows up to 512 (its prompt; checked in open_experts)
+    if (opt_.max_t < 1 || opt_.max_t > 512 || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
