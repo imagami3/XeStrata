@@ -7,9 +7,13 @@
 // up to 8 * NP of its entries: per 256 inputs each lane decodes one tile (its band, its 16 inputs: the decode kernel's
 // coalesced loads) into local memory as FP16 once, and each sub-group multiplies its band on the XMX engines for every
 // 8 of the entries (8 x 16 x 16 tiles, the inputs read from global memory, FP32 sums kept in local memory between the
-// steps); the row gains go on the FP32 sums.  The decode is the larger cost (~11 instructions a weight; B70, 64 experts
+// steps); the row gains (times the code's 1/147.8) go on the FP32 sums.  The decode is the larger cost (B70, 64 experts
 // x 8 entries: without it 4.4 ms of 10.2), so one decode serves as many entries as it can: 64 experts x 32 entries 52 ms
-// with a decode every 8 entries and the inputs gathered into local memory, 17.5 ms now (x 4 entries 12.1 -> 8.6 ms).
+// with a decode every 8 entries and the inputs gathered into local memory, 17.5 ms then (x 4 entries 12.1 -> 8.6 ms).
+// A weight goes into local memory as its code's integer value (-510 .. 510, exact in FP16: the byte sum's dot
+// instruction subtracts the 510, one conversion to FP16): x 8 / 32 entries 8.3 / 17.5 -> 6.8 / 15.2 ms against the
+// value in FP32 converted.  Keeping the sums of 2 or 4 passes in registers a step (each weight tile loaded once for
+// them) was slower at 8 entries (7.6 / 8.1 ms) and faster at 32 (14.6 / 13.3).
 #include "strata/kernels/tq_kernels.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 
@@ -177,17 +181,18 @@ struct TqXmx {
                         for (int i = 0; i < 16; ++i) { d[i] = *p; p += nt; }   // steps by nt (AGENTS.md: IGC's GEP simplification)
                         const uint32_t d16 = ((const uint16_t*) (p - lane))[lane];
                         auto tw = [&](int k) -> uint32_t { return k < 32 ? ((d[k >> 1] >> (16 * (k & 1))) & 0xFFFFu) : d16; };
-                        auto val = [](uint32_t z) { return (float) tq_bsum(z * 34038481u + 76625530u); };
-                        // a row's 16 values as floats, then one conversion and one 32-byte store (inserting FP16 lanes
-                        // one by one into a vector was 10x slower)
-                        auto put = [&](const float* f, int r) {
-                            sycl::vec<float, 16> v;
+                        // the code's integer value (-510 .. 510, exact in FP16; its 1/147.8 goes on the row gains)
+                        auto val = [](uint32_t z) { return tq_bsum510(z * 34038481u + 76625530u); };
+                        // a row's 16 values, then one conversion and one 32-byte store (inserting FP16 lanes one by one
+                        // into a vector was 10x slower)
+                        auto put = [&](const int32_t* f, int r) {
+                            sycl::vec<int32_t, 16> v;
 #pragma unroll
-                            for (int i = 0; i < 16; ++i) v[i] = (f[i] - 510.0f) * (1.0f / 147.8f);
+                            for (int i = 0; i < 16; ++i) v[i] = f[i];
                             *reinterpret_cast<sycl::vec<half, 16>*>(w + r * KC) = v.convert<half>();
                         };
                         uint32_t s = tw(0);
-                        float row[16];
+                        int32_t row[16];
                         row[0] = val(s);
 #pragma unroll
                         for (int wd = 0; wd < 32; ++wd) {
@@ -228,7 +233,7 @@ struct TqXmx {
                 for (int idx = tid; idx < n * RT; idx += WG) {
                     const int er = idx / RT, rr = idx % RT;
                     const int64_t r = r0 + rr;
-                    const float y = otp[er * RT + rr] * (float) gains[r];
+                    const float y = otp[er * RT + rr] * ((float) gains[r] * (1.0f / 147.8f));
                     if (DOWN) o0[(size_t) ent_dst[e + er] * (size_t) N + r] = y;
                     else (up ? o1 : o0)[(size_t) (e + er) * (size_t) FF + r] = y;
                 }

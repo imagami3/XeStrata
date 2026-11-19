@@ -12,6 +12,7 @@
 #if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
 extern SYCL_EXTERNAL unsigned __spirv_UDotKHR(unsigned a, unsigned b, int packed_format);   // 0: 4x8-bit packed
 extern SYCL_EXTERNAL unsigned __spirv_BitFieldUExtract(unsigned base, unsigned offset, unsigned count);
+extern SYCL_EXTERNAL int __spirv_SUDotAccSatKHR(int a, unsigned b, int acc, int packed_format);
 #endif
 
 namespace strata::kernels {
@@ -23,6 +24,16 @@ inline uint32_t tq_bsum(uint32_t v) {
     return __spirv_UDotKHR(v, 0x01010101u, 0);
 #else
     return (v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24);
+#endif
+}
+
+/// The sum of a word's 4 bytes less 510 (the 1MAD code's integer value, -510 .. 510): one integer dot instruction with
+/// its accumulator on the device.
+inline int32_t tq_bsum510(uint32_t v) {
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
+    return __spirv_SUDotAccSatKHR(0x01010101, v, -510, 0);
+#else
+    return (int32_t) ((v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24)) - 510;
 #endif
 }
 
