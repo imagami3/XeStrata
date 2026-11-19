@@ -424,7 +424,82 @@ static void inkling2_attention_split(const float* q, const float* r, const float
     sycl::queue& qu = queue_for(stream);
     const size_t nwg = (size_t) n_tokens * n_head * splits;
     float* part = att_scratch(qu, nwg * PW);
-    qu.submit([&](sycl::handler& h) {
+    // b70-local: a sub-group a (token, head, split), no barriers: 16 cells a step, a lane a cell's q.k (q from local
+    // memory, the cell's K row read by its lane) and bias, the step's softmax over the lanes, then p.v with a lane 8
+    // of the dims; a split takes at least 64 cells (the splits past the context's share write an empty part).  The
+    // work-group a (token, head, split) of 128 above took 143 us for 4 tokens over 304 cells on the B70 (the test's
+    // timing, no graph): its barriers, group reductions and one lane's bias loop a key.  STRATA_INK_ATT_SG=0: that one.
+    static const bool sg_on = [] { const char* v = std::getenv("STRATA_INK_ATT_SG"); return v == nullptr || v[0] != '0'; }();
+    if (sg_on && rel <= 32) {
+        constexpr int SGW = 16, NSGW = 8, CS = 16;
+        const size_t nsg = nwg, wgs = (nsg + NSGW - 1) / NSGW;
+        qu.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> sq(sycl::range<1>(NSGW * D), h);
+            h.parallel_for(sycl::nd_range<1>(wgs * NSGW * SGW, NSGW * SGW), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+                const size_t id = (size_t) it.get_group(0) * NSGW + sgi;
+                if (id >= nsg) return;   // the whole sub-group
+                const int sp = (int) (id % splits), th = (int) (id / splits), t = th / n_head, hh = th % n_head;
+                const int kvh = hh / G;
+                const int64_t width = (int64_t) n_head_kv * D;
+                float* qv = &sq[sgi * D];
+#pragma unroll
+                for (int i = 0; i < D / SGW; ++i) qv[lane + i * SGW] = q[(int64_t) th * D + lane + i * SGW] * qs;
+                float rv[32];
+#pragma unroll
+                for (int i = 0; i < 32; ++i) rv[i] = i < rel ? r[(int64_t) th * rel + i] : 0.0f;
+                sycl::group_barrier(sg);
+                const int64_t pos = steps[(int64_t) t * kStepCount + kStepPos];
+                const int64_t lo = window > 0 ? sycl::max((int64_t) 0, pos - window + 1) : 0;
+                const int64_t nk = pos - lo + 1;
+                const int64_t L = (sycl::max((int64_t) 64, (nk + splits - 1) / splits) + CS - 1) / CS * CS;
+                const int64_t j0 = lo + (int64_t) sp * L, j1 = sycl::min(pos + 1, j0 + L);
+                float m = -INFINITY, l = 0.0f, acc[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+                for (int64_t c0 = j0; c0 < j1; c0 += CS) {
+                    const int64_t j = c0 + lane;
+                    const bool valid = j < j1;
+                    float s = -INFINITY;
+                    if (valid) {
+                        const sycl::vec<float, 4>* kr = reinterpret_cast<const sycl::vec<float, 4>*>(kc + j * width + (int64_t) kvh * D);
+                        float sd = 0.0f;
+                        for (int d4 = 0; d4 < D / 4; ++d4) {
+                            const sycl::vec<float, 4> k4 = kr[d4];
+                            sd += qv[4 * d4] * k4[0] + qv[4 * d4 + 1] * k4[1] + qv[4 * d4 + 2] * k4[2] + qv[4 * d4 + 3] * k4[3];
+                        }
+                        const int64_t dist = pos - j;
+                        if (dist < extent) {
+                            const float* tb = table + dist * rel;
+                            for (int i = 0; i < rel; ++i) sd += rv[i] * tb[i];
+                        }
+                        s = sd;
+                    }
+                    const float cm = sycl::reduce_over_group(sg, s, sycl::maximum<float>());
+                    const float nm = sycl::fmax(m, cm);
+                    const float p = valid ? sycl::exp(s - nm) : 0.0f;
+                    const float a = m == -INFINITY ? 0.0f : sycl::exp(m - nm);
+                    l = l * a + sycl::reduce_over_group(sg, p, sycl::plus<float>());
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[i] *= a;
+                    const int nc = (int) sycl::min<int64_t>(CS, j1 - c0);
+                    for (int k = 0; k < nc; ++k) {
+                        const float pk = sycl::select_from_group(sg, p, k);
+                        const sycl::vec<float, 4>* vr = reinterpret_cast<const sycl::vec<float, 4>*>(vc + (c0 + k) * width + (int64_t) kvh * D + lane * 8);
+                        const sycl::vec<float, 4> v0 = vr[0], v1 = vr[1];
+                        acc[0] += pk * v0[0]; acc[1] += pk * v0[1]; acc[2] += pk * v0[2]; acc[3] += pk * v0[3];
+                        acc[4] += pk * v1[0]; acc[5] += pk * v1[1]; acc[6] += pk * v1[2]; acc[7] += pk * v1[3];
+                    }
+                    m = nm;
+                }
+                float* pp = part + id * PW;
+                if (lane == 0) { pp[0] = m; pp[1] = l; }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) pp[2 + lane * 8 + i] = acc[i];
+            });
+        });
+    } else qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sq(sycl::range<1>(D), h);
         sycl::local_accessor<float, 1> sr(sycl::range<1>(32), h);
         sycl::local_accessor<float, 1> sc(sycl::range<1>(kAttnChunk), h);
