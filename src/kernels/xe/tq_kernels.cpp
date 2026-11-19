@@ -20,24 +20,13 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <stdexcept>
 
-#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
-extern SYCL_EXTERNAL unsigned __spirv_UDotKHR(unsigned a, unsigned b, int packed_format);   // 0: 4x8-bit packed
-#endif
 
 namespace strata::kernels {
 
 namespace {
 
-inline uint32_t bsum(uint32_t v) {
-#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
-    return __spirv_UDotKHR(v, 0x01010101u, 0);
-#else
-    return (v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24);
-#endif
-}
 
 struct View {
     int64_t ff;
@@ -68,7 +57,7 @@ inline View view(const uint8_t* blob, int64_t N) {
 // block (a block = 4 tiles = 4 neighbouring lanes, blocks of tiles start at multiples of 16), so a lane does H16 on its 16
 // values and the 4 lanes H4 by two exchanges.  GU: bands [0, ff/16) gate, [ff/16, 2 ff/16) up, input x [ent_tok[e]][N],
 // output gate / up [e][FF]; else down: N/16 bands, input h [e][FF], output out[ent_dst[e]][N].
-template <int S, int EP, bool GU, int DBG = 0>
+template <int S, int EP, bool GU>
 sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_idx, const float* xin, int64_t ldx, float* o0, float* o1,
                  int64_t N, int64_t FF) {
@@ -115,7 +104,6 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                             const float* xp = xin + (size_t) row * (size_t) ldx + c * 16;
 #pragma unroll
                             for (int i = 0; i < 16; ++i) xv[j][i] = ((sb >> i) & 1) ? -xp[i] : xp[i];
-                            if (DBG != 1) {
 #pragma unroll
                             for (int hh = 1; hh < 16; hh <<= 1)
 #pragma unroll
@@ -128,7 +116,6 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                                     const float o = sycl::permute_group_by_xor(sg, xv[j][i], m);
                                     xv[j][i] = (lane & m) ? o - xv[j][i] : xv[j][i] + o;
                                 }
-                            }
                             xs[j] = 0.0f;
 #pragma unroll
                             for (int i = 0; i < 16; ++i) { xv[j][i] = live ? xv[j][i] * (0.125f / 147.8f) : 0.0f; xs[j] += xv[j][i]; }
@@ -149,7 +136,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                         auto tw = [&](int k) -> uint32_t { return k < 32 ? ((d[k >> 1] >> (16 * (k & 1))) & 0xFFFFu) : d16; };
                         uint32_t s = tw(0);
                         {
-                            const float w = (float) bsum(s * 34038481u + 76625530u);
+                            const float w = (float) tq_bsum(s * 34038481u + 76625530u);
 #pragma unroll
                             for (int j = 0; j < EP; ++j) acc[j][0] += w * xv[j][0];
                         }
@@ -161,7 +148,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                                 const int t = wd * 8 + u;
                                 if (t > 255) break;
                                 const uint32_t z = (U >> (2 * u)) & 0x3FFFu;
-                                const float w = (float) bsum(z * 34038481u + 76625530u);
+                                const float w = (float) tq_bsum(z * 34038481u + 76625530u);
 #pragma unroll
                                 for (int j = 0; j < EP; ++j) acc[j][t >> 4] += w * xv[j][t & 15];
                             }
@@ -201,24 +188,21 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
 
 }  // namespace
 
-// one entry an expert is the decode and nearly every small window (a window's tokens rarely share an expert); two at
-// once for bigger windows (each code decoded once for both)
+// one entry an expert is the decode and nearly every small window (a window's tokens rarely share an expert); a big
+// window (the prompt) on the XMX engines (tq_xmx.cpp), else two entries at once (each code decoded once for both)
 sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                  const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
-                  float* up, int64_t N, int64_t FF) {
+                         const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
+                         float* up, int64_t N, int64_t FF) {
     if (N % 64 != 0 || FF % 64 != 0) throw std::runtime_error("tq experts: widths must be multiples of 64");
+    if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
     if (cap_entries > 64) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
-    static const int sdbg = [] { const char* v = std::getenv("STRATA_TQ_S"); return v ? std::atoi(v) : 6; }();
-    if (sdbg == 9) return gemv<2, 1, true, 1>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
-    if (sdbg == 1) return gemv<1, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
-    if (sdbg == 2) return gemv<2, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
-    if (sdbg == 3) return gemv<3, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     return gemv<6, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
 }
 
 sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
                            float* out, int64_t N, int64_t FF) {
+    if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
     if (cap_entries > 64) return gemv<3, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
     return gemv<3, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
 }

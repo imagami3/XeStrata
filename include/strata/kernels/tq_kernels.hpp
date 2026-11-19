@@ -9,7 +9,21 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
+extern SYCL_EXTERNAL unsigned __spirv_UDotKHR(unsigned a, unsigned b, int packed_format);   // 0: 4x8-bit packed
+#endif
+
 namespace strata::kernels {
+
+/// The sum of a word's 4 bytes: one integer dot instruction on the device (SPV_KHR_integer_dot_product, as
+/// cuda_intrinsics.hpp's dp4a; the SYCL headers' dot_acc expands to a byte loop, 2.5x slower on the B70).
+inline uint32_t tq_bsum(uint32_t v) {
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
+    return __spirv_UDotKHR(v, 0x01010101u, 0);
+#else
+    return (v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24);
+#endif
+}
 
 inline constexpr int64_t kTqTileBytes = 66;            ///< a 16x16 tile: 2 bytes of start state, 255 2-bit symbols
 inline constexpr int32_t kTqMagic = 0x32515454;        ///< "TTQ2", the blob header's second int32
@@ -41,5 +55,15 @@ sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* gr
 sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
                            float* out, int64_t N, int64_t FF);
+
+/// Whether a window of `cap_entries` entries takes the XMX kernels (tq_xmx.cpp; STRATA_TQ_XMX: 0 off, else the
+/// entries it needs, default 64), as the device reports its matrix engines and local memory.
+bool tq_xmx_on(sycl::queue& q, int64_t cap_entries, int64_t N, int64_t FF);
+sycl::event tq_xmx_gu(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                      const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
+                      float* up, int64_t N, int64_t FF);
+sycl::event tq_xmx_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                        const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h, float* out,
+                        int64_t N, int64_t FF);
 
 }  // namespace strata::kernels
