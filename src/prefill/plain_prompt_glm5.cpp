@@ -45,7 +45,7 @@ namespace k = strata::kernels;
 namespace {
 constexpr int kHC = 4;
 constexpr float kL2Eps = 1e-6f;   // llama.cpp's FLA l2 norm
-int file_type(int t) { return t == k::kNativeQ6KRows ? 14 : t == k::kNativeQ8Rows ? 8 : t; }
+int file_type(int t) { return t == k::kNativeQ6KRows ? 14 : t == k::kNativeQ8Rows ? 8 : t == k::kNativeQ4Rows ? 2 : t; }
 }  // namespace
 
 bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,

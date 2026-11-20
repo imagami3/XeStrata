@@ -1023,6 +1023,11 @@ if(STRATA_ENABLE_XE)
     # #783 PR-g: the multi-token hyper-connection write against the per-token one, memcmp
     add_executable(hc_q8_bench src/kernels/hc_q8_bench.cpp)   # timing / output check of the Q8_0 hyper-connection read
     target_link_libraries(hc_q8_bench PRIVATE strata_kernels)
+    add_executable(mmvq_type_bench src/kernels/mmvq_type_bench.cpp)   # b70-local: decode GEMV bytes/s per weight type
+    target_link_libraries(mmvq_type_bench PRIVATE strata_kernels)
+    add_executable(q4_rows_parity src/kernels/q4_rows_parity.cpp)   # b70-local: kNativeQ4Rows bitwise Q4_0's
+    target_link_libraries(q4_rows_parity PRIVATE strata_kernels)
+    add_test(NAME q4_rows_parity COMMAND q4_rows_parity)
     add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
     target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
     add_test(NAME gr_multi_parity COMMAND gr_multi_parity)

@@ -194,7 +194,7 @@ bool PlainModel::dspark_load(std::string& err) {
                 if (v >= 0 && v < n_vocab_) ids.push_back(v);
             std::fclose(f);
         }
-        const int gt = head_.type == k::kNativeQ8Rows ? 8 : head_.type == k::kNativeQ6KRows ? 14 : head_.type;
+        const int gt = head_.type == k::kNativeQ8Rows ? 8 : head_.type == k::kNativeQ6KRows ? 14 : head_.type == k::kNativeQ4Rows ? 2 : head_.type;
         const size_t row = k::cpu::native_row_bytes(gt, head_.n_in);
         void* di = nullptr;
         void* dh = nullptr;

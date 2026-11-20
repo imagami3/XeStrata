@@ -68,6 +68,13 @@ namespace k = strata::kernels;
 
 constexpr int kQ6K = 14;
 constexpr int kQ80 = 8;
+constexpr int kQ40 = 2;
+// b70-local: STRATA_Q4_ROWS=1 - Q4_0 matrices into kNativeQ4Rows' layout at upload (aligned loads, the decode's
+// products bitwise Q4_0's: q4_rows_parity); off by default
+bool q4_rows_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_Q4_ROWS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
 constexpr int kF32 = 0;
 
@@ -157,6 +164,9 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     } else if (w.type == kQ80 && k::native_q8_0_rows_ok(w.n_in)) {   // as Qwen3.8's dense weights (native_dense)
         k::native_q8_0_to_rows(d, w.n_in, w.n_out, cs_);
         w.type = k::kNativeQ8Rows;
+    } else if (w.type == kQ40 && k::native_q4_0_rows_ok(w.n_in) && q4_rows_on()) {   // b70-local: STRATA_Q4_ROWS=1
+        k::native_q4_0_to_rows(d, w.n_in, w.n_out, cs_);
+        w.type = k::kNativeQ4Rows;
     }
     w.data = d;
     return true;
@@ -531,6 +541,7 @@ bool PlainModel::setup_draft_head(std::string& err) {
         }
         const int gguf_type = head_.type == k::kNativeQ8Rows    ? kQ80
                               : head_.type == k::kNativeQ6KRows ? kQ6K
+                              : head_.type == k::kNativeQ4Rows  ? kQ40
                                                                 : head_.type;
         const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2
                                                : k::cpu::native_row_bytes(gguf_type, head_.n_in);

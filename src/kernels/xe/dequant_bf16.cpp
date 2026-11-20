@@ -60,6 +60,13 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
             put(out, j, (float) ((b[2 + j] & 0x0F) - 8) * d);
             put(out, j + 16, (float) ((b[2 + j] >> 4) - 8) * d);
         }
+    } else if constexpr (TYPE == kNativeQ4Rows) {                  // b70-local: Q4_0 split by row (native_mmvq.hpp)
+        const uint8_t* qs = row_blocks + (size_t) gi_in_row * 16;
+        const float d = h2f(row_blocks + (size_t) groups_per_row * 16 + (size_t) gi_in_row * 2);
+        for (int j = 0; j < 16; ++j) {
+            put(out, j, (float) ((qs[j] & 0x0F) - 8) * d);
+            put(out, j + 16, (float) ((qs[j] >> 4) - 8) * d);
+        }
     } else if constexpr (TYPE == 6) {                              // Q5_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
         const float d = h2f(b);
@@ -278,6 +285,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 14: block_elems = 256; block_bytes = 210; return true;
     case kNativeQ6KRows: block_elems = 512; block_bytes = 420; return true;
     case kNativeQ8Rows: block_elems = 64; block_bytes = 68; return true;
+    case kNativeQ4Rows: block_elems = 64; block_bytes = 36; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
     case 40: block_elems = 64; block_bytes = 36; return true;
@@ -310,6 +318,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 14: STRATA_DQ(14);
     case kNativeQ6KRows: STRATA_DQ(kNativeQ6KRows);
     case kNativeQ8Rows: STRATA_DQ(kNativeQ8Rows);
+    case kNativeQ4Rows: STRATA_DQ(kNativeQ4Rows);
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);

@@ -67,7 +67,7 @@ bool mapped(size_t bytes, void** h, void** d) {
 }
 
 /// A projection's GGUF type before the engine's row order (the byte count of its rows)
-int file_type(int t) { return t == k::kNativeQ6KRows ? kQ6K : t == k::kNativeQ8Rows ? kQ80 : t; }
+int file_type(int t) { return t == k::kNativeQ6KRows ? kQ6K : t == k::kNativeQ8Rows ? kQ80 : t == k::kNativeQ4Rows ? 2 : t; }
 
 }  // namespace
 
