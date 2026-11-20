@@ -300,8 +300,25 @@ void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, vo
     sync_if_needed(stream, event, "glm5_hc_mean");
 }
 
+namespace {
+// b70-local (11-21): the dynamic count (glm5.hpp): lane i of the sub-group holds pick i's p (`mine`, 0 past k); a pick
+// is kept while the picks before it (heavier, ties to the lower index) hold less than topp of the k picks' sum; the
+// kept weights are renormalized over the kept ones.  Every lane of the sub-group takes part (the shuffles).
+inline float router_topp(const sycl::sub_group& sg, int lane, int k, float mine, float topp, float scale, bool& kept) {
+    const float tot = sycl::reduce_over_group(sg, lane < k ? mine : 0.0f, sycl::plus<float>());
+    float before = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float o = sycl::select_from_group(sg, mine, j);
+        if (o > mine || (o == mine && j < lane)) before += o;
+    }
+    kept = lane < k && before < topp * tot;
+    const float ks = sycl::reduce_over_group(sg, kept ? mine : 0.0f, sycl::plus<float>());
+    return kept ? mine / sycl::fmax(ks, 6.103515625e-05f) * scale : 0.0f;
+}
+}  // namespace
+
 void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, int n_expert, int k, bool norm,
-                         float scale, int32_t* ids, float* weights, void* stream) {
+                         float scale, int32_t* ids, float* weights, void* stream, float topp) {
     if (n_tokens <= 0) return;
     if (n_expert <= 0 || k <= 0 || k > WARP || k > n_expert || n_expert > 16 * WARP)
         throw core::DeviceError("glm5_router_sigmoid: " + std::to_string(k) + " of " + std::to_string(n_expert) +
@@ -311,6 +328,7 @@ void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, i
     // they are still computed). Unset or >= k: unchanged.
     static const int keep_env = [] { const char* v = std::getenv("STRATA_MOE_KEEP"); return v ? std::atoi(v) : 0; }();
     const int keep = keep_env > 0 && keep_env < k ? keep_env : k;
+    const bool dyn = topp > 0.0f && topp < 1.0f && norm;   // b70-local (11-21): the dynamic count
     // b70-local: a work-item an expert, each counting the experts ahead of it in the same order (larger biased score,
     // then lower index): rank i < k is pass i's pick of the kernel below, so the ids, their order and the weights are
     // the same (the logits bitwise).  One sub-group making k passes took ~19 us on the B70 (384 experts, k 8), this
@@ -357,7 +375,11 @@ void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, i
                     const float mine = e < k ? pw[e] : 0.0f;
                     float div = 1.0f;
                     if (norm) div = sycl::fmax(sycl::reduce_over_group(sg, mine, sycl::plus<float>()), 6.103515625e-05f);
-                    if (e < k) weights[(size_t) t * k + e] = e < keep ? mine / div * scale : 0.0f;
+                    if (dyn) {
+                        bool kept = false;
+                        const float wv = router_topp(sg, e, k, mine, topp, scale, kept);
+                        if (e < k) { weights[(size_t) t * k + e] = wv; if (!kept) ids[(size_t) t * k + e] = -1; }
+                    } else if (e < k) weights[(size_t) t * k + e] = e < keep ? mine / div * scale : 0.0f;
                 }
             });
         });
@@ -408,7 +430,11 @@ void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, i
                 const float sum = sycl::reduce_over_group(sg, lane < k ? mine : 0.0f, sycl::plus<float>());
                 div = sycl::fmax(sum, 6.103515625e-05f);   // 2**-14, as llama.cpp
             }
-            if (lane < k) weights[(size_t) t * k + lane] = lane < keep ? mine / div * scale : 0.0f;
+            if (dyn) {
+                bool kept = false;
+                const float wv = router_topp(sg, lane, k, mine, topp, scale, kept);
+                if (lane < k) { weights[(size_t) t * k + lane] = wv; if (!kept) ids[(size_t) t * k + lane] = -1; }
+            } else if (lane < k) weights[(size_t) t * k + lane] = lane < keep ? mine / div * scale : 0.0f;
         });
     sync_if_needed(stream, event, "glm5_router_sigmoid");
 }

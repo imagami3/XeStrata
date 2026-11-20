@@ -746,7 +746,11 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     }
     glm5_decode_stamp(this, l, 7, cs);   // b70-local profile: the norm and the router's product done
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
-    k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs);
+    // b70-local (11-21): STRATA_INK_MOE_TOPP=p (0 < p < 1): a token's experts by its routing weights until the ones
+    // before hold p of them, renormalized (B70 eval, TQ1: p 0.93 = 7.37 experts a token, KL -2%, agent +2%; 0.95 = 7.74,
+    // KL -1.7%); the dropped ones are not computed (the device plan leaves id -1 out)
+    static const float ink_topp = [] { const char* v = std::getenv("STRATA_INK_MOE_TOPP"); return v ? (float) std::atof(v) : 0.0f; }();
+    k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, true, scale, ids_, w_, cs, ink_topp);
     glm5_decode_stamp(this, l, 4, cs);
     ++ring;
     glm5_decode_stamp(this, l, 15, cs);

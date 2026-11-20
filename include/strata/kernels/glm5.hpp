@@ -52,8 +52,11 @@ void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, vo
 /// The sigmoid router (llama.cpp's build_moe_ffn with gating SIGMOID and exp_probs_b): p = sigmoid(logits); the k
 /// experts with the largest p + bias (ties to the lower index), weights p of those, divided by their sum (clamped
 /// below at 2**-14) when `norm`, times `scale`.  logits [T][E], bias [E]; ids, weights [T][k].  k <= 32.
+/// b70-local (11-21): `topp` in (0, 1): a dynamic count - a token keeps its heaviest picks (by p) until the ones before
+/// a pick hold `topp` of the k picks' p, renormalized over the kept ones (times `scale`); a dropped pick's id is -1 and
+/// its weight 0 (resident_plan / resident_plan_big leave it out, so it is not computed).  0: all k (unchanged).
 void glm5_router_sigmoid(const float* logits, const float* bias, int n_tokens, int n_expert, int k, bool norm,
-                         float scale, int32_t* ids, float* weights, void* stream);
+                         float scale, int32_t* ids, float* weights, void* stream, float topp = 0.0f);
 
 /// KDA's per-channel decay (llama.cpp's build_kda_layer with a gate lower bound): g = lb sigmoid(-(f + dt_bias) a),
 /// a = ssm_a (it holds -exp(A_log)) per head.  f, g [T][H][S]; dt_bias [H S]; ssm_a [H].  lb finite and below 0.

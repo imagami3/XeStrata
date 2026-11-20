@@ -833,7 +833,8 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             if (t < n) {
                 const int32_t ex = ids[t];
                 valid = ex >= 0 && ex < n_expert && res[ex] >= 0;
-                bad = !valid && !(absent_ok && ex >= 0 && ex < n_expert);
+                // b70-local (11-21): -1 = a pick the router's dynamic count dropped (glm5_router_sigmoid's topp): left out
+                bad = !valid && ex != -1 && !(absent_ok && ex >= 0 && ex < n_expert);
                 s_ids[t] = valid ? ex : -2 - t;   // an absent entry matches no other (absent_ok)
             }
             if (sycl::any_of_group(grp, bad)) {
