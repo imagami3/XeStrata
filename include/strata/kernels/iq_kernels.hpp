@@ -89,7 +89,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
-size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+// b70-local (11-22): n_embd > 0 adds the trellis experts' rotated inputs ([cap_entries][n_embd] FP32, STRATA_TQ_PREROT)
+size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff, int64_t n_embd = 0);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)

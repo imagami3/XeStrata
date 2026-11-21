@@ -126,7 +126,7 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
     if (f.tq) { L.mixed = true; L.tq = true; }   // b70-local: trellis-coded blobs (the kernels read each blob's header)
     constexpr int kRing = 16, kCap = 8;
     const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
-    const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);
+    const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff, f.n_embd);
     // b70-local: the RVQ experts (types 150 / 151) read the tokens' FP32 rows, the others their q8_1 blocks
     const bool rvq = f.gu_type == 150 || f.gu_type == 151;
     const size_t xq = rvq ? (size_t) f.n_embd * 4 : (size_t) (f.n_embd / 32) * 36, out = (size_t) kCap * (size_t) f.n_embd * 4;

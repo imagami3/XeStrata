@@ -59,7 +59,9 @@ inline View view(const uint8_t* blob, int64_t N) {
 // block (a block = 4 tiles = 4 neighbouring lanes, blocks of tiles start at multiples of 16), so a lane does H16 on its 16
 // values and the 4 lanes H4 by two exchanges.  GU: bands [0, ff/16) gate, [ff/16, 2 ff/16) up, input x [ent_tok[e]][N],
 // output gate / up [e][FF]; else down: N/16 bands, input h [e][FF], output out[ent_dst[e]][N].
-template <int S, int EPM, bool GU>
+// PRE (STRATA_TQ_PREROT=1, b70-local 11-22): xin holds each entry's rotated input [entry][ldx] (tq_rot below: the
+// same operations in the same order, so the sums are the same to the bit) and the band's work-groups only read it.
+template <int S, int EPM, bool GU, bool PRE = false>
 sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_idx, const float* xin, int64_t ldx, float* o0, float* o1,
                  int64_t N, int64_t FF) {
@@ -100,9 +102,18 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                         const int ln = live ? lane : 0;
                         const int64_t c = c0 + ln;
                         // the inputs: sign, H16 in the lane, H4 over lanes 4m..4m+3; 1/8 (orthonormal) and 1/147.8 (the code's scale)
-                        const uint32_t sb = (uint32_t) sgn[2 * c] | ((uint32_t) sgn[2 * c + 1] << 8);
                         float xv[EP][16];
                         float xs[EP];
+                        if constexpr (PRE) {
+#pragma unroll
+                            for (int j = 0; j < EP; ++j) {
+                                const float* xp = xin + (size_t) (e + (j < n ? j : 0)) * (size_t) ldx + c * 16;
+                                xs[j] = 0.0f;
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) { xv[j][i] = live ? xp[i] : 0.0f; xs[j] += xv[j][i]; }
+                            }
+                        } else {
+                        const uint32_t sb = (uint32_t) sgn[2 * c] | ((uint32_t) sgn[2 * c + 1] << 8);
 #pragma unroll
                         for (int j = 0; j < EP; ++j) {
                             const int64_t row = GU ? (int64_t) ent_idx[e + (j < n ? j : 0)] : (int64_t) (e + (j < n ? j : 0));
@@ -124,6 +135,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                             xs[j] = 0.0f;
 #pragma unroll
                             for (int i = 0; i < 16; ++i) { xv[j][i] = live ? xv[j][i] * (0.125f / 147.8f) : 0.0f; xs[j] += xv[j][i]; }
+                        }
                         }
                         if (!live) continue;
                         // the pointer steps by nt from the last read (AGENTS.md: IGC 2.27-2.30's GEP simplification misreads
@@ -198,23 +210,89 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
 // STRATA_TQ_PAIR=0: every entry its own pass (else two entries of an expert share a pass, a single one has its own)
 bool tq_pair_on() { static const bool on = [] { const char* v = std::getenv("STRATA_TQ_PAIR"); return !v || std::strtol(v, nullptr, 10) != 0; }(); return on; }
 
+// b70-local (11-22): each entry's input rotated once (STRATA_TQ_PREROT=1), as gemv does it in every band's work-group:
+// xr[e][c * 16 + i] = (0.125 / 147.8) (Hb (sign * x))[c * 16 + i], a sub-group of 16 lanes takes 16 tiles' inputs (lane l
+// tile c = 16 b + l, its H4 partners the lanes 4m..4m+3 as there).  GU: x [ent_tok[e]][N] by the gate / up signs, K = N;
+// else h [e][ld] by the down signs, K = the expert's ff (h's rows past it are left).  An entry's expert: the last group
+// whose start is at or before it.
+template <bool GU>
+sycl::event tq_rot(sycl::queue& q, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                   const int32_t* ent_idx, int64_t cap_entries, const float* xin, int64_t ldx, float* xr, int64_t N, int64_t K) {
+    const size_t subs = (size_t) ((K / 16 + 15) / 16);
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<2>({(size_t) cap_entries, subs * 16}, {1, 16}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id();
+            const int e = (int) it.get_group(0);
+            const int ng = *n_groups;
+            if (ng <= 0 || e < grp_start[0] || e >= grp_start[ng]) return;   // the whole sub-group
+            int lo = 0, hi = ng - 1;
+            while (lo < hi) { const int mid = (lo + hi + 1) / 2; if (grp_start[mid] <= e) lo = mid; else hi = mid - 1; }
+            const View v = view((const uint8_t*) grp_ptr[lo], N);
+            const int64_t Kk = GU ? N : v.ff, NC = Kk / 16;
+            const int64_t c = (int64_t) it.get_group(1) * 16 + lane;
+            if ((int64_t) it.get_group(1) * 16 >= NC) return;   // the whole sub-group
+            const bool live = c < NC;   // lanes 4m..4m+3 alike (widths are multiples of 64)
+            const int64_t cc = live ? c : 0;
+            const uint8_t* sgn = GU ? v.gu_sign : v.d_sign;
+            const uint32_t sb = (uint32_t) sgn[2 * cc] | ((uint32_t) sgn[2 * cc + 1] << 8);
+            const int64_t row = GU ? (int64_t) ent_idx[e] : (int64_t) e;
+            const float* xp = xin + (size_t) row * (size_t) ldx + cc * 16;
+            float xv[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) xv[i] = ((sb >> i) & 1) ? -xp[i] : xp[i];
+#pragma unroll
+            for (int hh = 1; hh < 16; hh <<= 1)
+#pragma unroll
+                for (int i = 0; i < 16; ++i)
+                    if (!(i & hh)) { const float a0 = xv[i], a1 = xv[i | hh]; xv[i] = a0 + a1; xv[i | hh] = a0 - a1; }
+#pragma unroll
+            for (int m = 1; m < 4; m <<= 1)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const float o = sycl::permute_group_by_xor(sg, xv[i], m);
+                    xv[i] = (lane & m) ? o - xv[i] : xv[i] + o;
+                }
+            if (!live) return;
+            float* xo = xr + (size_t) e * (size_t) (GU ? N : ldx) + c * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) xo[i] = xv[i] * (0.125f / 147.8f);
+        });
+    });
+}
+
 }  // namespace
+
+// STRATA_TQ_PREROT=0: the rotation in each band's work-group again (B70 11-22, DSpark spec 3: code / agent / ja
+// 55.9 / 52.7 / 42.1 -> 57.2 / 54.0 / 42.7 tok/s, the same text)
+bool tq_prerot_on() { static const bool on = [] { const char* v = std::getenv("STRATA_TQ_PREROT"); return !v || std::strtol(v, nullptr, 10) != 0; }(); return on; }
 
 // one entry an expert is the decode and nearly every small window (a window's tokens rarely share an expert); a big
 // window (the prompt) on the XMX engines (tq_xmx.cpp), else two entries at once (each code decoded once for both)
 sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                          const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
-                         float* up, int64_t N, int64_t FF) {
+                         float* up, int64_t N, int64_t FF, float* xr) {
     if (N % 64 != 0 || FF % 64 != 0) throw std::runtime_error("tq experts: widths must be multiples of 64");
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
+    if (xr != nullptr) {
+        tq_rot<true>(q, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, N, xr, N, N);
+        if (tq_pair_on()) return gemv<6, 2, true, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, xr, N, gate, up, N, FF);
+        return gemv<6, 1, true, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, xr, N, gate, up, N, FF);
+    }
     if (tq_pair_on()) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     return gemv<6, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
 }
 
 sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
-                           float* out, int64_t N, int64_t FF) {
+                           float* out, int64_t N, int64_t FF, float* hr) {
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
+    if (hr != nullptr) {
+        tq_rot<false>(q, grp_ptr, grp_start, n_groups, nullptr, cap_entries, h, FF, hr, N, FF);
+        if (tq_pair_on()) return gemv<3, 2, false, true>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hr, FF, out, nullptr, N, FF);
+        return gemv<3, 1, false, true>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hr, FF, out, nullptr, N, FF);
+    }
     if (tq_pair_on()) return gemv<3, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
     return gemv<3, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
 }

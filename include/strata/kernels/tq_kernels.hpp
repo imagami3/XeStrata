@@ -72,11 +72,15 @@ inline void tq_repack_band(const uint8_t* src, uint8_t* dst, int64_t nc) {
 /// Gate and up rows of every entry (x: FP32 rows by ent_tok, N each) into gate / up [entry][FF].
 sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                   const int32_t* n_groups, const int32_t* ent_tok, int64_t cap_entries, const float* x, float* gate,
-                  float* up, int64_t N, int64_t FF);
+                  float* up, int64_t N, int64_t FF, float* xr = nullptr);
 /// Down rows of every entry (h: [entry][FF], the GLU output) into out[ent_dst[entry]][N].
 sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
-                           float* out, int64_t N, int64_t FF);
+                           float* out, int64_t N, int64_t FF, float* hr = nullptr);
+/// b70-local (11-22): STRATA_TQ_PREROT (default on; 0 off) - the small windows' inputs rotated once an entry (xr: [entry][N] FP32 for
+/// gate / up, hr: [entry][FF] for down; the scratch's last part, native_expert_scratch_bytes with n_embd), else in each
+/// band's work-group.  The same sums to the bit.
+bool tq_prerot_on();
 
 /// Whether a window of `cap_entries` entries takes the XMX kernels (tq_xmx.cpp; STRATA_TQ_XMX: 0 off, else the
 /// entries it needs, default 64), as the device reports its matrix engines and local memory.

@@ -166,7 +166,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
 
         const size_t scratch = std::max<size_t>(
             (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-            strata::kernels::native_expert_scratch_bytes(CAP, FF));
+            strata::kernels::native_expert_scratch_bytes(CAP, FF, H));
         const size_t rows = (size_t) CAP * H * sizeof(float);
         stream_ = gpu::stream_create();
         read_stream_ = gpu::stream_create_copy();

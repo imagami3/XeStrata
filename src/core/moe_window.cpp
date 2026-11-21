@@ -123,7 +123,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         hit_xs_ = b.take<float>(T * (N / 32));
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), shape.n_embd, max_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), max_ff)));
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), max_ff, shape.n_embd)));
     };
     Bump count;
     carve(count);

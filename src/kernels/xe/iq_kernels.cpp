@@ -2514,9 +2514,10 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
-size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
+size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff, int64_t n_embd) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
-    return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
+    return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255) +
+           (n_embd > 0 ? (((size_t) cap * (size_t) n_embd * sizeof(float) + 255) & ~(size_t) 255) : 0);
 }
 
 // b70-local (ptq1_dpas.cpp): PTQ1_0 experts on DPAS, opt-in STRATA_PTQ1_DPAS=1
@@ -2860,7 +2861,13 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
     const bool use_xmx = D == 8 && mixed && !use_tq && rvq_xmx_on(cap_entries, N, FF);
     // b70-local: one token (the decode) by lookup tables of the layer's books against x (rvq_lut.cpp)
     const bool use_lut = D == 8 && !use_xmx && !use_tq && rvq_lut_on(q, cap_entries, N, FF, mixed, L.up_off, L.down_off, L.d_row);
-    if (use_tq) tq_expert_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
+    // b70-local (11-22, STRATA_TQ_PREROT=1): the trellis inputs rotated once an entry, into the scratch's last part (the
+    // callers size it with n_embd) and, for down, into gate (free once h is made)
+    float* tq_xr = use_tq && tq_prerot_on()
+        ? reinterpret_cast<float*>(static_cast<uint8_t*>(scratch) + 3 * fa +
+                                   (((size_t) cap_entries * (size_t) (FF / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255))
+        : nullptr;
+    if (use_tq) tq_expert_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF, tq_xr);
     else if (use_xmx) rvq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, gate, up, N, FF);
     else if (use_lut) rvq_lut_gu(q, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF, mixed, gu_row, L.up_off, tail, h);
     else
@@ -2913,7 +2920,8 @@ static void native_expert_grouped_rvq_d(const NativeExpertLayout& L, const unsig
         h[i] = (g / (1.0f + sycl::exp(-g))) * u;
     });
     if (use_tq) {
-        const sycl::event et = tq_expert_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
+        const sycl::event et = tq_expert_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF,
+                                              tq_xr != nullptr ? gate : nullptr);
         sync_if_needed(stream, et, "native_expert_grouped_rvq (trellis)");
         return;
     }
