@@ -5117,6 +5117,8 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
+                            if guard is not None:   # b70-local (11-21): the guard sees the end of the thinking too
+                                guard.follow(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
                             evs = cut(parser.feed(detok.push(t)))
                             self._note(n, evs, st, rate)
