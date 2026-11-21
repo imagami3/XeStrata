@@ -4229,6 +4229,10 @@ class Service:
         # thinking unless asked off, as the server counts it (encode_prompt): said to the template, since Unsloth's
         # Qwen3.5-9B template thinks only when enable_thinking is given true (the others think unless it is false)
         kwargs = {"enable_thinking": True, **kwargs}
+        if getattr(self.template, "inkling", False) and kwargs.get("enable_thinking") is False:
+            # b70-local (11-21): Inkling 2's template has no enable_thinking - its least thinking is "Thinking effort
+            # level: 0" (reasoning_effort "none"); a request for no thinking was rendered at the default 0.9
+            kwargs = {**kwargs, "reasoning_effort": "none"}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -4531,10 +4535,13 @@ class Service:
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when there)."""
             marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
-            effort = kwargs.get("reasoning_effort")
-            off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
-            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            given = kwargs
+            if getattr(self.template, "inkling", False) and given.get("enable_thinking") is False:
+                given = {**given, "reasoning_effort": "none"}     # b70-local: render_prompt's Inkling 2 rule
+            effort = given.get("reasoning_effort")
+            off = given.get("enable_thinking") is False         # render_prompt's rule for #458's effort_end
+            kw = ({k: v for k, v in given.items() if k not in ("reasoning_effort", "enable_thinking")}
+                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(given))
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)

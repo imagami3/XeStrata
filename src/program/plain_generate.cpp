@@ -32,6 +32,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <unordered_map>
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <iterator>
@@ -98,6 +100,21 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
         return {};   // an unreadable file has no stop ids to add; loading it reports why
     }
     return ids;
+}
+
+// b70-local (11-21): the tokens the penalties leave alone: the GGUF's control and unused tokens (types 3 and 5) and
+// the rows past its list (a padded vocabulary) - a penalty on a chat template's markers would bend the turn's form
+std::vector<uint8_t> penalty_exempt(const std::string& path, int64_t V) {
+    std::vector<uint8_t> ex((size_t) V, 1);
+    try {
+        const GgufModel m = GgufModel::open(path);
+        const MetaValue* v = m.meta().get("tokenizer.ggml.token_type");
+        if (v == nullptr || v->type != MetaType::ARRAY) return std::vector<uint8_t>((size_t) V, 0);
+        for (size_t i = 0; i < v->items.size() && i < (size_t) V; ++i) ex[i] = v->items[i].u == 3 || v->items[i].u == 5;
+    } catch (const std::exception&) {
+        return std::vector<uint8_t>((size_t) V, 0);
+    }
+    return ex;
 }
 
 // The processor's own graphics through Level Zero: with the Unified Runtime's second Level Zero adapter the UHD 770's
@@ -306,6 +323,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         bias_host = nullptr;
         bias_dev = nullptr;
     }
+    const std::vector<uint8_t> pen_exempt = penalty_exempt(opt.gguf, V);
     std::printf("INFO %scontext=%lld expert_slots=%lld\n", bias_dev != nullptr ? "logit_bias=1 " : "", (long long) ctx,
                 (long long) model.slots());
     std::printf("READY %lld stop\n", (long long) ctx);
@@ -377,6 +395,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         sp.temperature = 0.0f;
         sp.top_p = 1.0f;
         std::string bias_text, bias_err;   // b70-local: logit_bias=id:value,...
+        float pen_present = 0.0f, pen_freq = 0.0f;   // b70-local (11-21): penalty_present / penalty_freq
+        int64_t pen_last_n = 64;
         for (;;) {   // the sampling keys between max_new and the ids; the ids start at the first token without '='
             while (endp != nullptr && *endp == ' ') ++endp;
             const char* start = endp;
@@ -392,6 +412,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
             else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
             else if (key == "logit_bias") bias_text = val;
+            else if (key == "penalty_present") pen_present = std::strtof(val.c_str(), nullptr);
+            else if (key == "penalty_freq") pen_freq = std::strtof(val.c_str(), nullptr);
+            else if (key == "penalty_last_n") pen_last_n = std::max(1LL, std::strtoll(val.c_str(), nullptr, 10));
             else if (key == "img_keys")
                 for (const char* q = val.c_str(); *q != '\0';) {
                     char* e2 = nullptr;
@@ -436,6 +459,36 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::printf("ERR a token id is outside the vocabulary\n");
             std::fflush(stdout);
             continue;
+        }
+        // b70-local (11-21): OpenAI's presence and frequency penalties over the reply's last penalty_last_n tokens
+        // (not the prompt's, as OpenAI counts; the control tokens exempt, penalty_exempt), as biases in the host-mapped array the sampler reads; each
+        // token taken updates its own and the one leaving the window.  The drafts' windows are off with them: a
+        // window's rows would all see the biases of its start.  penalty_repeat (a factor on the logit) is not taken.
+        const bool pen_on = bias_dev != nullptr && (pen_present != 0.0f || pen_freq != 0.0f);
+        std::vector<float> pen_base;
+        std::deque<int32_t> pen_win;
+        std::unordered_map<int32_t, int> pen_cnt;
+        auto pen_set = [&](int32_t t) {
+            const auto it = pen_cnt.find(t);
+            const int c = it == pen_cnt.end() ? 0 : it->second;
+            bias_host[t] = pen_base[(size_t) t] - (c > 0 ? pen_present : 0.0f) - (float) c * pen_freq;
+        };
+        auto pen_push = [&](int32_t t) {
+            if (t < 0 || t >= V || pen_exempt[(size_t) t]) return;
+            pen_win.push_back(t);
+            ++pen_cnt[t];
+            pen_set(t);
+            if ((int64_t) pen_win.size() > pen_last_n) {
+                const int32_t o = pen_win.front();
+                pen_win.pop_front();
+                if (--pen_cnt[o] == 0) pen_cnt.erase(o);
+                pen_set(o);
+            }
+        };
+        if (pen_on) {
+            if (sp.logit_bias == nullptr) std::memset(bias_host, 0, (size_t) V * 4);
+            pen_base.assign(bias_host, bias_host + V);
+            sp.logit_bias = (const float*) bias_dev;
         }
         // b70-local: the pictures' rows; `feed` is what the model reads, `ids` from here on what the conversation
         // cache compares: each image token becomes a negative id from its picture's key and its place in it, so a
@@ -653,7 +706,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // when the sampler picks it there and the text is the serial loop's (no penalties here: the history is not
         // part of the draw)
         static const bool spec_sampled = [] { const char* e = std::getenv("STRATA_PLAIN_SPEC_SAMPLED"); return e == nullptr || e[0] != '0'; }();
-        const bool spec = model.drafts() > 0 && (sp.greedy || spec_sampled);
+        const bool spec = model.drafts() > 0 && (sp.greedy || spec_sampled) && !pen_on;
         if (spec) model.set_context(live.data(), (int64_t) live.size());   // b70-local: lookup drafts' context
         if (spec && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
         std::vector<int32_t> pend;
@@ -664,6 +717,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             ++produced;
             if (std::find(eos.begin(), eos.end(), next) != eos.end()) { finish = "stop"; break; }
             if (produced >= max_new) break;
+            if (pen_on) pen_push(next);
             if (at < pend.size()) {   // the window read this one already
                 live.push_back(next);
                 next = pend[at++];
