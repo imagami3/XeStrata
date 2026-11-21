@@ -172,6 +172,43 @@ ANSWER_RESERVE_MIN = 512
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# b70-local (11-21): Inkling 2's thinking is a message, <|content_thinking|>...<|end_message|>: </think> is plain text to it,
+# so the budget's wrap-up and the loop guard's close did not close it.  Inkling's thinking loops paraphrase ("is X right?
+# no, X ... actually X"), which the exact-period guard and the 2,000-word coverage check miss: GB10's rule - a K-char
+# string N times or more in the last W chars of the thinking - closes it, and the reopening <|content_thinking|> is
+# banned for the rest of the reply (else the model opens a new thinking at once, as GB10 saw in llama-server).
+# STRATA_INK_THINK_LOOP=K,N,W[;K,N,W...] (default 20,7,400;48,4,2400; 0 = off).  The second rule is for loops whose
+# cycle is longer than 400 / 7 chars (a regex rewritten again and again, GB10's agent-70 implement-3): on 6 known loops
+# and 362 thoughts of GB10's quantized model (T 0.6) the two rules hit all 6 loops (at 320-480 chars, the long one at
+# 3,240) and 10 of the 362 thoughts, every one of them a real loop ("Mount Blanc? / Mount Blanc? ..."); a 60,3,1500
+# rule also stopped a final summary that restated its answer, so it is not used.
+INK_THINK_OPEN, INK_THINK_CLOSE = "<|content_thinking|>", "<|end_message|>"
+_ink_loop_env = os.environ.get("STRATA_INK_THINK_LOOP", "20,7,400;48,4,2400").strip()
+INK_THINK_LOOP = None if _ink_loop_env in ("", "0") else [tuple(int(x) for x in r.split(",")) for r in _ink_loop_env.split(";") if r.strip()]
+INK_LOOP_CHECK_EVERY = 16       # output tokens between two looks at the tail of the thinking
+
+
+def ink_think_loop(text, rules):
+    """GB10's receiver rule, one or more (k, n, w): some k-char string occurs n times or more in the last w chars."""
+    for k, n, w in rules:
+        t = text[-w:]
+        if len(t) < k * n:
+            continue
+        seen = set()
+        for i in range(len(t) - k + 1):
+            sub = t[i:i + k]
+            if sub not in seen:
+                seen.add(sub)
+                if t.count(sub) >= n:
+                    return True
+    return False
+
+
+def ink_ban_thinking(sampling, tid):
+    """The sampling with Inkling's <|content_thinking|> banned (logit_bias -100), the request's own biases kept."""
+    lb = dict(bias_api.normalize((sampling or {}).get("logit_bias"), None))
+    lb[int(tid)] = -100.0
+    return {**(sampling or {}), "logit_bias": lb}
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -4699,6 +4736,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        ink_closed, next_ink_check = False, INK_LOOP_CHECK_EVERY   # b70-local (11-21): Inkling's thinking loop closed
         raw_ids: list = []                              # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -4803,6 +4841,7 @@ class Service:
                         stream = loop_guard.HeldStream(guard, gen, self.stop_ids, n) if guard is not None else None
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        ink_close = False               # b70-local: Inkling's thinking loops (INK_THINK_LOOP)
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -4842,7 +4881,7 @@ class Service:
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                    if (self.reasoning_loop_recovery or (inkling and INK_THINK_LOOP)) and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
@@ -4870,6 +4909,12 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                if (inkling and INK_THINK_LOOP and not ink_closed and parser.state == "reasoning"
+                                        and n >= next_ink_check and not parser.buf and not detok.pending()):
+                                    next_ink_check = n + INK_LOOP_CHECK_EVERY
+                                    if ink_think_loop(reasoning_text, INK_THINK_LOOP):
+                                        ink_close = True    # b70-local: closed after the pass, the reopening banned
+                                        break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -4951,7 +4996,10 @@ class Service:
                             if act.kind == loop_guard.CLOSE_THINKING and not closing:
                                 act = act._replace(kind=loop_guard.PENALTY)
                             if closing:
-                                extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                                extra = self.tok.encode(INK_THINK_CLOSE if inkling else REASONING_CLOSE, parse_special=True)
+                                if inkling:   # b70-local (11-21): Inkling's end of the thinking, the reopening banned
+                                    ink_closed = True
+                                    sampling = ink_ban_thinking(sampling, self.tok.encode(INK_THINK_OPEN, parse_special=True)[0])
                                 if max_new - n - len(extra) < 1:
                                     extra = []
                                 for t in extra:
@@ -5026,14 +5074,26 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not (wrap or opens or ink_close) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
-                        if wrap:
+                        if inkling and (wrap or ink_close):
+                            # b70-local (11-21): Inkling's own end of the thinking message, the reopening banned
+                            if wrap:
+                                budget = st["thinking_budget"] = None
+                            text = INK_THINK_CLOSE + (force or "")
+                            ink_closed = True
+                            sampling = ink_ban_thinking(sampling, self.tok.encode(INK_THINK_OPEN, parse_special=True)[0])
+                            if ink_close:
+                                print(f"[strata] Inkling thinking loop at {len(reasoning_text)} chars ({n} tokens): "
+                                      "closing the thinking (STRATA_INK_THINK_LOOP)", flush=True)
+                                with self.status_lock:
+                                    self.loop_guard_counts["thinking_closed"] += 1
+                        elif wrap:
                             budget = st["thinking_budget"] = None
                             text = REASONING_WRAP_UP + (force or "")
                         else:

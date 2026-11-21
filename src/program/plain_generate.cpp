@@ -14,6 +14,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/logit_bias.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
@@ -296,7 +297,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     }
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
-    std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
+    // b70-local (11-21): request token biases (logit_bias=id:value,..., -100 bans), as generate.cpp's: the serve layer
+    // bans Inkling's <|content_thinking|> after it closes a looping thought.  One host-mapped [V] array, read by the
+    // sampling kernel of whichever GPU runs the head (a device allocation would live on one GPU only).
+    float* bias_host = nullptr;
+    void* bias_dev = nullptr;
+    if (!strata::gpu::alloc_host((void**) &bias_host, (size_t) V * 4) || !strata::gpu::device_pointer(&bias_dev, bias_host)) {
+        bias_host = nullptr;
+        bias_dev = nullptr;
+    }
+    std::printf("INFO %scontext=%lld expert_slots=%lld\n", bias_dev != nullptr ? "logit_bias=1 " : "", (long long) ctx,
+                (long long) model.slots());
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
     std::string line;
@@ -365,6 +376,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         sp.greedy = true;
         sp.temperature = 0.0f;
         sp.top_p = 1.0f;
+        std::string bias_text, bias_err;   // b70-local: logit_bias=id:value,...
         for (;;) {   // the sampling keys between max_new and the ids; the ids start at the first token without '='
             while (endp != nullptr && *endp == ' ') ++endp;
             const char* start = endp;
@@ -379,6 +391,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (key == "top_k") sp.top_k = (int) std::strtol(val.c_str(), nullptr, 10);
             else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
             else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
+            else if (key == "logit_bias") bias_text = val;
             else if (key == "img_keys")
                 for (const char* q = val.c_str(); *q != '\0';) {
                     char* e2 = nullptr;
@@ -395,6 +408,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             emb_path.assign(start, (size_t) (endp - start));
         }
         sp.greedy = sp.temperature <= 0.0f;
+        sp.logit_bias = nullptr;
+        if (!bias_text.empty()) {
+            std::vector<float> bias;
+            if (bias_dev == nullptr || !strata::core::parse_logit_bias(bias_text, (int) V, bias, bias_err)) {
+                std::printf("ERR logit_bias: %s\n", bias_dev == nullptr ? "no host-mapped memory for the biases" : bias_err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            std::memcpy(bias_host, bias.data(), (size_t) V * 4);
+            sp.logit_bias = (const float*) bias_dev;
+        }
         std::vector<int32_t> ids;
         if (max_new < 1 || endp == nullptr || !parse_ids(endp, ids) || ids.empty()) {
             std::printf("ERR bad request: max_new or the ids\n");
