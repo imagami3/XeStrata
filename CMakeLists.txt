@@ -315,6 +315,10 @@ if(STRATA_ENABLE_XE)
       if(arch STREQUAL _strata_cuda_generic)          # no SYCL name for it (sm_120): the generic NVIDIA target
         list(APPEND _strata_sycl_targets nvptx64-nvidia-cuda)
         set(_strata_generic_opts -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${arch})
+        # the generic target defines no __SYCL_CUDA_ARCH__: pass the architecture (sm_121 -> 1210, as __SYCL_CUDA_ARCH__
+        # counts) so STRATA_NV_ARCH's paths (dp4a, int8 / BF16 tensor cores) are built as for a named target
+        string(REGEX REPLACE "^sm_([0-9]+)[a-z]?$" "\\10" _strata_nv_arch_num "${arch}")
+        add_compile_definitions(STRATA_NV_ARCH_GENERIC=${_strata_nv_arch_num})
       else()
         list(APPEND _strata_sycl_targets nvidia_gpu_${arch})
       endif()

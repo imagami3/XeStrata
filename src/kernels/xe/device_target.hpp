@@ -19,6 +19,8 @@
 // body there: the device does not report that combination, so the kernel is never launched on it.
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__)
 #define STRATA_NV_ARCH __SYCL_CUDA_ARCH__
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(STRATA_NV_ARCH_GENERIC)
+#define STRATA_NV_ARCH STRATA_NV_ARCH_GENERIC   // the generic NVIDIA target (no SYCL name for the arch): CMake passes it
 #else
 #define STRATA_NV_ARCH 0
 #endif
