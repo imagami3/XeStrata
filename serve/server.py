@@ -4716,8 +4716,12 @@ class Service:
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
+        shown = [False]                                 # b70-local (11-22): some content or a call went out
+
         def cut(evs):
             """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
+            if not shown[0] and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                shown[0] = True
             if stops is None:
                 return evs
             out = []
@@ -5130,9 +5134,14 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
-                    elif guard_stopped and not answered:
+                    elif guard_stopped and not answered and not shown[0]:
                         # the guard ended an answer that has no text yet: it says so instead of ending empty
                         for ev in cut([Event("content", LOOP_STOP_NOTE)]):
+                            yield "event", ev
+                    elif guard_stopped and parser.state not in ("call", "rcall"):
+                        # b70-local (11-22): an answer cut in its text says so after it (it ended silently, a page
+                        # or a picture just stopping mid-way); not inside a call, whose arguments it would break
+                        for ev in cut([Event("content", "\n\n" + LOOP_STOP_NOTE)]):
                             yield "event", ev
                     elif looped:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
