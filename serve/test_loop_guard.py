@@ -112,6 +112,28 @@ class Policy(unittest.TestCase):
         g.rewind(tok.encode("still planning"))                   # what was kept: back in the thinking
         self.assertTrue(g.in_think)
 
+    def test_inkling_thinking_markers(self):
+        # b70-local (11-21): Inkling 2's thinking is <|content_thinking|> ... <|end_message|>
+        tok = ByteTokenizer()
+        g = LG.LoopGuard(in_think=False, pieces=lambda: Detokenizer(tok).push)
+        for t in tok.encode("<|message_model|><|content_thinking|>plan"):
+            g.push(t)
+        self.assertTrue(g.in_think)
+        for t in tok.encode(" done<|end_message|><|message_model|><|content_text|>answer"):
+            g.push(t)
+        self.assertFalse(g.in_think)
+
+    def test_stop_any_bounds_the_penalties(self):
+        # b70-local (11-21): a thinking the server cannot close, falling back into its loop every time: ended at
+        # STOP_ANY loops in all instead of penalised for ever
+        g = LG.LoopGuard(in_think=True, can_close=False)
+        kinds = []
+        for _ in range(LG.STOP_ANY):
+            a = self.fire(g, self.loop * 2)
+            kinds.append(a.kind)
+            g.resume([], a)
+        self.assertEqual(kinds, [LG.PENALTY] * (LG.STOP_ANY - 1) + [LG.STOP])
+
     def test_never_inside_a_tool_call(self):
         tok = ByteTokenizer()
         call = '<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.py\n</parameter>\n</function>\n</tool_call>\n'

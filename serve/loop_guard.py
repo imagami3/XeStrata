@@ -53,6 +53,8 @@ MIN_SPAN_THINK = 192
 HOLD_MAX = 64
 THINK_PENALTIES = 2     # loops in the thinking broken by the penalty before the guard closes the thinking
 STOP_AFTER = 4          # loops in all after which the answer ends (in the answer; the thinking is closed first)
+STOP_ANY = 8            # b70-local (11-21): loops in all after which the request ends wherever it is (a model that
+                        # falls back into the same loop after every penalty, as Inkling 2 did, went on for an hour)
 LOOP_PENALTY = 1.15     # the temporary repetition penalty after a loop
 PENALTY_MIN_N = 128     # its window (penalty_last_n): 2 x the period, at least this
 PENALTY_EXTRA = 128     # it applies to the next 2 x period + this many tokens, then the request's own sampling again
@@ -157,8 +159,10 @@ def penalty_window(period: int) -> int:
 
 # the thinking's edges in the text: Qwen's and GLM's <think> ... </think>, Harmony's analysis channel (its final and
 # commentary channels are the answer and the calls)
-_THINK_OPEN = re.compile(r"<think>|<\|channel\|>analysis")
-_THINK_CLOSE = re.compile(r"</think>|<\|channel\|>(?:final|commentary)")
+# b70-local (11-21): Inkling 2's thinking is a message of its own, <|content_thinking|> ... <|end_message|>; without
+# them the guard took Inkling's whole answer for thinking, so an answer's loop was never ended (a 50-minute request)
+_THINK_OPEN = re.compile(r"<think>|<\|channel\|>analysis|<\|content_thinking\|>")
+_THINK_CLOSE = re.compile(r"</think>|<\|channel\|>(?:final|commentary)|<\|end_message\|>")
 _TAIL = 48              # the text kept to find a marker split across tokens
 
 
@@ -215,7 +219,9 @@ class LoopGuard:
             return None
         where = "thinking" if self.in_think else "answer"
         self.hits[where] += 1
-        if where == "thinking":                 # (never STOP while it thinks: that ends with no answer at all)
+        if sum(self.hits.values()) >= STOP_ANY:
+            kind = STOP
+        elif where == "thinking":               # (never STOP while it thinks: that ends with no answer at all)
             kind = PENALTY if self.hits[where] <= THINK_PENALTIES or not self.can_close else CLOSE_THINKING
         else:
             kind = PENALTY if self.hits[where] == 1 and sum(self.hits.values()) < STOP_AFTER else STOP

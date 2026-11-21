@@ -4707,7 +4707,9 @@ class Service:
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
         # tail that could still be a loop's repeats.  Harmony's thinking is not closed by the server (its closing
         # text is Qwen's), so there a loop in the thinking only gets the penalty.
-        guard = loop_guard.ToolSafeGuard(parser.state == "reasoning", pieces=self._guard_pieces,
+        # b70-local (11-21): Inkling 2 thinks only after its <|content_thinking|> (the guard follows it in the text):
+        # at the start it may answer at once (reasoning_effort "none"), which is no thinking
+        guard = loop_guard.ToolSafeGuard(parser.state == "reasoning" and not inkling, pieces=self._guard_pieces,
                                          can_close=not harmony) if self._loop_guard_on(sampling) else None
         guard_stopped = False                           # the guard ended the answer (a loop that came back)
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
