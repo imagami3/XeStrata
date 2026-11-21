@@ -63,6 +63,11 @@ inline View view(const uint8_t* blob, int64_t N) {
 // the H4 exchanges (xor 1, 2) stay in a slice, the row sums are a 16-lane butterfly, and every slice of a sub-group runs
 // the same number of block steps (a step past its share reads block 0 and adds nothing), so the shuffles stay converged.
 #if defined(STRATA_GB10_SG32)
+inline float tq_u2f_gb10(uint32_t b) { return tq_u2f(b); }   // exact for b < 2^23 (a byte sum is at most 1020)
+#else
+inline float tq_u2f_gb10(uint32_t b) { return (float) b; }
+#endif
+#if defined(STRATA_GB10_SG32)
 constexpr int kTqSg = 32;
 #else
 constexpr int kTqSg = 16;
@@ -161,7 +166,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                         auto tw = [&](int k) -> uint32_t { return k < 32 ? ((d[k >> 1] >> (16 * (k & 1))) & 0xFFFFu) : d16; };
                         uint32_t s = tw(0);
                         {
-                            const float w = (float) tq_bsum(s * 34038481u + 76625530u);
+                            const float w = tq_u2f_gb10(tq_bsum(s * 34038481u + 76625530u));
 #pragma unroll
                             for (int j = 0; j < EP; ++j) acc[j][0] += w * xv[j][0];
                         }
@@ -173,7 +178,7 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                                 const int t = wd * 8 + u;
                                 if (t > 255) break;
                                 const uint32_t z = tq_bits(U, 2 * u, 14);
-                                const float w = (float) tq_bsum(z * 34038481u + 76625530u);
+                                const float w = tq_u2f_gb10(tq_bsum(z * 34038481u + 76625530u));
 #pragma unroll
                                 for (int j = 0; j < EP; ++j) acc[j][t >> 4] += w * xv[j][t & 15];
                             }
@@ -223,6 +228,8 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
 
 #if defined(STRATA_GB10_SG32)
 int tq_epm() { static const int v = [] { const char* e = std::getenv("STRATA_TQ_EPM"); return e ? std::atoi(e) : 2; }(); return v; }
+int tq_sgu() { static const int v = [] { const char* e = std::getenv("STRATA_TQ_SGU"); return e ? std::atoi(e) : 6; }(); return v; }
+int tq_sgd() { static const int v = [] { const char* e = std::getenv("STRATA_TQ_SGD"); return e ? std::atoi(e) : 4; }(); return v; }
 #endif
 // STRATA_TQ_PAIR=0: every entry its own pass (else two entries of an expert share a pass, a single one has its own)
 bool tq_pair_on() { static const bool on = [] { const char* v = std::getenv("STRATA_TQ_PAIR"); return !v || std::strtol(v, nullptr, 10) != 0; }(); return on; }
@@ -240,6 +247,15 @@ sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* gr
     // GB10 port: STRATA_TQ_EPM=4 - up to 4 entries of an expert share a pass (a speculative window's 3 tokens: one decode
     // of the codes instead of a pair and a single)
     if (tq_epm() >= 4) return gemv<6, 4, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+    // STRATA_TQ_SGU: the 16-lane slices a work-group for gate / up (default 6; 2, 4, 8, 12, 16: whole sub-groups of 32)
+    switch (tq_sgu()) {
+        case 2: return gemv<2, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+        case 4: return gemv<4, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+        case 8: return gemv<8, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+        case 12: return gemv<12, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+        case 16: return gemv<16, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+        default: break;
+    }
 #endif
     if (tq_pair_on()) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     return gemv<6, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
@@ -256,6 +272,13 @@ sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* 
 #endif
 #if defined(STRATA_GB10_SG32)
     if (tq_epm() >= 4) return gemv<SD, 4, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+    switch (tq_sgd()) {   // STRATA_TQ_SGD: the slices a work-group for down (default 4; 2, 8, 12, 16)
+        case 2: return gemv<2, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+        case 8: return gemv<8, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+        case 12: return gemv<12, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+        case 16: return gemv<16, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+        default: break;
+    }
 #endif
     if (tq_pair_on()) return gemv<SD, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
     return gemv<SD, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);

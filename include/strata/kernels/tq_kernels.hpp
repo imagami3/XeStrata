@@ -22,6 +22,11 @@ namespace strata::kernels {
 inline uint32_t tq_bsum(uint32_t v) {
 #if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
     return __spirv_UDotKHR(v, 0x01010101u, 0);
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    // NVIDIA (sm_61 and later): one dp4a, not four byte extracts and three adds (the decode's integer pipe)
+    uint32_t r;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(v), "r"(0x01010101u), "r"(0u));
+    return r;
 #else
     return (v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24);
 #endif
@@ -32,6 +37,10 @@ inline uint32_t tq_bsum(uint32_t v) {
 inline int32_t tq_bsum510(uint32_t v) {
 #if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
     return __spirv_SUDotAccSatKHR(0x01010101, v, -510, 0);
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    int32_t r;   // NVIDIA: one dp4a with its accumulator (bytes unsigned, the multiplier's signed 1s)
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(v), "r"(0x01010101), "r"(-510));
+    return r;
 #else
     return (int32_t) ((v & 255u) + ((v >> 8) & 255u) + ((v >> 16) & 255u) + (v >> 24)) - 510;
 #endif
@@ -45,6 +54,12 @@ inline uint32_t tq_bits(uint32_t v, uint32_t off, uint32_t n) {
 #else
     return (v >> off) & ((1u << n) - 1u);
 #endif
+}
+
+/// (float) b for 0 <= b < 2^23 without an integer-to-float conversion (a quarter-rate instruction on NVIDIA): the bits
+/// of 2^23 + b, less 2^23 (exact)
+inline float tq_u2f(uint32_t b) {
+    return sycl::bit_cast<float>(0x4B000000u | b) - 8388608.0f;
 }
 
 inline constexpr int64_t kTqTileBytes = 66;            ///< a 16x16 tile: 2 bytes of start state, 255 2-bit symbols
