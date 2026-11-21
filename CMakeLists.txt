@@ -1146,6 +1146,15 @@ if(STRATA_BUILD_TESTS)
   set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
 endif()
 
+# GB10 local feasibility port: aarch64 host - x86 intrinsics through SIMDe, no CPUID, no -m<x86 feature> flags
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(STRATA_A64 ON)
+  set_source_files_properties(src/kernels/xe/tq_kernels.cpp src/kernels/xe/inkling2_attn_xmx.cpp src/kernels/xe/mma_gemm.cpp PROPERTIES COMPILE_DEFINITIONS STRATA_GB10_SG32=1)   # NVIDIA sub-groups are 32 wide
+  # the x86 header stand-ins (a64compat/, beside the source tree) and SIMDe (simd-everywhere, MIT): LOCAL.md says where
+  set(STRATA_A64_COMPAT_DIR "${CMAKE_SOURCE_DIR}/a64compat" CACHE PATH "GB10 port: x86 header stand-ins")
+  set(STRATA_SIMDE_DIR "${CMAKE_SOURCE_DIR}/../simde" CACHE PATH "GB10 port: SIMDe")
+  include_directories(BEFORE ${STRATA_A64_COMPAT_DIR} ${STRATA_SIMDE_DIR})
+endif()
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp
             src/kernels/cpu/kq_avx2.cpp)
@@ -1380,4 +1389,32 @@ endif()
 
 if(STRATA_PACKAGE)
   include(cmake/packaging.cmake)
+endif()
+
+if(STRATA_A64)
+  get_property(_a64_srcs DIRECTORY PROPERTY SOURCES)
+  foreach(_f src/kernels/cpu/expert.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/tq_avx2.cpp
+             src/kernels/cpu/tq_avx512.cpp src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
+             src/kernels/cpu/canon_expert.cpp)
+    set_source_files_properties(${_f} PROPERTIES COMPILE_OPTIONS "")
+  endforeach()
+endif()
+
+# GB10 port: the Intel-only DPAS / joint_matrix kernel files are replaced by stand-ins
+if(STRATA_A64)
+  foreach(_t IN ITEMS strata_kernels_xe strata_xe strata_kernels)
+    if(TARGET ${_t})
+      get_target_property(_srcs ${_t} SOURCES)
+      if(_srcs MATCHES "q8_dpas")
+        list(REMOVE_ITEM _srcs src/kernels/xe/q8_dpas.cpp src/kernels/xe/ptq1_dpas.cpp src/kernels/xe/rvq_xmx.cpp src/kernels/xe/q6k_xmx.cpp src/kernels/xe/tq_xmx.cpp)
+        list(APPEND _srcs src/kernels/xe/a64_intel_stubs.cpp src/kernels/xe/a64_rvq_mma.cpp src/kernels/xe/a64_tq_mma.cpp src/kernels/xe/a64_ink_attn.cpp)
+        set_property(TARGET ${_t} PROPERTY SOURCES ${_srcs})
+        message(STATUS "GB10 port: Intel-only kernels replaced by stand-ins in ${_t}")
+      endif()
+    endif()
+  endforeach()
+endif()
+
+if(STRATA_A64 AND NOT STRATA_NATIVE_EXPERTS)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/a64_native_stubs.cpp)
 endif()

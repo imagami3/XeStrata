@@ -30,6 +30,7 @@
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else
+#include <immintrin.h>   // GB10 port: the aarch64 stand-in (a64compat) for _mm_sfence
 #define STRATA_SPIN_PAUSE() ((void) 0)
 #endif
 

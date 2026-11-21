@@ -176,13 +176,37 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
                             std::string& err) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
-    if (t == nullptr || (t->type != kF32 && t->type != kBF16) || t->elements() != elements || !m.in_bounds(*t, at)) {
-        err = "plain model: " + name + " is missing, not F32 or BF16 or not " + std::to_string(elements) + " values";
+    // GB10 port: F16 too (GB10's GGUFs keep attn_r / sinks / the router in F16; ggml type 1), widened on the host
+    if (t == nullptr || (t->type != kF32 && t->type != kBF16 && t->type != 1) || t->elements() != elements ||
+        !m.in_bounds(*t, at)) {
+        err = "plain model: " + name + " is missing, not F32, BF16 or F16 or not " + std::to_string(elements) + " values";
         return false;
     }
     const void* src = m.shard(at).tensor_data(*t);
     std::vector<float> wide;
-    if (t->type == kBF16) {
+    if (t->type == 1) {
+        wide.resize(elements);
+        const auto* h = static_cast<const uint16_t*>(src);
+        for (uint64_t i = 0; i < elements; ++i) {
+            const uint32_t x = h[i], sign = (x & 0x8000u) << 16, ex = (x >> 10) & 0x1f, man = x & 0x3ff;
+            uint32_t u;
+            if (ex == 0) {
+                if (man == 0) {
+                    u = sign;
+                } else {   // subnormal
+                    float f = (float) man * (1.0f / 16777216.0f);
+                    std::memcpy(&u, &f, 4);
+                    u |= sign;
+                }
+            } else if (ex == 31) {
+                u = sign | 0x7f800000u | (man << 13);
+            } else {
+                u = sign | ((ex + 112) << 23) | (man << 13);
+            }
+            std::memcpy(&wide[i], &u, 4);
+        }
+        src = wide.data();
+    } else if (t->type == kBF16) {
         wide.resize(elements);
         const auto* h = static_cast<const uint16_t*>(src);
         for (uint64_t i = 0; i < elements; ++i) {
@@ -273,7 +297,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         }
     }
     // b70-local: Inkling 2 with every expert resident takes windows up to 512 (its prompt; checked in open_experts)
-    if (opt_.max_t < 1 || opt_.max_t > 512 || opt_.max_cells < 16) {
+    if (opt_.max_t < 1 || opt_.max_t > 2048 || opt_.max_cells < 16) {   // GB10 port: 2048 (was 512)
         err = "plain model: the window or the context is out of range";
         return false;
     }
@@ -2309,10 +2333,13 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         std::fflush(df);
     }
     if (logits != nullptr && T > k::cpu::MAXT) {   // b70-local: a big window (Inkling's prompt) has its last row's only
-        err = "plain model: a window past " + std::to_string(k::cpu::MAXT) + " tokens has no logits to read";
-        return false;
-    }
-    if (logits != nullptr && !strata::gpu::copy(logits, t.logits_, (size_t) T * (size_t) n_vocab_ * 4)) {
+        // GB10 port (B70's suggestion, 11-21): that row goes to the caller's last row (the first token after the
+        // prompt: --dump-logits compares prefill kernels); the other rows are not written
+        if (!strata::gpu::copy(logits + (size_t) (T - 1) * (size_t) n_vocab_, t.logits_, (size_t) n_vocab_ * 4)) {
+            err = "plain model: reading the logits failed";
+            return false;
+        }
+    } else if (logits != nullptr && !strata::gpu::copy(logits, t.logits_, (size_t) T * (size_t) n_vocab_ * 4)) {
         err = "plain model: reading the logits failed";
         return false;
     }

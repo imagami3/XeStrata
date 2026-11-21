@@ -544,6 +544,17 @@ float* k_scratch(sycl::queue& q, size_t floats) {
     std::lock_guard<std::mutex> lock(mu);
     Scratch& s = per_device[q.get_device()];
     if (floats > s.cap) {
+#if defined(STRATA_GB10_SG32)
+        // GB10 port: the first products can come while a window is recorded into a command graph, where a wait is
+        // refused: the first buffer is made without one (nothing can read it yet), and large enough (64M floats) that
+        // it does not have to grow
+        if (s.buf == nullptr) {
+            const size_t n = std::max<size_t>(floats, (size_t) 64 << 20);
+            s.buf = sycl::malloc_device<float>(n, q);
+            s.cap = s.buf != nullptr ? n : 0;
+            return s.buf;
+        }
+#endif
         q.wait();   // the products queued before may still read the old one
         if (s.buf != nullptr) sycl::free(s.buf, q);
         s.buf = sycl::malloc_device<float>(floats, q);

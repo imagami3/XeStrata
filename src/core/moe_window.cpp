@@ -63,7 +63,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
         shape.max_t < 1 || (!shape.big && (shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT)) ||
-        shape.max_t > 512 ||
+        shape.max_t > 2048 ||   // GB10 port: 2048 (was 512)
         (shape.groups != 1 && shape.groups != 2)) {
         err = "moe window: the shape is out of range";
         return false;

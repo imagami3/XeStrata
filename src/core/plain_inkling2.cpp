@@ -450,7 +450,8 @@ void PlainModel::gproj_win(const W& w, const float* x, float* y, int TT, bool qu
         // matrix engines (xmx_gemm), not decoded again for every 8 rows (STRATA_INK_W16_MIN rows, default 32)
         static const int w16_min = [] { const char* v = std::getenv("STRATA_INK_W16_MIN"); return v ? std::atoi(v) : 32; }();
         if (i_xh_ != nullptr && i_w16_ != nullptr && TT >= w16_min && w.type == k::kNativeQ6KRows && w.n_in % 256 == 0 &&
-            w.n_out % 16 == 0 && k::xmx_available(k::XmxType::f16)) {
+            w.n_out % 16 == 0 && (k::xmx_available(k::XmxType::f16) || std::strcmp(k::gemm_path(k::XmxType::f16), "joint_matrix") == 0)) {
+            // GB10 port: a device whose products go through joint_matrix (NVIDIA's tensor cores, mma_gemm) takes it too
             const int64_t rows = std::min<int64_t>(w.n_out, i_w16_elems_ / w.n_in / 16 * 16);
             if (rows > 0 && k::xmx_gemm_ok(i_xh_, i_w16_, y, rows, w.n_in, w.n_out)) {
                 k::native_f32_to_f16_rows(x, i_xh_, (int) w.n_in, TT, c);

@@ -59,6 +59,14 @@ inline View view(const uint8_t* blob, int64_t N) {
 // block (a block = 4 tiles = 4 neighbouring lanes, blocks of tiles start at multiples of 16), so a lane does H16 on its 16
 // values and the 4 lanes H4 by two exchanges.  GU: bands [0, ff/16) gate, [ff/16, 2 ff/16) up, input x [ent_tok[e]][N],
 // output gate / up [e][FF]; else down: N/16 bands, input h [e][FF], output out[ent_dst[e]][N].
+// GB10 port (STRATA_GB10_SG32, NVIDIA: sub-groups of 32 only): a sub-group of 32 lanes holds two of the 16-lane slices;
+// the H4 exchanges (xor 1, 2) stay in a slice, the row sums are a 16-lane butterfly, and every slice of a sub-group runs
+// the same number of block steps (a step past its share reads block 0 and adds nothing), so the shuffles stay converged.
+#if defined(STRATA_GB10_SG32)
+constexpr int kTqSg = 32;
+#else
+constexpr int kTqSg = 16;
+#endif
 template <int S, int EPM, bool GU>
 sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_idx, const float* xin, int64_t ldx, float* o0, float* o1,
@@ -67,9 +75,13 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> red(S * EPM * 16, h);
         h.parallel_for(sycl::nd_range<2>({cg, (size_t) bands * S * 16}, {1, (size_t) S * 16}),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kTqSg)]] {
             const sycl::sub_group sg = it.get_sub_group();
+#if defined(STRATA_GB10_SG32)
+            const int lid = (int) it.get_local_id(1), lane = lid & 15, sl = lid >> 4;
+#else
             const int lane = (int) sg.get_local_linear_id(), sl = (int) sg.get_group_linear_id();
+#endif
             const int64_t band = (int64_t) it.get_group(1);
             for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
                 const View v = view((const uint8_t*) grp_ptr[g], N);
@@ -93,9 +105,17 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                     for (int j = 0; j < EP; ++j)
 #pragma unroll
                         for (int r = 0; r < 16; ++r) acc[j][r] = 0.0f;
+#if defined(STRATA_GB10_SG32)
+                    for (int64_t kq = 0; kq < per; ++kq) {   // the same count for both slices of a sub-group
+                        const int64_t bk = blk0 + kq;
+                        const bool act = bk < blk1;
+                        const int64_t c0 = act ? bk * 16 : 0;
+                        const int nt = act ? (int) sycl::min<int64_t>(16, NC - c0) : 0;
+#else
                     for (int64_t bk = blk0; bk < blk1; ++bk) {   // uniform in the sub-group: every lane takes part in the exchanges
                         const int64_t c0 = bk * 16;
                         const int nt = (int) sycl::min<int64_t>(16, NC - c0);   // a multiple of 4 (widths are multiples of 64)
+#endif
                         const bool live = lane < nt;
                         const int ln = live ? lane : 0;
                         const int64_t c = c0 + ln;
@@ -164,7 +184,13 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                     for (int j = 0; j < EP; ++j)
 #pragma unroll
                         for (int r = 0; r < 16; ++r) {
+#if defined(STRATA_GB10_SG32)
+                            float t = acc[j][r];
+#pragma unroll
+                            for (int o = 8; o >= 1; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
+#else
                             const float t = sycl::reduce_over_group(sg, acc[j][r], sycl::plus<float>());
+#endif
                             if (lane == r) red[(sl * EP + j) * 16 + r] = t;
                         }
                     sycl::group_barrier(it.get_group());
@@ -195,6 +221,9 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
     });
 }
 
+#if defined(STRATA_GB10_SG32)
+int tq_epm() { static const int v = [] { const char* e = std::getenv("STRATA_TQ_EPM"); return e ? std::atoi(e) : 2; }(); return v; }
+#endif
 // STRATA_TQ_PAIR=0: every entry its own pass (else two entries of an expert share a pass, a single one has its own)
 bool tq_pair_on() { static const bool on = [] { const char* v = std::getenv("STRATA_TQ_PAIR"); return !v || std::strtol(v, nullptr, 10) != 0; }(); return on; }
 
@@ -207,6 +236,11 @@ sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* gr
                          float* up, int64_t N, int64_t FF) {
     if (N % 64 != 0 || FF % 64 != 0) throw std::runtime_error("tq experts: widths must be multiples of 64");
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_gu(q, cg, grp_ptr, grp_start, n_groups, ent_tok, cap_entries, x, gate, up, N, FF);
+#if defined(STRATA_GB10_SG32)
+    // GB10 port: STRATA_TQ_EPM=4 - up to 4 entries of an expert share a pass (a speculative window's 3 tokens: one decode
+    // of the codes instead of a pair and a single)
+    if (tq_epm() >= 4) return gemv<6, 4, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
+#endif
     if (tq_pair_on()) return gemv<6, 2, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     return gemv<6, 1, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
 }
@@ -215,8 +249,16 @@ sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* 
                            const int32_t* n_groups, const int32_t* ent_dst, int64_t cap_entries, const float* h,
                            float* out, int64_t N, int64_t FF) {
     if (tq_xmx_on(q, cap_entries, N, FF)) return tq_xmx_down(q, cg, grp_ptr, grp_start, n_groups, ent_dst, cap_entries, h, out, N, FF);
-    if (tq_pair_on()) return gemv<3, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
-    return gemv<3, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+#if defined(STRATA_GB10_SG32)
+    constexpr int SD = 4;   // an even count of 16-lane slices: whole sub-groups of 32
+#else
+    constexpr int SD = 3;
+#endif
+#if defined(STRATA_GB10_SG32)
+    if (tq_epm() >= 4) return gemv<SD, 4, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+#endif
+    if (tq_pair_on()) return gemv<SD, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+    return gemv<SD, 1, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
 }
 
 }  // namespace strata::kernels

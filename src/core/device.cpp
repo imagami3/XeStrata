@@ -202,7 +202,13 @@ bool xe_gpu_from_xe2() {
                 if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
                     const auto* list = reinterpret_cast<const drm_xe_query_gt_list*>(buf.data());
                     for (uint32_t i = 0; i < list->num_gt; ++i)
-                        if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN && list->gt_list[i].ip_ver_major >= 20)
+                        if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN
+#if !defined(__aarch64__)   // GB10 port: this system's xe_drm.h has no ip_ver_major (and no Intel GPU)
+                            && list->gt_list[i].ip_ver_major >= 20
+#else
+                            && false
+#endif
+                            )
                             found = true;
                 }
             }

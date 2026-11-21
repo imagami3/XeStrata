@@ -284,9 +284,19 @@ bool launch(sycl::event& ev, sycl::queue& queue, const float* q, const float* r,
 
 }  // namespace
 
+#if defined(STRATA_GB10_SG32)
+bool inkling2_attention_gb10(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
+                             const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
+                             int extent, int window, float* out, int n_tokens, void* stream);   // a64_ink_attn.cpp
+#endif
 bool inkling2_attention_xmx(const float* q, const float* r, const float* sinks, const float* kc, const float* vc,
                             const float* table, const int32_t* steps, int n_head, int n_head_kv, int dim, int rel,
                             int extent, int window, float* out, int n_tokens, void* stream) {
+#if defined(STRATA_GB10_SG32)   // GB10 port: NVIDIA's prompt-window kernel (a64_ink_attn.cpp)
+    if (inkling2_attention_gb10(q, r, sinks, kc, vc, table, steps, n_head, n_head_kv, dim, rel, extent, window, out,
+                                n_tokens, stream))
+        return true;
+#endif
     static const bool on = [] {
         const char* v = std::getenv("STRATA_INK_ATT_XMX");
         return v == nullptr || v[0] != '0';
