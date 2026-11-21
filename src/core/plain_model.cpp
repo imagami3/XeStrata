@@ -1960,10 +1960,55 @@ bool PlainModel::setup_device_plan(std::string& err) {
     return true;
 }
 
+// b70-local (after the GB10 port's fix): a window's graph is recorded once a size and kept, and a prompt's last chunk
+// comes in any size, so a client's turns (each a new size) piled up graphs, each holding host and device memory (GB10,
+// 11-22, agent tasks: the RSS grew 0.5 GB a minute until the RAM guard stopped the engine).  STRATA_PLAIN_GRAPH_KEEP=N
+// (default 32; 0 keeps every one, as before): past N sizes, the size recorded longest ago is destroyed before a new one
+// is recorded, and recorded again if it comes back; with the expert relay (EP) the other GPUs' graphs for that size
+// (assist_) go with it.  The graphs are the same, so the output is bit-identical.  record() runs between windows,
+// when every GPU of the chain is idle (forward runs the stages in turn; ep_relay waits for the helpers).
+void PlainModel::graph_evict(bool mtp, int T) {
+    static const int keep = [] {
+        const char* e = std::getenv("STRATA_PLAIN_GRAPH_KEEP");
+        return e != nullptr && *e != '\0' ? std::max(0, std::atoi(e)) : 32;
+    }();
+    if (keep <= 0) return;
+    std::vector<strata::gpu::Graph*>& ex = mtp ? mexec_ : exec_;
+    std::vector<std::vector<strata::gpu::Graph*>>& sg = mtp ? msegs_ : segs_;
+    std::vector<uint64_t>& used = mtp ? mgraph_used_ : graph_used_;
+    for (;;) {
+        int live = 0, lru = -1;
+        for (size_t t = 0; t < ex.size(); ++t) {
+            if (ex[t] == nullptr && sg[t].empty()) continue;
+            ++live;
+            if ((int) t != T && (lru < 0 || used[t] < used[(size_t) lru])) lru = (int) t;
+        }
+        if (live < keep || lru < 0) return;
+        // graph_destroy drains this GPU's queues first, so a replay in flight completes before its graph goes
+        if (ex[(size_t) lru] != nullptr) { strata::gpu::graph_destroy(ex[(size_t) lru]); ex[(size_t) lru] = nullptr; }
+        for (auto* g : sg[(size_t) lru]) strata::gpu::graph_destroy(g);
+        sg[(size_t) lru].clear();
+        if (mtp) continue;
+        const int key = ep_stage_ << 16 | lru;   // ep_relay's key for this stage's window of lru tokens
+        for (PlainModel* h : root_->chain()) {
+            if (h == this) continue;
+            const auto it = h->assist_.find(key);
+            if (it == h->assist_.end()) continue;
+            const OnDevice on(h->dev_);
+            strata::gpu::graph_destroy(it->second);
+            h->assist_.erase(it);
+        }
+    }
+}
+
 bool PlainModel::record(int T, bool mtp, std::string& err) {
     strata::gpu::Graph*& exec = (mtp ? mexec_ : exec_)[(size_t) T];
     std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
+    std::vector<uint64_t>& used = mtp ? mgraph_used_ : graph_used_;
+    if (used.size() != (mtp ? mexec_ : exec_).size()) used.assign((mtp ? mexec_ : exec_).size(), 0);
+    used[(size_t) T] = ++graph_tick_;
     if (exec != nullptr || !segs.empty()) return true;
+    graph_evict(mtp, T);
     if (!setup_device_plan(err)) return false;
     if (T > k::cpu::MAXT && !big_ok_) {
         err = "plain model: a window of " + std::to_string(T) + " tokens needs the device plan (STRATA_PLAIN_DEVICE_PLAN=1)";

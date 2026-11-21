@@ -302,6 +302,7 @@ private:
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
     bool record(int T, bool mtp, std::string& err);
+    void graph_evict(bool mtp, int T);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
     bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb = true);
@@ -736,6 +737,8 @@ private:
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
     std::vector<std::vector<strata::gpu::Graph*>> msegs_;
+    std::vector<uint64_t> graph_used_, mgraph_used_;             ///< b70-local: per T, the last record() (graph_evict)
+    uint64_t graph_tick_ = 0;
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
     int32_t *h_raw_ = nullptr, *m_raw_ = nullptr;                ///< mapped: T flags, 1: the row is a picture's
     const float* const* embd_rows_ = nullptr;                    ///< set_embd_rows
