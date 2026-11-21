@@ -153,6 +153,17 @@ class Policy(unittest.TestCase):
         self.assertEqual(n, 2 * 20 + LG.PENALTY_EXTRA)
         self.assertEqual(g.sampling({"top_k": 5}, 50 + n, 4000 - n), ({"top_k": 5}, 4000 - n))
 
+    def test_a_greedy_request_samples_while_the_penalty_runs(self):
+        # b70-local (11-22): an engine path without the repetition penalty (Inkling 2's plain one) wrote the same
+        # block again at temperature 0; the guard's window samples at LOOP_TEMP, a request's own top_p kept
+        g = LG.LoopGuard()
+        g.resume([1] * 50, self.fire(g, self.loop))
+        smp, n = g.sampling({"temperature": 0, "top_p": 0.5}, 50, 4000)
+        self.assertEqual((smp["temperature"], smp["top_p"]), (LG.LOOP_TEMP, 0.5))
+        smp, _ = g.sampling({}, 50, 4000)
+        self.assertEqual((smp["temperature"], smp["top_p"]), (LG.LOOP_TEMP, LG.LOOP_TOP_P))
+        self.assertEqual(g.sampling({}, 50 + n, 4000 - n), ({}, 4000 - n))   # then greedy again
+
 
 class LoopingEngine:
     """Writes `head` and then `block` until its limit; with a repetition penalty (`steered`) or once the prompt holds

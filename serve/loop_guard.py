@@ -21,7 +21,10 @@ own (a stop string, the thinking budget).
                      penalty          the repeats not sent yet are dropped (what was sent stays) and the engine goes
                                       on from there with a short repetition penalty (LOOP_PENALTY over the last
                                       2 x period tokens, at least PENALTY_MIN_N, for the next 2 x period +
-                                      PENALTY_EXTRA): the 1st loop in the answer, the 1st and 2nd in the thinking
+                                      PENALTY_EXTRA): the 1st loop in the answer, the 1st and 2nd in the thinking;
+                                      a greedy request samples meanwhile (b70-local, LOOP_TEMP: an engine path
+                                      without the repetition penalty, Inkling 2's plain one, wrote the same block
+                                      again at once)
                      close thinking   the 3rd loop in the thinking: the server closes it as the thinking budget does,
                                       and it answers (never a silent end while it thinks)
                      stop             the 2nd loop in the answer, or a 4th in all: the answer ends (finish "stop")
@@ -35,6 +38,7 @@ to back three times or more, which is what a loop is.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Callable, NamedTuple
 
@@ -59,6 +63,13 @@ LOOP_PENALTY = 1.15     # the temporary repetition penalty after a loop
 PENALTY_MIN_N = 128     # its window (penalty_last_n): 2 x the period, at least this
 PENALTY_EXTRA = 128     # it applies to the next 2 x period + this many tokens, then the request's own sampling again
 PENALTY_N_MAX = 4096    # (the engine counts at most this many: kPenaltyWindowCap in src/program/generate.cpp)
+# b70-local (11-22): a greedy request (temperature 0 or none, Inkling 2's default: its card names no sampling) samples
+# at this temperature (top_p LOOP_TOP_P unless the request has one) while the penalty runs; STRATA_LOOP_TEMP=0: off.
+# Inkling 2's plain path has no repetition penalty, so greedy wrote its pelican SVG into the same lines again after
+# the penalty (cut by the stop, 1 of 1); sampling at 0.8 meanwhile, it finished it (3 of 3; banning the token the
+# block restarts with instead: 0 of 1, both: 2 of 3)
+LOOP_TEMP = float(os.environ.get("STRATA_LOOP_TEMP", "0.8"))
+LOOP_TOP_P = 0.95
 
 PENALTY, CLOSE_THINKING, STOP = "penalty", "close_thinking", "stop"
 
@@ -248,13 +259,17 @@ class LoopGuard:
     def sampling(self, base: Any, written: int, left: int) -> tuple[Any, int]:
         """The sampling for an engine call that starts after `written` tokens, and how many tokens it may write:
         the request's own (and `left`) - unless the temporary penalty runs, which then ends that call where it ends.
-        A request's own stronger penalty or longer window stays."""
+        A request's own stronger penalty or longer window stays; a greedy one samples at LOOP_TEMP meanwhile."""
         if written >= self.until:
             return base, left
         smp = dict(base or {})
         rp = smp.get("repetition_penalty")
         rp = float(rp) if isinstance(rp, (int, float)) and not isinstance(rp, bool) else 1.0
         smp["repetition_penalty"] = max(rp, LOOP_PENALTY)
+        t = smp.get("temperature")
+        if LOOP_TEMP > 0 and not (isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0):
+            smp["temperature"] = LOOP_TEMP
+            smp.setdefault("top_p", LOOP_TOP_P)
         pln = smp.get("penalty_last_n")
         if not (isinstance(pln, int) and not isinstance(pln, bool) and (pln == -1 or pln >= self.window)):
             smp["penalty_last_n"] = self.window
