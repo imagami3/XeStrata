@@ -307,6 +307,45 @@ void inkling2_conv(const float* x, float* state, const float* w, const float* dy
         throw core::DeviceError("inkling2_conv: taps or heads");
     const int64_t C = n_channels, per_head = dyn != nullptr ? C / heads : 1;
     const int K = n_taps, T = n_tokens;
+    // GB10 port (11-22): a prompt window (STRATA_INK_CONV_PAR rows and more, default 16; 0 off) a work-item a (token,
+    // channel): every output is the same sums in the same order (its window is x_{t-K+1..t}, the rows before the window
+    // from the state), then the new state in a second launch, after every read of the old one.  The loop below kept a
+    // channel's 2,048 tokens in one work-item: C work-items for the whole window.
+    static const int par_min = [] { const char* e = std::getenv("STRATA_INK_CONV_PAR"); return e ? std::atoi(e) : 16; }();
+    if (par_min > 0 && T >= par_min) {
+        auto& q = queue_for(stream);
+        q.parallel_for(sycl::range<2>((size_t) T, (size_t) C), [=](sycl::id<2> id) {
+            const int t = (int) id[0];
+            const int64_t c = (int64_t) id[1];
+            float win[kMaxTaps];
+            for (int j = 0; j < K; ++j) {
+                const int idx = t - (K - 1) + j;
+                win[j] = idx >= 0 ? x[(int64_t) idx * C + c] : state[c * (K - 1) + (K - 1) + idx];
+            }
+            const float* wc = w + c * K;
+            const int64_t hd = c / per_head;
+            float sum = 0.0f;
+            for (int j = 0; j < K; ++j) sum += win[j] * wc[j];
+            if (dyn != nullptr) {
+                const float* tap = dyn + ((int64_t) t * heads + hd) * K;
+                for (int j = 0; j < K; ++j) sum += tap[j] * win[K - 1 - j];   // lag j: x_{t - j}
+            }
+            y[(int64_t) t * C + c] = (win[K - 1] + sum) * scale;
+            if (t < n_snap)   // b70-local: the history after row t (speculative decoding's rollback)
+                for (int j = 0; j < K - 1; ++j) snap[(int64_t) t * snap_stride + c * (K - 1) + j] = win[j + 1];
+        });
+        const auto event = q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+            const int64_t c = (int64_t) id[0];
+            float nw[kMaxTaps];
+            for (int j = 0; j < K - 1; ++j) {
+                const int idx = T - (K - 1) + j;
+                nw[j] = idx >= 0 ? x[(int64_t) idx * C + c] : state[c * (K - 1) + (K - 1) + idx];
+            }
+            for (int j = 0; j < K - 1; ++j) state[c * (K - 1) + j] = nw[j];
+        });
+        sync_if_needed(stream, event, "inkling2_conv");
+        return;
+    }
     // a work-item a channel, the tokens in order (a decode window is short)
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
         const int64_t c = (int64_t) id[0];

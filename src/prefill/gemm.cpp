@@ -474,4 +474,14 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     f16(X, scratch_, Y, T, N, K, ldy);
 }
 
+// GB10 port: the FP16 product through oneMath's BLAS on the given stream (cuBLAS on NVIDIA); false: no BLAS for the device
+bool blas_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream) {
+#if STRATA_ONEMATH
+    return blas<sycl::half>(X, W, Y, T, N, K, ldy, false, stream);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) stream;
+    return false;
+#endif
+}
+
 }  // namespace strata::prefill

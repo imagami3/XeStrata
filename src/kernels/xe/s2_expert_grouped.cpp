@@ -531,11 +531,15 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
     if (cap <= 0) return;
     const int ne = (int) n_embd;
     const size_t gx = (size_t) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8);
-    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) cap, gx * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
-        const int h = (int) it.get_group(0);
-        if (h >= *count) return;
-        const size_t row = (size_t) dst[h] * (size_t) ne;
-        for (int i = (int) it.get_global_id(1); i < ne; i += (int) it.get_global_range(1)) parts[row + i] += hit_out[row + i];
+    // GB10 port: at most 512 hit slots, each work-group walks h += the range (cap is the window's entry capacity: 16,384 x
+    // 8 work-groups that nearly all left at once cost ~4 ms a call); every element is still added once
+    const size_t gh = (size_t) (cap < 512 ? cap : 512);
+    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({gh, gx * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+        const int nh = *count;
+        for (int h = (int) it.get_group(0); h < nh; h += (int) it.get_group_range(0)) {
+            const size_t row = (size_t) dst[h] * (size_t) ne;
+            for (int i = (int) it.get_global_id(1); i < ne; i += (int) it.get_global_range(1)) parts[row + i] += hit_out[row + i];
+        }
     });
     if (!stream) core::Runtime::get().wait(e, "moe_hit_add");
 }

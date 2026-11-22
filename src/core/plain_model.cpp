@@ -1984,10 +1984,43 @@ bool PlainModel::setup_device_plan(std::string& err) {
     return true;
 }
 
+// GB10 port: the window graphs are recorded once a window size and kept, and a prompt's last chunk comes in any size,
+// so a client's turns (each a new size) piled up graphs, tens of MB of host and device memory each (11-22, agent tasks:
+// the RSS grew 0.5 GB a minute until the RAM guard stopped the engine).  STRATA_PLAIN_GRAPH_KEEP=N (default 32; 0 keeps
+// every one, as before): past N sizes, the one launched longest ago is destroyed before a new size is recorded, and
+// recorded again if it comes back.  The graphs are the same, so the output is bit-identical.
+void PlainModel::graph_evict(bool mtp, int T) {
+    static const int keep = [] {
+        const char* e = std::getenv("STRATA_PLAIN_GRAPH_KEEP");
+        return e != nullptr && *e != '\0' ? std::max(0, std::atoi(e)) : 32;
+    }();
+    if (keep <= 0) return;
+    std::vector<strata::gpu::Graph*>& ex = mtp ? mexec_ : exec_;
+    std::vector<std::vector<strata::gpu::Graph*>>& sg = mtp ? msegs_ : segs_;
+    std::vector<uint64_t>& used = mtp ? mgraph_used_ : graph_used_;
+    for (;;) {
+        int live = 0, lru = -1;
+        for (size_t t = 0; t < ex.size(); ++t) {
+            if (ex[t] == nullptr && sg[t].empty()) continue;
+            ++live;
+            if ((int) t != T && (lru < 0 || used[t] < used[(size_t) lru])) lru = (int) t;
+        }
+        if (live < keep || lru < 0) return;
+        // graph_destroy drains the queues first, so a replay in flight completes before its graph goes
+        if (ex[(size_t) lru] != nullptr) { strata::gpu::graph_destroy(ex[(size_t) lru]); ex[(size_t) lru] = nullptr; }
+        for (auto* g : sg[(size_t) lru]) strata::gpu::graph_destroy(g);
+        sg[(size_t) lru].clear();
+    }
+}
+
 bool PlainModel::record(int T, bool mtp, std::string& err) {
     strata::gpu::Graph*& exec = (mtp ? mexec_ : exec_)[(size_t) T];
     std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
+    std::vector<uint64_t>& used = mtp ? mgraph_used_ : graph_used_;
+    if (used.size() != (mtp ? mexec_ : exec_).size()) used.assign((mtp ? mexec_ : exec_).size(), 0);
+    used[(size_t) T] = ++graph_tick_;
     if (exec != nullptr || !segs.empty()) return true;
+    graph_evict(mtp, T);
     if (!setup_device_plan(err)) return false;
     if (T > k::cpu::MAXT && !big_ok_) {
         err = "plain model: a window of " + std::to_string(T) + " tokens needs the device plan (STRATA_PLAIN_DEVICE_PLAN=1)";
@@ -2628,6 +2661,11 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     spec_drafted_ += nd;
     spec_accepted_ += n;
     if (ink_spec_ && nd > 0) ds_ema_ = 0.9f * ds_ema_ + 0.1f * (float) n / (float) nd;   // b70-local
+    // GB10 port, STRATA_SPEC_STATS=N: the windows, drafts and accepted drafts so far, every N windows (diagnostics)
+    static const int spec_stats = [] { const char* e = std::getenv("STRATA_SPEC_STATS"); return e ? std::max(1, std::atoi(e)) : 0; }();
+    if (spec_stats > 0 && spec_windows_ % spec_stats == 0)
+        std::fprintf(stderr, "strata spec stats: %lld windows, %lld drafts, %lld accepted\n", (long long) spec_windows_,
+                     (long long) spec_drafted_, (long long) spec_accepted_);
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
     if (spec_lookup_on()) {   // the window's pending token and its accepted drafts join the context

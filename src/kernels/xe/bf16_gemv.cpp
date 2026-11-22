@@ -210,6 +210,170 @@ sycl::event launch_mmvf_rows(sycl::queue& q, const float* x, int64_t ldx, const 
     });
 }
 
+// GB10 port (11-22): launch_mmvf<BLOCK_SIZE, 8> over a window's 8-row slices in one launch (grid dimension 0 the slice,
+// its rows min(8, T - 8 s)): every output is launch_mmvf's work-item walk, FMAs and sums, so the multi-row call's bits
+// slice by slice (Inkling's router over a prompt window: 256 launches a layer at T = 2048 before)
+template<int BLOCK_SIZE>
+sycl::event launch_mmvf_slices(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                               int n_in, int64_t n_out, int T) {
+    // (8 rows a work-group, launch_mmvf_rows' form, and 4 slices a work-group were slower on GB10: 394.6 / 413.0 against
+    // 416.4 tok/s, the prompt of 4,713 tokens)
+    constexpr int NT = 8;
+    const size_t slices = (size_t) ((T + NT - 1) / NT);
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> partials(sycl::range<1>(NT * 32), h);
+        h.parallel_for(sycl::nd_range<2>({slices, (size_t) n_out * BLOCK_SIZE}, {1, (size_t) BLOCK_SIZE}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_local_id(1);
+            const int s0 = (int) it.get_group(0) * NT;
+            const int n_tok = sycl::min(NT, T - s0);
+            const float* xs = x + (size_t) s0 * ldx;
+            float* ys = y + (size_t) s0 * ldy;
+            const size_t rowi = it.get_group(1);
+            const uint16_t* row = w + rowi * n_in;
+            if constexpr (BLOCK_SIZE > 32) {
+                if (t < 32)
+                    for (int k = 0; k < NT; ++k) partials[k * 32 + t] = 0.0f;
+                sycl::group_barrier(it.get_group());
+            }
+            float acc[NT];
+            for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+            for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+                const uint32_t weight = reinterpret_cast<const uint32_t*>(row)[pair];
+                const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+                for (int k = 0; k < NT; ++k) {
+                    if (k < n_tok) {
+                        const float* xin = xs + (size_t) k * ldx + 2 * (size_t) pair;
+                        acc[k] = sycl::fma(w0, xin[0], acc[k]);
+                        acc[k] = sycl::fma(w1, xin[1], acc[k]);
+                    }
+                }
+            }
+            for (int k = 0; k < NT; ++k) acc[k] = warp_sum(sg, acc[k]);
+            if constexpr (BLOCK_SIZE > 32) {
+                if ((t & 31) == 0)
+                    for (int k = 0; k < NT; ++k) partials[k * 32 + t / 32] = acc[k];
+                sycl::group_barrier(it.get_group());
+                if (t < 32)
+                    for (int k = 0; k < NT; ++k) acc[k] = warp_sum(sg, partials[k * 32 + t]);
+            }
+            if (t == 0)
+                for (int k = 0; k < NT; ++k)
+                    if (k < n_tok) ys[(size_t) k * ldy + rowi] = acc[k];
+        });
+    });
+}
+
+// GB10 port (11-22): the slices' bits with R output columns x M rows a work-group.  The slices read every row's
+// activations once per output column (Inkling's router at T = 4,719: ~35 GB through L2 a layer, ~9% of the prompt).
+// Work-item t keeps launch_mmvf's walk (pairs t, t + BLOCK_SIZE, ..., two ordered FMAs) for all R x M outputs; the
+// sub-group sum is the same xor butterfly (16, 8, 4, 2, 1), done as a reduce-scatter (each step, a lane keeps the
+// half of the outputs its bit selects and adds its partner's: own + partner, the butterfly's own pairs), so 32
+// outputs cost 31 exchanges instead of 160; the work-group sum is launch_mmvf's second butterfly over the NW partials
+// and zeros, written out.  STRATA_MMVF_TILES=0: the slices.
+template<int N>
+inline void rs_step(const sycl::sub_group& sg, const float* a, float* b, int lane) {
+    // a[2N] -> b[N]: lanes with bit N set keep a[N..2N), the others a[0..N); partner = lane ^ N
+    const bool hi = (lane & N) != 0;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const float send = hi ? a[i] : a[i + N];
+        const float keep = hi ? a[i + N] : a[i];
+        b[i] = keep + sycl::permute_group_by_xor(sg, send, N);
+    }
+}
+inline float reduce_scatter32(const sycl::sub_group& sg, const float* a, int lane) {
+    float b[16], c[8], d[4], e[2], f[1];
+    rs_step<16>(sg, a, b, lane);
+    rs_step<8>(sg, b, c, lane);
+    rs_step<4>(sg, c, d, lane);
+    rs_step<2>(sg, d, e, lane);
+    rs_step<1>(sg, e, f, lane);
+    return f[0];   // the sum of output `lane`
+}
+// launch_mmvf's work-group sum: a butterfly over 32 values, partials p[0..NW) then zeros; lane 0's value
+template<int NW>
+inline float wg_butterfly(const float* p) {
+    float v[32];
+#pragma unroll
+    for (int l = 0; l < 32; ++l) v[l] = l < NW ? p[l] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float nv[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) nv[l] = v[l] + v[l ^ off];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) v[l] = nv[l];
+    }
+    return v[0];
+}
+
+template<int BLOCK_SIZE, int R, int M>
+sycl::event launch_mmvf_tiles(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                              int n_in, int64_t n_out, int T) {
+    static_assert(R * M == 64, "two reduce-scatters of 32 outputs");
+    constexpr int NW = BLOCK_SIZE / 32;
+    const size_t slices = (size_t) ((T + M - 1) / M);
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> partials(sycl::range<1>(64 * NW), h);
+        h.parallel_for(sycl::nd_range<2>({slices, (size_t) (n_out / R) * BLOCK_SIZE}, {1, (size_t) BLOCK_SIZE}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_local_id(1);
+            const int lane = t & 31, wid = t >> 5;
+            const int s0 = (int) it.get_group(0) * M;
+            const int n_tok = sycl::min(M, T - s0);
+            const float* xs = x + (size_t) s0 * ldx;
+            const int64_t r0 = (int64_t) it.get_group(1) * R;
+            const uint32_t* wr = reinterpret_cast<const uint32_t*>(w + r0 * n_in);
+            const int64_t wstride = n_in / 2;
+            float acc[R * M];
+#pragma unroll
+            for (int o = 0; o < R * M; ++o) acc[o] = 0.0f;
+            for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+                float w0[R], w1[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t weight = wr[(size_t) r * wstride + pair];
+                    w0[r] = f32_from_bf16((uint16_t) weight);
+                    w1[r] = f32_from_bf16((uint16_t) (weight >> 16));
+                }
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    if (m < n_tok) {
+                        const sycl::float2 xv = *reinterpret_cast<const sycl::float2*>(xs + (size_t) m * ldx + 2 * (size_t) pair);
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            acc[r * M + m] = sycl::fma(w0[r], xv.x(), acc[r * M + m]);
+                            acc[r * M + m] = sycl::fma(w1[r], xv.y(), acc[r * M + m]);
+                        }
+                    }
+                }
+            }
+            const float p0 = reduce_scatter32(sg, acc, lane);        // output lane
+            const float p1 = reduce_scatter32(sg, acc + 32, lane);   // output 32 + lane
+            if constexpr (NW == 1) {
+                const int o0 = lane, o1 = 32 + lane;
+                if (o0 % M < n_tok) y[(size_t) (s0 + o0 % M) * ldy + r0 + o0 / M] = p0;
+                if (o1 % M < n_tok) y[(size_t) (s0 + o1 % M) * ldy + r0 + o1 / M] = p1;
+            } else {
+                partials[lane * NW + wid] = p0;
+                partials[(32 + lane) * NW + wid] = p1;
+                sycl::group_barrier(it.get_group());
+                if (t < 64) {
+                    float pw[NW];
+#pragma unroll
+                    for (int i = 0; i < NW; ++i) pw[i] = partials[t * NW + i];
+                    const float v = wg_butterfly<NW>(pw);
+                    const int m = t % M, r = t / M;
+                    if (m < n_tok) y[(size_t) (s0 + m) * ldy + r0 + r] = v;
+                }
+            }
+        });
+    });
+}
+
 int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
@@ -350,6 +514,42 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
     auto& q = queue_for(stream);
     multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, n_out >= 64 && rows_form(q, n_in, n_out, n_tok));
     if (!stream) core::Runtime::get().finish(q);
+}
+
+bool bf16_gemv_fp32_mmvf_slices(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                int64_t n_in, int64_t n_out, int T, void* stream) {
+    // the multi-row call's 1-row (n_tok 1: dispatch_mmvf<1>), exact-count (2..6) and 4-rows forms give these bits too
+    if (T < 1 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr || w == nullptr || y == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 3u) != 0)
+        return false;
+    auto& q = queue_for(stream);
+    static const bool tiles = [] { const char* e = std::getenv("STRATA_MMVF_TILES"); return !e || std::atoi(e) != 0; }();
+    if (tiles && n_out % 8 == 0 && T > 8) {
+        switch (mmvf_block_size(n_in)) {
+            case 32: launch_mmvf_tiles<32, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 64: launch_mmvf_tiles<64, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 96: launch_mmvf_tiles<96, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 128: launch_mmvf_tiles<128, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 160: launch_mmvf_tiles<160, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 192: launch_mmvf_tiles<192, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            case 224: launch_mmvf_tiles<224, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+            default: launch_mmvf_tiles<256, 8, 8>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        }
+        if (!stream) core::Runtime::get().finish(q);
+        return true;
+    }
+    switch (mmvf_block_size(n_in)) {
+        case 32: launch_mmvf_slices<32>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 64: launch_mmvf_slices<64>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 96: launch_mmvf_slices<96>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 128: launch_mmvf_slices<128>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 160: launch_mmvf_slices<160>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 192: launch_mmvf_slices<192>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        case 224: launch_mmvf_slices<224>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+        default: launch_mmvf_slices<256>(q, x, ldx, w, y, ldy, (int) n_in, n_out, T); break;
+    }
+    if (!stream) core::Runtime::get().finish(q);
+    return true;
 }
 
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,

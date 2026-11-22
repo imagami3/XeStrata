@@ -79,4 +79,7 @@ private:
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
 };
 
+/// GB10 port: Y[T, ldy] = X[T, K] . W[N, K]^T through oneMath's BLAS (FP16, FP32 sums) on `stream`; false: no BLAS
+bool blas_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream);
+
 }  // namespace strata::prefill

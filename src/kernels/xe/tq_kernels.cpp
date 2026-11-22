@@ -21,8 +21,11 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 
 
 namespace strata::kernels {
@@ -72,7 +75,76 @@ constexpr int kTqSg = 32;
 #else
 constexpr int kTqSg = 16;
 #endif
-template <int S, int EPM, bool GU>
+#if defined(STRATA_GB10_SG32)
+// GB10 port, STRATA_TQ_PREROT (default 1): the inputs are rotated once an entry (rotate_f32, into a scratch row) instead
+// of once a band in gemv - the gate / up input of a token went through H16 and the H4 exchanges in each of its 2 ff/16
+// bands, and once for each entry of a pass.  The same operations in the same order (sign, H16 by bits 0-3, H4 by lane
+// xor 1 and 2, the scale 0.125 / 147.8), so the inputs and so the outputs are the same bits.
+bool tq_pf() { static const bool on = [] { const char* e = std::getenv("STRATA_TQ_PF"); return e && std::atoi(e) != 0; }(); return on; }
+bool tq_prerot() { static const bool on = [] { const char* e = std::getenv("STRATA_TQ_PREROT"); return !e || std::atoi(e) != 0; }(); return on; }
+struct FBuf { float* p = nullptr; size_t n = 0; };
+std::mutex fbuf_mu;
+// slot 0: x' for gate / up, slot 1: h' for down; an older, smaller buffer stays allocated for the graphs recorded with it
+float* scratch_f(sycl::queue& q, size_t n, int slot) {
+    static std::unordered_map<size_t, FBuf> m;
+    std::lock_guard<std::mutex> lk(fbuf_mu);
+    FBuf& b = m[std::hash<sycl::device>{}(q.get_device()) * 4 + (size_t) slot];
+    if (b.n < n) {
+        b.p = sycl::malloc_device<float>(n, q);
+        b.n = b.p ? n : 0;
+    }
+    if (b.p == nullptr) throw std::runtime_error("tq experts: no scratch for the rotated inputs");
+    return b.p;
+}
+// out[e][0, K) = Hb (sign * in[row(e)]) * 0.125 / 147.8 for every entry: K = N (gate / up, row = ent_tok[e]) or the
+// expert's ff (down, row = e); a work-item 16 inputs (one tile column), lanes past K still take part in the exchanges
+sycl::event rotate_f32(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_tok, const float* in, int64_t ld_in, float* out,
+                       int64_t ld_out, int64_t N, int64_t KMAX, bool down) {
+    const size_t items = (size_t) ((KMAX / 16 + 31) / 32 * 32);
+    return q.parallel_for(sycl::nd_range<2>({cg, items}, {1, (size_t) 32}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int64_t c = (int64_t) it.get_global_id(1);
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const View v = view((const uint8_t*) grp_ptr[g], N);
+            const int64_t K = down ? v.ff : N;
+            const bool live = c * 16 < K;
+            const int64_t cc = live ? c : 0;
+            const uint8_t* sgn = down ? v.d_sign : v.gu_sign;
+            const uint32_t sb = (uint32_t) sgn[2 * cc] | ((uint32_t) sgn[2 * cc + 1] << 8);
+            for (int e = grp_start[g]; e < grp_start[g + 1]; ++e) {
+                const float* xp = in + (size_t) (down ? e : ent_tok[e]) * (size_t) ld_in + cc * 16;
+                float xv[16];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) xv[i] = ((sb >> i) & 1) ? -xp[i] : xp[i];
+#pragma unroll
+                for (int hh = 1; hh < 16; hh <<= 1)
+#pragma unroll
+                    for (int i = 0; i < 16; ++i)
+                        if (!(i & hh)) { const float a0 = xv[i], a1 = xv[i | hh]; xv[i] = a0 + a1; xv[i | hh] = a0 - a1; }
+#pragma unroll
+                for (int m = 1; m < 4; m <<= 1)
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const float o = sycl::permute_group_by_xor(sg, xv[i], m);
+                        xv[i] = (lane & m) ? o - xv[i] : xv[i] + o;
+                    }
+                if (live) {
+                    sycl::vec<float, 4>* o4 = reinterpret_cast<sycl::vec<float, 4>*>(out + (size_t) e * (size_t) ld_out + c * 16);
+#pragma unroll
+                    for (int q4 = 0; q4 < 4; ++q4)
+                        o4[q4] = sycl::vec<float, 4>(xv[4 * q4] * (0.125f / 147.8f), xv[4 * q4 + 1] * (0.125f / 147.8f),
+                                                     xv[4 * q4 + 2] * (0.125f / 147.8f), xv[4 * q4 + 3] * (0.125f / 147.8f));
+                }
+            }
+        }
+    });
+}
+#endif
+// PR (GB10 port): xin is rotate_f32's x' / h' [entry][ldx], so the pass only loads it
+// PF (GB10 port, with PR; STRATA_TQ_PF=1): the next block's codes are loaded into registers while this one is decoded
+template <int S, int EPM, bool GU, bool PR = false, bool PF = false>
 sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_idx, const float* xin, int64_t ldx, float* o0, float* o1,
                  int64_t N, int64_t FF) {
@@ -111,6 +183,22 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
 #pragma unroll
                         for (int r = 0; r < 16; ++r) acc[j][r] = 0.0f;
 #if defined(STRATA_GB10_SG32)
+                    uint32_t pd[16];
+                    uint32_t pd16 = 0;
+                    auto pfl = [&](int64_t kq2) {
+                        const int64_t bk2 = blk0 + kq2;
+                        if (kq2 < per && bk2 < blk1) {
+                            const int64_t c02 = bk2 * 16;
+                            const int nt2 = (int) sycl::min<int64_t>(16, NC - c02);
+                            if (lane < nt2) {
+                                const uint32_t* p2 = (const uint32_t*) (bandp + (size_t) c02 * kTqTileBytes) + lane;
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) { pd[i] = *p2; p2 += nt2; }
+                                pd16 = ((const uint16_t*) (p2 - lane))[lane];
+                            }
+                        }
+                    };
+                    if constexpr (PF) pfl(0);
                     for (int64_t kq = 0; kq < per; ++kq) {   // the same count for both slices of a sub-group
                         const int64_t bk = blk0 + kq;
                         const bool act = bk < blk1;
@@ -124,10 +212,26 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                         const bool live = lane < nt;
                         const int ln = live ? lane : 0;
                         const int64_t c = c0 + ln;
-                        // the inputs: sign, H16 in the lane, H4 over lanes 4m..4m+3; 1/8 (orthonormal) and 1/147.8 (the code's scale)
-                        const uint32_t sb = (uint32_t) sgn[2 * c] | ((uint32_t) sgn[2 * c + 1] << 8);
                         float xv[EP][16];
                         float xs[EP];
+                        if constexpr (PR) {
+                            if (!live) continue;
+#pragma unroll
+                            for (int j = 0; j < EP; ++j) {
+                                const sycl::vec<float, 4>* xp4 = reinterpret_cast<const sycl::vec<float, 4>*>(
+                                    xin + (size_t) (e + (j < n ? j : 0)) * (size_t) ldx + c * 16);
+#pragma unroll
+                                for (int q4 = 0; q4 < 4; ++q4) {
+                                    const sycl::vec<float, 4> t4 = xp4[q4];
+                                    xv[j][4 * q4] = t4[0]; xv[j][4 * q4 + 1] = t4[1]; xv[j][4 * q4 + 2] = t4[2]; xv[j][4 * q4 + 3] = t4[3];
+                                }
+                                xs[j] = 0.0f;
+#pragma unroll
+                                for (int i = 0; i < 16; ++i) xs[j] += xv[j][i];
+                            }
+                        } else {
+                        // the inputs: sign, H16 in the lane, H4 over lanes 4m..4m+3; 1/8 (orthonormal) and 1/147.8 (the code's scale)
+                        const uint32_t sb = (uint32_t) sgn[2 * c] | ((uint32_t) sgn[2 * c + 1] << 8);
 #pragma unroll
                         for (int j = 0; j < EP; ++j) {
                             const int64_t row = GU ? (int64_t) ent_idx[e + (j < n ? j : 0)] : (int64_t) (e + (j < n ? j : 0));
@@ -151,14 +255,26 @@ sycl::event gemv(sycl::queue& q, size_t cg, const unsigned long long* grp_ptr, c
                             for (int i = 0; i < 16; ++i) { xv[j][i] = live ? xv[j][i] * (0.125f / 147.8f) : 0.0f; xs[j] += xv[j][i]; }
                         }
                         if (!live) continue;
+                        }
                         // the pointer steps by nt from the last read (AGENTS.md: IGC 2.27-2.30's GEP simplification misreads
                         // constant multiples of a runtime stride)
-                        const uint32_t* B = (const uint32_t*) (bandp + (size_t) c0 * kTqTileBytes);
                         uint32_t d[16];
+                        uint32_t d16;
+#if defined(STRATA_GB10_SG32)
+                        if constexpr (PF) {
+#pragma unroll
+                            for (int i = 0; i < 16; ++i) d[i] = pd[i];
+                            d16 = pd16;
+                            pfl(kq + 1);
+                        } else
+#endif
+                        {
+                        const uint32_t* B = (const uint32_t*) (bandp + (size_t) c0 * kTqTileBytes);
                         const uint32_t* p = B + lane;
 #pragma unroll
                         for (int i = 0; i < 16; ++i) { d[i] = *p; p += nt; }
-                        const uint32_t d16 = ((const uint16_t*) (p - lane))[lane];
+                        d16 = ((const uint16_t*) (p - lane))[lane];
+                        }
 #pragma unroll
                         for (int j = 0; j < EP; ++j)
 #pragma unroll
@@ -246,6 +362,18 @@ sycl::event tq_expert_gu(sycl::queue& q, size_t cg, const unsigned long long* gr
 #if defined(STRATA_GB10_SG32)
     // GB10 port: STRATA_TQ_EPM=4 - up to 4 entries of an expert share a pass (a speculative window's 3 tokens: one decode
     // of the codes instead of a pair and a single)
+    // STRATA_TQ_PREROT (default on): the inputs rotated once an entry (rotate_f32), STRATA_TQ_SGU 4, 6 or 8 slices
+    if (tq_prerot() && tq_pair_on() && (tq_sgu() == 4 || tq_sgu() == 6 || tq_sgu() == 8)) {
+        float* xr = scratch_f(q, (size_t) cap_entries * (size_t) N, 0);
+        rotate_f32(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, xr, N, N, N, false);
+#define TQ_GU_PR(S_, E_) return tq_pf() ? gemv<S_, E_, true, true, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, xr, N, gate, up, N, FF) \
+                                         : gemv<S_, E_, true, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, xr, N, gate, up, N, FF)
+        if (tq_epm() >= 4) { if (tq_sgu() == 4) TQ_GU_PR(4, 4); if (tq_sgu() == 8) TQ_GU_PR(8, 4); TQ_GU_PR(6, 4); }
+        if (tq_sgu() == 4) TQ_GU_PR(4, 2);
+        if (tq_sgu() == 8) TQ_GU_PR(8, 2);
+        TQ_GU_PR(6, 2);
+#undef TQ_GU_PR
+    }
     if (tq_epm() >= 4) return gemv<6, 4, true>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, x, N, gate, up, N, FF);
     // STRATA_TQ_SGU: the 16-lane slices a work-group for gate / up (default 6; 2, 4, 8, 12, 16: whole sub-groups of 32)
     switch (tq_sgu()) {
@@ -271,10 +399,24 @@ sycl::event tq_expert_down(sycl::queue& q, size_t cg, const unsigned long long* 
     constexpr int SD = 3;
 #endif
 #if defined(STRATA_GB10_SG32)
+    // STRATA_TQ_PREROT (default on), STRATA_TQ_SGD 2, 4 or 10 slices (Inkling 2's ff 2304 is 9 blocks of 16 tiles:
+    // 4 slices x 3 blocks leave a quarter idle, 2 x 5 and 10 x 1 a tenth)
+    if (tq_prerot() && tq_pair_on() && (tq_sgd() == 2 || tq_sgd() == 4 || tq_sgd() == 10)) {
+        float* hr = scratch_f(q, (size_t) cap_entries * (size_t) FF, 1);
+        rotate_f32(q, cg, grp_ptr, grp_start, n_groups, nullptr, h, FF, hr, FF, N, FF, true);
+#define TQ_DN_PR(S_, E_) return tq_pf() ? gemv<S_, E_, false, true, true>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hr, FF, out, nullptr, N, FF) \
+                                         : gemv<S_, E_, false, true>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hr, FF, out, nullptr, N, FF)
+        if (tq_epm() >= 4) { if (tq_sgd() == 2) TQ_DN_PR(2, 4); if (tq_sgd() == 10) TQ_DN_PR(10, 4); TQ_DN_PR(4, 4); }
+        if (tq_sgd() == 2) TQ_DN_PR(2, 2);
+        if (tq_sgd() == 10) TQ_DN_PR(10, 2);
+        TQ_DN_PR(4, 2);
+#undef TQ_DN_PR
+    }
     if (tq_epm() >= 4) return gemv<SD, 4, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
     switch (tq_sgd()) {   // STRATA_TQ_SGD: the slices a work-group for down (default 4; 2, 8, 12, 16)
         case 2: return gemv<2, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
         case 8: return gemv<8, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
+        case 10: return gemv<10, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
         case 12: return gemv<12, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
         case 16: return gemv<16, 2, false>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, h, FF, out, nullptr, N, FF);
         default: break;

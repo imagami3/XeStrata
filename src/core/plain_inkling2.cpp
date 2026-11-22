@@ -40,6 +40,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -458,6 +459,10 @@ void PlainModel::gproj_win(const W& w, const float* x, float* y, int TT, bool qu
                 for (int64_t r0 = 0; r0 < w.n_out; r0 += rows) {
                     const int64_t n = std::min(rows, w.n_out - r0);
                     k::dequant_f16(w.type, w.data, r0, n, w.n_in, (uint16_t*) i_w16_, c);
+                    // GB10 port, STRATA_INK_W16_BLAS=1 (opt-in, other sums' order): the product through oneMath (cuBLAS)
+                    static const bool w16_blas = [] { const char* e = std::getenv("STRATA_INK_W16_BLAS"); return e && std::atoi(e) != 0; }();
+                    if (w16_blas && strata::prefill::blas_f16((const uint16_t*) i_xh_, (const uint16_t*) i_w16_, y + r0, TT, n, w.n_in, w.n_out, c))
+                        continue;
                     k::xmx_gemm(k::XmxType::f16, (const uint16_t*) i_xh_, (const uint16_t*) i_w16_, y + r0, TT, n, w.n_in,
                                 w.n_out, c);
                 }
@@ -739,7 +744,11 @@ bool PlainModel::record_iblock(const IBlock& b, int64_t l, int T, uint32_t& ring
     k::inkling2_attn_res(i_blocks_, bstride, (int) (l / B + 1), x_, b.ffn_rq, 1, i_in_, N, T, cs);
     glm5_decode_stamp(this, l, 6, cs);   // b70-local profile: the MoE input's residual mix done
     k::native_qsa_rms_norm_weighted_q8_1(i_in_, b.ffn_norm, hn_, g_xq_, (int) N, T, eps, cs);
-    for (int t0 = 0; t0 < T; t0 += 8) {
+    // GB10 port: a window past 8 rows in one launch (STRATA_INK_ROUTER_SLICES=0: a launch a slice)
+    static const bool router_slices = [] { const char* e = std::getenv("STRATA_INK_ROUTER_SLICES"); return !e || std::atoi(e) != 0; }();
+    const bool sliced = router_slices && T > 8 && b.router16 != nullptr &&
+                        k::bf16_gemv_fp32_mmvf_slices(hn_, N, b.router16, rlog_, E, N, E, T, cs);
+    for (int t0 = 0; t0 < T && !sliced; t0 += 8) {
         if (b.router16 != nullptr)
             k::bf16_gemv_fp32_mmvf_multi(hn_ + (size_t) t0 * N, N, b.router16, rlog_ + (size_t) t0 * E, E, N, E, std::min(8, T - t0), cs);
         else

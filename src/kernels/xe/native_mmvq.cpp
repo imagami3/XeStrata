@@ -707,7 +707,13 @@ inline bool q6k_xreuse() {
     return on;
 }
 inline int q6k_xreuse_rows() {
-    static const int r = [] { const char* e = std::getenv("STRATA_MMVQ_Q6K_XROWS"); return e ? std::atoi(e) : 2; }();
+    // GB10 port (the generic NVIDIA target): 1 row a work-group by default (+1-2% decode on GB10, the same bits)
+#if defined(STRATA_NV_ARCH_GENERIC)
+    constexpr int kDefault = 1;
+#else
+    constexpr int kDefault = 2;
+#endif
+    static const int r = [] { const char* e = std::getenv("STRATA_MMVQ_Q6K_XROWS"); return e ? std::atoi(e) : kDefault; }();
     return r;
 }
 
@@ -736,7 +742,9 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     }
     if constexpr (std::is_same_v<F, Q6KRowTraits> && NCOLS > 1) {
         if (n_in / F::DIV >= F::BPI && q6k_xreuse()) {
-            if (q6k_xreuse_rows() == 8) launch_q6k_rows_xreuse<NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
+            // GB10 port: 1 row a work-group (twice the work-groups; each row's sum is the same steps, so the same bits)
+            if (q6k_xreuse_rows() == 1) launch_q6k_rows_xreuse<NCOLS, 1>(q, weights, x_q8_1, y, n_in, n_out);
+            else if (q6k_xreuse_rows() == 8) launch_q6k_rows_xreuse<NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
             else if (q6k_xreuse_rows() == 4) launch_q6k_rows_xreuse<NCOLS, 4>(q, weights, x_q8_1, y, n_in, n_out);
             else launch_q6k_rows_xreuse<NCOLS, 2>(q, weights, x_q8_1, y, n_in, n_out);
             return;

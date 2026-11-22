@@ -67,6 +67,10 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 /// device for an n_in x n_out matrix and 2..8 rows, and keeps the faster for each; call it before any graph is
 /// recorded (once a device and shape).  Untuned shapes take a row a work-group.  STRATA_MMVF_ROWS=0|1 fixes the form.
 void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream);
+/// GB10 port: bf16_gemv_fp32_mmvf_multi over the T rows' 8-row slices in one launch, the same bits slice by slice
+/// (false: the arguments do not fit; nothing was launched)
+bool bf16_gemv_fp32_mmvf_slices(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                int64_t n_in, int64_t n_out, int T, void* stream);
 /// bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) and the 1-row
 /// bf16_gemv_fp32_mmvf_multi(x, ldx, w_aux, y_aux, ldy_aux, n_in, 1, n_tok) in one launch, every output the two calls'
 /// bits (upstream b08cf3e1: the router and the shared expert's scalar gate).  2..8 rows.  Returns false, launching
